@@ -31,7 +31,7 @@ struct Args {
     port: u16,
     #[arg(long, default_value_t = 32)]
     max_batch_size: usize,
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 0)]
     batch_wait_ms: u64,
 }
 
@@ -146,6 +146,7 @@ mod tests {
         assert_eq!(args.model_path, None);
         assert_eq!(args.served_model_name, None);
         assert_eq!(args.host, "0.0.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!(args.batch_wait_ms, 0);
     }
 
     #[test]
