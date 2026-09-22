@@ -26,6 +26,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 utoipa = { version = "5.5.0", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.11.0", features = ["accelerate"] }
+candle-nn = { version = "0.11.0", features = ["accelerate"] }
+candle-transformers = { version = "0.11.0", features = ["accelerate"] }
+
 [patch.crates-io]
 candle-kernels = { git = "https://github.com/huggingface/candle", rev = "e68b659fd096ed0947855d43b2eaa55634759c56" }
 
