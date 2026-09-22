@@ -21,11 +21,19 @@ jobs:
           - name: cpu
             file: Dockerfile
             suffix: ""
+            cache_mode: max
           - name: cuda
             file: Dockerfile.cuda
             suffix: -cuda
+            cache_mode: min
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free disk space for CUDA
+        if: matrix.name == 'cuda'
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          preinstalled-runtimes: false
+          swap-storage: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -54,4 +62,4 @@ jobs:
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=${{ matrix.cache_mode }},scope=${{ matrix.name }}
