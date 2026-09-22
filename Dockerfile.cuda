@@ -106,4 +106,3 @@ USER sys1
 EXPOSE 3000
 
 ENTRYPOINT ["/usr/local/bin/cuda-entrypoint.sh"]
-CMD ["--host", "0.0.0.0"]

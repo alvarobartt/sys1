@@ -36,4 +36,3 @@ USER sys1
 EXPOSE 3000
 
 ENTRYPOINT ["/usr/local/bin/sys1"]
-CMD ["--host", "0.0.0.0"]
