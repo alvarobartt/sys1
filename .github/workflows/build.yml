@@ -55,6 +55,19 @@ jobs:
             build_args: CUDA_COMPUTE_CAPS=100;120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Determine cache permissions
+        id: cache
+        env:
+          TRUSTED_CACHE_WRITER: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        shell: bash
+        run: |
+          if [[ "${TRUSTED_CACHE_WRITER}" == "true" ]]; then
+            echo "write=true" >> "${GITHUB_OUTPUT}"
+            echo "sccache=on" >> "${GITHUB_OUTPUT}"
+          else
+            echo "write=false" >> "${GITHUB_OUTPUT}"
+            echo "sccache=off" >> "${GITHUB_OUTPUT}"
+          fi
       - name: Free disk space for CUDA
         if: matrix.name != 'cpu'
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
@@ -62,8 +75,15 @@ jobs:
           preinstalled-runtimes: false
           swap-storage: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Configure sccache credentials
+        if: steps.cache.outputs.write == 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: steps.cache.outputs.write == 'true'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -86,13 +106,18 @@ jobs:
           context: .
           file: ${{ matrix.file }}
           target: runtime
-          build-args: ${{ matrix.build_args }}
+          build-args: |
+            ${{ matrix.build_args }}
+            SCCACHE_GHA_ENABLED=${{ steps.cache.outputs.sccache }}
+          secrets: |
+            ACTIONS_RESULTS_URL=${{ env.ACTIONS_RESULTS_URL }}
+            ACTIONS_RUNTIME_TOKEN=${{ env.ACTIONS_RUNTIME_TOKEN }}
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: ${{ matrix.name == 'cpu' && 'type=gha,scope=cpu' || format('type=registry,ref=ghcr.io/{0}:buildcache-{1}', github.repository, matrix.cache_scope) }}
-          cache-to: ${{ matrix.name == 'cpu' && 'type=gha,mode=max,scope=cpu' || (github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}:buildcache-{1},mode=max', github.repository, matrix.cache_scope) || '') }}
+          cache-to: ${{ matrix.name == 'cpu' && 'type=gha,mode=max,scope=cpu' || (steps.cache.outputs.write == 'true' && format('type=registry,ref=ghcr.io/{0}:buildcache-{1},mode=max', github.repository, matrix.cache_scope) || '') }}
 
   promote:
     if: github.ref_type == 'tag'
