@@ -20,7 +20,7 @@ jobs:
         include:
           - name: cpu
             file: Dockerfile
-            suffix: ""
+            suffix: -cpu
             cache_mode: max
           - name: cuda
             file: Dockerfile.cuda
@@ -49,9 +49,12 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           flavor: latest=false
           tags: |
-            type=raw,value=${{ github.sha }}${{ matrix.suffix }},enable=${{ github.ref_type != 'tag' }}
+            type=sha,format=short,prefix=,suffix=${{ matrix.suffix }},enable=${{ github.ref_type != 'tag' }}
+            type=sha,format=short,prefix=,enable=${{ matrix.name == 'cpu' && github.ref_type != 'tag' }}
             type=semver,pattern={{version}},suffix=${{ matrix.suffix }},enable=${{ github.ref_type == 'tag' }}
+            type=semver,pattern={{version}},enable=${{ matrix.name == 'cpu' && github.ref_type == 'tag' }}
             type=raw,value=latest${{ matrix.suffix }},enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=latest,enable=${{ matrix.name == 'cpu' && github.event_name != 'pull_request' }}
       - name: Build ${{ matrix.name }} image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
