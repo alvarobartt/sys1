@@ -35,32 +35,20 @@ if [[ -d /usr/local/cuda/compat && -n "${driver_cuda}" ]]; then
     fi
 fi
 
-compute_cap="$({
-    nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null |
-        head -n1 |
-        tr -d '.[:space:]'
-} || true)"
+if [[ -x /usr/local/bin/sys1 ]]; then
+    binary=/usr/local/bin/sys1
+else
+    compute_cap="$({
+        nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null |
+            head -n1 |
+            tr -d '.[:space:]'
+    } || true)"
 
-case "${compute_cap}" in
-75)
-    binary=/usr/local/bin/sys1-75
-    ;;
-8[0-9])
-    binary=/usr/local/bin/sys1-80
-    ;;
-90)
-    binary=/usr/local/bin/sys1-90
-    ;;
-100)
-    binary=/usr/local/bin/sys1-100
-    ;;
-120)
-    binary=/usr/local/bin/sys1-120
-    ;;
-*)
-    echo "error: CUDA compute capability '${compute_cap:-unknown}' is not supported by this image" >&2
-    exit 1
-    ;;
-esac
+    binary="/usr/local/bin/sys1-${compute_cap}"
+    if [[ ! -x "${binary}" ]]; then
+        echo "error: CUDA compute capability '${compute_cap:-unknown}' is not supported by this image" >&2
+        exit 1
+    fi
+fi
 
 exec /opt/nvidia/nvidia_entrypoint.sh "${binary}" "$@"
