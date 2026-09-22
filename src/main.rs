@@ -25,7 +25,7 @@ struct Args {
     revision: String,
     #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     served_model_name: Option<String>,
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "0.0.0.0")]
     host: IpAddr,
     #[arg(long, default_value_t = 3000)]
     port: u16,
@@ -145,6 +145,7 @@ mod tests {
         assert_eq!(args.revision, "main");
         assert_eq!(args.model_path, None);
         assert_eq!(args.served_model_name, None);
+        assert_eq!(args.host, "0.0.0.0".parse::<IpAddr>().unwrap());
     }
 
     #[test]
