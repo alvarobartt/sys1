@@ -1,0 +1,36 @@
+[package]
+name = "sys1"
+version = "0.0.1"
+edition = "2024"
+description = "System One decision model API compatible with TypeSafeAI Jev, written in Rust."
+authors = ["Alvaro Bartolome <36760800+alvarobartt@users.noreply.github.com>"]
+default-run = "sys1"
+license = "Apache-2.0"
+repository = "https://github.com/alvarobartt/sys1"
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/openapi.json"]
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+
+[dependencies]
+anyhow = "1"
+axum = "0.8.9"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+clap = { version = "4.6.7", features = ["derive"] }
+hf-hub = "1.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokenizers = "1.0.0-rc.2"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+strip = true
