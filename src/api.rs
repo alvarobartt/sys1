@@ -11,16 +11,57 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde_json::json;
+use serde::Serialize;
 use std::time::Instant;
 use tracing::Instrument;
+use utoipa::{OpenApi, ToSchema};
+use utoipa_swagger_ui::SwaggerUi;
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "sys1",
+        version = env!("CARGO_PKG_VERSION"),
+        description = env!("CARGO_PKG_DESCRIPTION")
+    ),
+    paths(health, models, decide, systemone),
+    components(schemas(
+        HealthResponse,
+        ModelsResponse,
+        Model,
+        DecisionRequest,
+        crate::schema::DecisionResponse,
+        crate::schema::Usage,
+        ApiError
+    )),
+    tags((name = "sys1", description = "System One decision API"))
+)]
+pub struct ApiDoc;
+
+#[derive(Serialize, ToSchema)]
+struct HealthResponse {
+    status: &'static str,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ModelsResponse {
+    data: Vec<Model>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct Model {
+    id: String,
+    object: &'static str,
+    owned_by: &'static str,
+}
 
 pub fn router(batcher: Batcher) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
-        .route("/v1/systemone", post(decide))
+        .route("/v1/systemone", post(systemone))
         .route("/v1/decide", post(decide))
+        .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
         .layer(middleware::from_fn(trace_request))
         .with_state(batcher)
 }
@@ -47,21 +88,64 @@ async fn trace_request(request: Request, next: Next) -> Response {
     .await
 }
 
-async fn health() -> Json<serde_json::Value> {
-    Json(json!({"status": "ok"}))
+/// Check whether the service is running.
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "sys1",
+    responses((status = OK, description = "Service is healthy", body = HealthResponse))
+)]
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse { status: "ok" })
 }
 
-async fn models(State(batcher): State<Batcher>) -> Json<serde_json::Value> {
-    Json(json!({
-        "data": [{
-            "id": batcher.served_model_name(),
-            "object": "model",
-            "owned_by": "sys1"
-        }]
-    }))
+/// List the model served by this instance.
+#[utoipa::path(
+    get,
+    path = "/v1/models",
+    tag = "sys1",
+    responses((status = OK, description = "Available models", body = ModelsResponse))
+)]
+async fn models(State(batcher): State<Batcher>) -> Json<ModelsResponse> {
+    Json(ModelsResponse {
+        data: vec![Model {
+            id: batcher.served_model_name().to_owned(),
+            object: "model",
+            owned_by: "sys1",
+        }],
+    })
 }
 
+/// Make a decision.
+#[utoipa::path(
+    post,
+    path = "/v1/decide",
+    tag = "sys1",
+    request_body = DecisionRequest,
+    responses(
+        (status = OK, description = "Decision generated", body = crate::schema::DecisionResponse),
+        (status = BAD_REQUEST, description = "Invalid request", body = ApiError)
+    )
+)]
 async fn decide(
+    State(batcher): State<Batcher>,
+    Json(request): Json<DecisionRequest>,
+) -> Result<Json<crate::schema::DecisionResponse>, ApiError> {
+    batcher.predict(request).await.map(Json)
+}
+
+/// Make a decision using the Jev-compatible route.
+#[utoipa::path(
+    post,
+    path = "/v1/systemone",
+    tag = "sys1",
+    request_body = DecisionRequest,
+    responses(
+        (status = OK, description = "Decision generated", body = crate::schema::DecisionResponse),
+        (status = BAD_REQUEST, description = "Invalid request", body = ApiError)
+    )
+)]
+async fn systemone(
     State(batcher): State<Batcher>,
     Json(request): Json<DecisionRequest>,
 ) -> Result<Json<crate::schema::DecisionResponse>, ApiError> {
@@ -71,5 +155,88 @@ async fn decide(
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (StatusCode::BAD_REQUEST, Json(self)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        models::DecisionModel,
+        schema::{DecisionResponse, Usage},
+    };
+    use axum::{body::Body, http::Request};
+    use serde_json::Map;
+    use std::{sync::Arc, time::Duration};
+    use tower::ServiceExt;
+
+    struct TestModel;
+
+    impl DecisionModel for TestModel {
+        fn predict_batch(
+            &self,
+            requests: Vec<DecisionRequest>,
+        ) -> Vec<Result<DecisionResponse, ApiError>> {
+            requests
+                .into_iter()
+                .map(|_| {
+                    Ok(DecisionResponse {
+                        model: String::new(),
+                        answers: Map::new(),
+                        usage: Usage {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        },
+                    })
+                })
+                .collect()
+        }
+    }
+
+    fn test_router() -> Router {
+        router(Batcher::new(
+            Arc::new(TestModel),
+            "test-model".to_owned(),
+            1,
+            Duration::ZERO,
+        ))
+    }
+
+    #[test]
+    fn openapi_contains_all_public_routes() {
+        let document = ApiDoc::openapi();
+        let json = serde_json::to_value(document).unwrap();
+        let paths = json["paths"].as_object().unwrap();
+
+        for path in ["/health", "/v1/models", "/v1/decide", "/v1/systemone"] {
+            assert!(paths.contains_key(path), "missing OpenAPI path {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn serves_openapi_document() {
+        let response = test_router()
+            .oneshot(Request::get("/openapi.json").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/json");
+    }
+
+    #[tokio::test]
+    async fn renders_swagger_ui() {
+        let response = test_router()
+            .oneshot(Request::get("/docs/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
     }
 }
