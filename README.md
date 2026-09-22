@@ -15,6 +15,7 @@
 ## Features
 
 - `tokio`, `axum` and `serde`, the usual suspects
+- System One compatible API Spec
 - `candle` with [`tokenizers` release candidate](https://huggingface.co/blog/tokenizers-v1)!
 - Dynamic, token-based batching
 - Support for ModernBert with Laya custom decision heads
