@@ -1,5 +1,6 @@
 ARG CUDA_VERSION=12.9.1
 ARG CUDA_COMPAT_VERSION=12-9
+ARG CUDA_COMPUTE_CAPS=80
 ARG UBUNTU_VERSION=24.04
 
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS chef
@@ -25,59 +26,52 @@ COPY src ./src
 
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef AS builder-base
+FROM chef AS builder
 
 COPY --from=planner /app/recipe.json recipe.json
 
-FROM builder-base AS builder-75
+ARG CUDA_COMPUTE_CAPS
 
-RUN CUDA_COMPUTE_CAP=75 cargo chef cook --release --no-default-features --features cuda --recipe-path recipe.json
-
-COPY Cargo.toml Cargo.lock ./
-COPY rust-toolchain.toml ./
-COPY src ./src
-
-RUN CUDA_COMPUTE_CAP=75 cargo build --release --locked --no-default-features --features cuda --bin sys1
-
-FROM builder-base AS builder-80
-
-RUN CUDA_COMPUTE_CAP=80 cargo chef cook --release --no-default-features --features cuda --recipe-path recipe.json
-
-COPY Cargo.toml Cargo.lock ./
-COPY rust-toolchain.toml ./
-COPY src ./src
-
-RUN CUDA_COMPUTE_CAP=80 cargo build --release --locked --no-default-features --features cuda --bin sys1
-
-FROM builder-base AS builder-90
-
-RUN CUDA_COMPUTE_CAP=90 cargo chef cook --release --no-default-features --features cuda --recipe-path recipe.json
+RUN set -eux; \
+    if ! printf '%s\n' "${CUDA_COMPUTE_CAPS}" \
+        | grep -Eq '^(75|80|89|90|100|120)(;(75|80|89|90|100|120))*$'; then \
+        echo "unsupported CUDA compute capabilities: ${CUDA_COMPUTE_CAPS}" >&2; \
+        exit 1; \
+    fi; \
+    compute_caps="$(printf '%s' "${CUDA_COMPUTE_CAPS}" | tr ';' ' ')"; \
+    for compute_cap in ${compute_caps}; do \
+        CUDA_COMPUTE_CAP="${compute_cap}" \
+        CARGO_TARGET_DIR="target/${compute_cap}" \
+        cargo chef cook \
+            --release \
+            --no-default-features \
+            --features cuda \
+            --recipe-path recipe.json; \
+    done
 
 COPY Cargo.toml Cargo.lock ./
 COPY rust-toolchain.toml ./
 COPY src ./src
 
-RUN CUDA_COMPUTE_CAP=90 cargo build --release --locked --no-default-features --features cuda --bin sys1
-
-FROM builder-base AS builder-100
-
-RUN CUDA_COMPUTE_CAP=100 cargo chef cook --release --no-default-features --features cuda --recipe-path recipe.json
-
-COPY Cargo.toml Cargo.lock ./
-COPY rust-toolchain.toml ./
-COPY src ./src
-
-RUN CUDA_COMPUTE_CAP=100 cargo build --release --locked --no-default-features --features cuda --bin sys1
-
-FROM builder-base AS builder-120
-
-RUN CUDA_COMPUTE_CAP=120 cargo chef cook --release --no-default-features --features cuda --recipe-path recipe.json
-
-COPY Cargo.toml Cargo.lock ./
-COPY rust-toolchain.toml ./
-COPY src ./src
-
-RUN CUDA_COMPUTE_CAP=120 cargo build --release --locked --no-default-features --features cuda --bin sys1
+RUN set -eux; \
+    compute_caps="$(printf '%s' "${CUDA_COMPUTE_CAPS}" | tr ';' ' ')"; \
+    set -- ${compute_caps}; \
+    install -d /app/bin; \
+    for compute_cap do \
+        CUDA_COMPUTE_CAP="${compute_cap}" \
+        CARGO_TARGET_DIR="target/${compute_cap}" \
+        cargo build \
+            --release \
+            --locked \
+            --no-default-features \
+            --features cuda \
+            --bin sys1; \
+        if [ "$#" -eq 1 ]; then \
+            install "target/${compute_cap}/release/sys1" /app/bin/sys1; \
+        else \
+            install "target/${compute_cap}/release/sys1" "/app/bin/sys1-${compute_cap}"; \
+        fi; \
+    done
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
 
@@ -94,16 +88,11 @@ ENV HOME=/home/sys1 \
     HF_HOME=/home/sys1/.cache/huggingface \
     CUDA_CACHE_PATH=/home/sys1/.cache/nvidia
 
-COPY --from=builder-75 /app/target/release/sys1 /usr/local/bin/sys1-75
-COPY --from=builder-80 /app/target/release/sys1 /usr/local/bin/sys1-80
-COPY --from=builder-90 /app/target/release/sys1 /usr/local/bin/sys1-90
-COPY --from=builder-100 /app/target/release/sys1 /usr/local/bin/sys1-100
-COPY --from=builder-120 /app/target/release/sys1 /usr/local/bin/sys1-120
 COPY --chmod=755 cuda-entrypoint.sh /usr/local/bin/cuda-entrypoint.sh
+COPY --from=builder /app/bin/ /usr/local/bin/
 
 USER sys1
 
 EXPOSE 3000
 
 ENTRYPOINT ["/usr/local/bin/cuda-entrypoint.sh"]
-CMD ["--host", "0.0.0.0"]
