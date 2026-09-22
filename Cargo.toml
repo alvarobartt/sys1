@@ -26,6 +26,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 utoipa = { version = "5.5.0", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"] }
 
+[patch.crates-io]
+candle-kernels = { git = "https://github.com/huggingface/candle", rev = "e68b659fd096ed0947855d43b2eaa55634759c56" }
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 

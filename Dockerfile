@@ -6,14 +6,18 @@ WORKDIR /app
 
 FROM chef AS planner
 
-COPY . .
+COPY Cargo.toml Cargo.lock ./
+COPY rust-toolchain.toml ./
+COPY src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --no-default-features --features cpu --recipe-path recipe.json
-COPY . .
+COPY Cargo.toml Cargo.lock ./
+COPY rust-toolchain.toml ./
+COPY src ./src
 RUN cargo build --release --locked --no-default-features --features cpu --bin sys1
 
 FROM debian:bookworm-slim AS runtime
@@ -32,4 +36,4 @@ USER sys1
 EXPOSE 3000
 
 ENTRYPOINT ["/usr/local/bin/sys1"]
-CMD ["--host", "0.0.0.0", "--port", "3000"]
+CMD ["--host", "0.0.0.0"]
