@@ -1,6 +1,18 @@
-![]()
+<div align="center">
+  <img
+    src="https://github.com/user-attachments/assets/8b2774a7-6439-422e-bbd3-3fdd85117c5d"
+    alt="System One"
+    width="1200"
+  />
+  <br/>
+  <em>
+    System One compatible API for open decision models, e.g.
+    <a href="https://huggingface.co/convaiinnovations/laya">Laya</a>,
+    written in Rust.
+  </em>
+</div>
 
-System One compatible API for open decision models e.g., [Laya](https://huggingface.co/convaiinnovations/laya), written in Rust.
+## Features
 
 - `tokio`, `axum` and `serde`, the usual suspects
 - `candle` with [`tokenizers` release candidate](https://huggingface.co/blog/tokenizers-v1)!
