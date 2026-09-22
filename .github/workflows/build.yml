@@ -11,6 +11,10 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: build-containers-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     if: github.ref_type != 'tag'
@@ -22,15 +26,37 @@ jobs:
           - name: cpu
             file: Dockerfile
             suffix: -cpu
-            cache_mode: max
-          - name: cuda
+            cache_scope: cpu
+            build_args: ""
+          - name: turing
             file: Dockerfile.cuda
-            suffix: -cuda
-            cache_mode: min
+            suffix: -turing
+            cache_scope: cuda-turing
+            build_args: CUDA_COMPUTE_CAPS=75
+          - name: ampere
+            file: Dockerfile.cuda
+            suffix: -ampere
+            cache_scope: cuda-ampere
+            build_args: CUDA_COMPUTE_CAPS=80
+          - name: ada-lovelace
+            file: Dockerfile.cuda
+            suffix: -ada-lovelace
+            cache_scope: cuda-ada-lovelace
+            build_args: CUDA_COMPUTE_CAPS=89
+          - name: hopper
+            file: Dockerfile.cuda
+            suffix: -hopper
+            cache_scope: cuda-hopper
+            build_args: CUDA_COMPUTE_CAPS=90
+          - name: blackwell
+            file: Dockerfile.cuda
+            suffix: -blackwell
+            cache_scope: cuda-blackwell
+            build_args: CUDA_COMPUTE_CAPS=100;120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Free disk space for CUDA
-        if: matrix.name == 'cuda'
+        if: matrix.name != 'cpu'
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           preinstalled-runtimes: false
@@ -59,12 +85,14 @@ jobs:
         with:
           context: .
           file: ${{ matrix.file }}
+          target: runtime
+          build-args: ${{ matrix.build_args }}
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=${{ matrix.cache_mode }},scope=${{ matrix.name }}
+          cache-from: ${{ matrix.name == 'cpu' && 'type=gha,scope=cpu' || format('type=registry,ref=ghcr.io/{0}:buildcache-{1}', github.repository, matrix.cache_scope) }}
+          cache-to: ${{ matrix.name == 'cpu' && 'type=gha,mode=max,scope=cpu' || (github.event_name != 'pull_request' && format('type=registry,ref=ghcr.io/{0}:buildcache-{1},mode=max', github.repository, matrix.cache_scope) || '') }}
 
   promote:
     if: github.ref_type == 'tag'
@@ -76,8 +104,16 @@ jobs:
         include:
           - name: cpu
             suffix: -cpu
-          - name: cuda
-            suffix: -cuda
+          - name: turing
+            suffix: -turing
+          - name: ampere
+            suffix: -ampere
+          - name: ada-lovelace
+            suffix: -ada-lovelace
+          - name: hopper
+            suffix: -hopper
+          - name: blackwell
+            suffix: -blackwell
     steps:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Log in to GHCR
