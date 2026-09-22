@@ -7,13 +7,7 @@ authors = ["Alvaro Bartolome <36760800+alvarobartt@users.noreply.github.com>"]
 default-run = "sys1"
 license = "Apache-2.0"
 repository = "https://github.com/alvarobartt/sys1"
-include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/openapi.json"]
-
-[features]
-default = ["cpu"]
-cpu = []
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
 
 [dependencies]
 anyhow = "1"
@@ -30,6 +24,12 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal",
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 
 [profile.release]
 lto = "thin"

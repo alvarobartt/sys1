@@ -1,4 +1,4 @@
-# sys1
+![]()
 
 System One compatible API for open decision models e.g., [Laya](https://huggingface.co/convaiinnovations/laya), written in Rust.
 
@@ -8,12 +8,19 @@ System One compatible API for open decision models e.g., [Laya](https://huggingf
 - Support for ModernBert with Laya custom decision heads
 - CPU, CUDA and Metal (MPS) supported
 
-## Get started!
+## Get started
 
-Install it for CPU with the `--features cpu`, or Metal with `--features metal`, or CUDA with `--features cuda`.
+Install it with support for CPU, Metal or CUDA.
 
 ```bash
 cargo install sys1 --features cpu
+# cargo install sys1 --no-default-features --features metal
+# cargo install sys1 --no-default-features --features cuda
+```
+
+Then run it with [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya) (more models coming soon!).
+
+```bash
 sys1 --model-id convaiinnovations/laya
 ```
 
