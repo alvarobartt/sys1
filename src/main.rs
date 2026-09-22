@@ -4,11 +4,13 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use sys1::{api, batching::Batcher, models};
+use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
     #[arg(
@@ -35,12 +37,26 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("sys1=info")),
+        )
+        .with_target(false)
+        .compact()
+        .init();
     let args = Args::parse();
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        description = env!("CARGO_PKG_DESCRIPTION"),
+        backend = backend(),
+        ?args,
+        "sys1 starting"
+    );
     let address = SocketAddr::new(args.host, args.port);
     let (model_path, source_name, architecture) = match args.model_path {
         Some(path) => {
             if args.served_model_name.is_none() {
-                eprintln!("warning: --served-model-name is recommended when using --model-path");
+                warn!("--served-model-name is recommended when using --model-path");
             }
             let name = path.display().to_string();
             let architecture = models::Architecture::from_path(&path)?;
@@ -48,32 +64,74 @@ async fn main() -> anyhow::Result<()> {
         }
         None => {
             let architecture = models::Architecture::from_model_id(&args.model_id)?;
-            (
-                sys1::hub::download(&args.model_id, &args.revision).await?,
-                args.model_id,
-                architecture,
-            )
+            let started = Instant::now();
+            info!(model_id = %args.model_id, revision = %args.revision, "resolving model snapshot");
+            let path = sys1::hub::download(&args.model_id, &args.revision).await?;
+            info!(
+                model_id = %args.model_id,
+                path = %path.display(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "model snapshot ready"
+            );
+            (path, args.model_id, architecture)
         }
     };
     let served_model_name = args.served_model_name.unwrap_or(source_name);
+    let started = Instant::now();
+    info!(
+        model = %served_model_name,
+        ?architecture,
+        path = %model_path.display(),
+        "loading model"
+    );
     let model = models::load(&model_path, architecture)
         .with_context(|| format!("failed to load model from {}", model_path.display()))?;
-    let app = api::router(Batcher::new(
+    info!(
+        model = %served_model_name,
+        elapsed_ms = started.elapsed().as_millis(),
+        "model loaded"
+    );
+    let batcher = Batcher::new(
         Arc::new(model),
-        served_model_name,
+        served_model_name.clone(),
         args.max_batch_size,
         Duration::from_millis(args.batch_wait_ms),
-    ));
+    );
+    let started = Instant::now();
+    info!(model = %served_model_name, "model warmup started");
+    batcher
+        .warmup()
+        .await
+        .map_err(|error| anyhow::anyhow!(error.error))
+        .context("model warmup failed")?;
+    info!(
+        model = %served_model_name,
+        elapsed_ms = started.elapsed().as_millis(),
+        "model warmup completed"
+    );
+    let app = api::router(batcher);
     let listener = tokio::net::TcpListener::bind(address).await?;
-    println!("listening on http://{address}");
+    info!(%address, model = %served_model_name, "sys1 ready");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await?;
+    info!("sys1 stopped");
     Ok(())
 }
 
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
+    info!("shutdown requested");
+}
+
+fn backend() -> &'static str {
+    if cfg!(feature = "cuda") {
+        "cuda"
+    } else if cfg!(feature = "metal") {
+        "metal"
+    } else {
+        "cpu"
+    }
 }
 
 #[cfg(test)]

@@ -3,8 +3,10 @@ use crate::{
     schema::{ApiError, DecisionRequest, DecisionResponse},
 };
 
+use serde_json::{Map, json};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, error};
 
 struct Job {
     request: DecisionRequest,
@@ -36,15 +38,29 @@ impl Batcher {
                         _ => break,
                     }
                 }
+                let batch_size = jobs.len();
+                let started = std::time::Instant::now();
+                debug!(batch_size, "inference batch started");
                 let requests = jobs.iter().map(|job| job.request.clone()).collect();
                 let model = model.clone();
                 let responses = tokio::task::spawn_blocking(move || model.predict_batch(requests))
                     .await
                     .unwrap_or_else(|error| {
+                        error!(%error, "inference worker failed");
                         (0..jobs.len())
                             .map(|_| Err(ApiError::new(error.to_string())))
                             .collect()
                     });
+                let failures = responses
+                    .iter()
+                    .filter(|response| response.is_err())
+                    .count();
+                debug!(
+                    batch_size,
+                    failures,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "inference batch completed"
+                );
                 for (job, response) in jobs.into_iter().zip(responses) {
                     let _ = job.response.send(response);
                 }
@@ -58,6 +74,28 @@ impl Batcher {
 
     pub fn served_model_name(&self) -> &str {
         &self.served_model_name
+    }
+
+    pub async fn warmup(&self) -> Result<(), ApiError> {
+        let mut questions = Map::new();
+        questions.insert(
+            "warmup".to_owned(),
+            json!({
+                "type": "choice",
+                "instructions": "Choose the matching option.",
+                "criteria": {
+                    "first": "The first option.",
+                    "second": "The second option."
+                }
+            }),
+        );
+        self.predict(DecisionRequest {
+            model: None,
+            state: json!("Warm up the decision model before serving requests."),
+            questions,
+        })
+        .await
+        .map(|_| ())
     }
 
     pub async fn predict(&self, request: DecisionRequest) -> Result<DecisionResponse, ApiError> {
