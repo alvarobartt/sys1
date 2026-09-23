@@ -23,3 +23,4 @@ jobs:
           key: clippy-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: clippy-${{ runner.os }}-
       - run: cargo clippy --locked --no-default-features --features cpu --all-targets -- -D warnings
+      - run: cargo test --locked --no-default-features --features cpu

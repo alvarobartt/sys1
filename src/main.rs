@@ -1,12 +1,17 @@
 use anyhow::Context;
-use clap::Parser;
+use candle_core::DType;
+use clap::{Parser, ValueEnum};
 use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
-use sys1::{api, batching::Batcher, models};
+use sys1::{
+    api,
+    batching::{Batcher, BatcherConfig},
+    models,
+};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -31,8 +36,62 @@ struct Args {
     port: u16,
     #[arg(long, default_value_t = 32)]
     max_batch_size: usize,
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 128)]
+    max_batch_questions: usize,
+    #[arg(long, default_value_t = 64)]
+    max_questions_per_request: usize,
+    #[arg(long, default_value_t = 256)]
+    max_queue_size: usize,
+    #[arg(long, default_value_t = 0)]
     batch_wait_ms: u64,
+    #[arg(long, default_value_t = 30_000)]
+    request_timeout_ms: u64,
+    #[arg(long, default_value_t = 1_048_576)]
+    max_request_bytes: usize,
+    #[arg(long, value_enum, default_value_t = Precision::Auto)]
+    dtype: Precision,
+}
+
+impl Args {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.max_batch_size > 0, "--max-batch-size must be positive");
+        anyhow::ensure!(
+            self.max_batch_questions > 0,
+            "--max-batch-questions must be positive"
+        );
+        anyhow::ensure!(
+            self.max_questions_per_request > 0,
+            "--max-questions-per-request must be positive"
+        );
+        anyhow::ensure!(
+            self.max_questions_per_request <= self.max_batch_questions,
+            "--max-questions-per-request cannot exceed --max-batch-questions"
+        );
+        anyhow::ensure!(self.max_queue_size > 0, "--max-queue-size must be positive");
+        anyhow::ensure!(
+            self.max_request_bytes > 0,
+            "--max-request-bytes must be positive"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum Precision {
+    Auto,
+    F32,
+    F16,
+    Bf16,
+}
+
+impl Precision {
+    fn resolve(self) -> DType {
+        match self {
+            Self::Auto | Self::F32 => DType::F32,
+            Self::F16 => DType::F16,
+            Self::Bf16 => DType::BF16,
+        }
+    }
 }
 
 #[tokio::main]
@@ -45,11 +104,14 @@ async fn main() -> anyhow::Result<()> {
         .compact()
         .init();
     let args = Args::parse();
+    args.validate()?;
+    let dtype = args.dtype.resolve();
     info!(
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),
         backend = backend(),
         ?args,
+        ?dtype,
         "sys1 starting"
     );
     let address = SocketAddr::new(args.host, args.port);
@@ -84,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
         path = %model_path.display(),
         "loading model"
     );
-    let model = models::load(&model_path, architecture)
+    let model = models::load(&model_path, architecture, dtype)
         .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     info!(
         model = %served_model_name,
@@ -94,8 +156,15 @@ async fn main() -> anyhow::Result<()> {
     let batcher = Batcher::new(
         Arc::new(model),
         served_model_name.clone(),
-        args.max_batch_size,
-        Duration::from_millis(args.batch_wait_ms),
+        BatcherConfig {
+            max_batch_size: args.max_batch_size,
+            max_batch_questions: args.max_batch_questions,
+            max_questions_per_request: args.max_questions_per_request,
+            wait: Duration::from_millis(args.batch_wait_ms),
+            queue_capacity: args.max_queue_size,
+            response_timeout: (args.request_timeout_ms > 0)
+                .then(|| Duration::from_millis(args.request_timeout_ms)),
+        },
     );
     let started = Instant::now();
     info!(model = %served_model_name, "model warmup started");
@@ -109,7 +178,8 @@ async fn main() -> anyhow::Result<()> {
         elapsed_ms = started.elapsed().as_millis(),
         "model warmup completed"
     );
-    let app = api::router(batcher);
+    batcher.reset_stats();
+    let app = api::router(batcher, args.max_request_bytes);
     let listener = tokio::net::TcpListener::bind(address).await?;
     info!(%address, model = %served_model_name, "sys1 ready");
     axum::serve(listener, app)
@@ -119,6 +189,19 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+async fn shutdown() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+    info!("shutdown requested");
+}
+
+#[cfg(not(unix))]
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
     info!("shutdown requested");
@@ -146,12 +229,31 @@ mod tests {
         assert_eq!(args.model_path, None);
         assert_eq!(args.served_model_name, None);
         assert_eq!(args.host, "0.0.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!(args.batch_wait_ms, 0);
+        assert_eq!(args.max_batch_size, 32);
+        assert_eq!(args.max_batch_questions, 128);
+        assert_eq!(args.max_questions_per_request, 64);
+        assert_eq!(args.max_queue_size, 256);
+        assert_eq!(args.request_timeout_ms, 30_000);
+        assert_eq!(args.max_request_bytes, 1_048_576);
+        assert_eq!(args.dtype, Precision::Auto);
     }
 
     #[test]
     fn accepts_a_local_model_path() {
         let args = Args::try_parse_from(["sys1", "--model-path", "/models/laya"]).unwrap();
         assert_eq!(args.model_path, Some(PathBuf::from("/models/laya")));
+    }
+
+    #[test]
+    fn resolves_requested_and_backend_default_dtypes() {
+        assert_eq!(Precision::F32.resolve(), DType::F32);
+        assert_eq!(Precision::F16.resolve(), DType::F16);
+        assert_eq!(Precision::Bf16.resolve(), DType::BF16);
+        assert_eq!(Precision::Auto.resolve(), DType::F32);
+
+        let args = Args::try_parse_from(["sys1", "--dtype", "bf16"]).unwrap();
+        assert_eq!(args.dtype, Precision::Bf16);
     }
 
     #[test]
@@ -166,5 +268,21 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_invalid_capacity_configuration() {
+        let args = Args::try_parse_from([
+            "sys1",
+            "--max-batch-questions",
+            "8",
+            "--max-questions-per-request",
+            "9",
+        ])
+        .unwrap();
+        assert!(args.validate().is_err());
+
+        let args = Args::try_parse_from(["sys1", "--max-queue-size", "0"]).unwrap();
+        assert!(args.validate().is_err());
     }
 }

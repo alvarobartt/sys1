@@ -20,6 +20,7 @@
 - Dynamic, token-based batching
 - Support for ModernBert with Laya custom decision heads
 - CPU, CUDA and Metal (MPS) supported
+- Up to ~14ms per query on NVIDIA RTX Pro 6000
 
 ## Get started
 
@@ -34,7 +35,7 @@ cargo install sys1 --features cpu
 Then run it with [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya) (more models coming soon!).
 
 ```bash
-sys1 --model-id convaiinnovations/laya
+sys1 --model-id convaiinnovations/laya --dtype auto
 ```
 
 And, just query your Jev-compatible API at `/v1/systemone` (or `/v1/decide`).

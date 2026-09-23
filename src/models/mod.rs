@@ -4,6 +4,7 @@ mod modernbert;
 use crate::schema::{ApiError, DecisionRequest, DecisionResponse};
 
 use anyhow::{Context, bail};
+use candle_core::DType;
 use serde::Deserialize;
 use std::{fs, path::Path};
 
@@ -88,9 +89,9 @@ impl DecisionModel for Model {
     }
 }
 
-pub fn load(path: &Path, architecture: Architecture) -> anyhow::Result<Model> {
+pub fn load(path: &Path, architecture: Architecture, dtype: DType) -> anyhow::Result<Model> {
     match architecture {
-        Architecture::Laya => Laya::load(path).map(Model::Laya),
+        Architecture::Laya => Laya::load(path, dtype).map(Model::Laya),
     }
 }
 

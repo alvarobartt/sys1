@@ -6,10 +6,9 @@ use crate::{
     tokenizer,
 };
 
+use anyhow::Context;
 use candle_core::{D, DType, Device, IndexOp, Tensor};
-use candle_nn::{
-    Embedding, LayerNorm, Linear, VarBuilder, embedding, layer_norm, linear, ops::softmax,
-};
+use candle_nn::{Embedding, LayerNorm, Linear, VarBuilder, embedding, layer_norm, ops::softmax};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::{collections::HashMap, fs, path::Path};
@@ -44,6 +43,13 @@ struct RequestItems {
     items: Vec<Item>,
 }
 
+#[derive(Eq, Hash, PartialEq)]
+struct ItemKey<'a> {
+    kind: usize,
+    ids: &'a [u32],
+    markers: &'a [usize],
+}
+
 struct HeadLayer {
     qkv: Linear,
     projection: Linear,
@@ -52,21 +58,27 @@ struct HeadLayer {
     linear1: Linear,
     linear2: Linear,
     heads: usize,
+    compute_dtype: DType,
 }
 
 impl HeadLayer {
-    fn load(vb: VarBuilder, hidden: usize) -> candle_core::Result<Self> {
+    fn load(vb: VarBuilder, hidden: usize, compute_dtype: DType) -> candle_core::Result<Self> {
         Ok(Self {
             qkv: Linear::new(
-                vb.get((hidden * 3, hidden), "self_attn.in_proj_weight")?,
-                Some(vb.get(hidden * 3, "self_attn.in_proj_bias")?),
+                vb.get((hidden * 3, hidden), "self_attn.in_proj_weight")?
+                    .to_dtype(compute_dtype)?,
+                Some(
+                    vb.get(hidden * 3, "self_attn.in_proj_bias")?
+                        .to_dtype(compute_dtype)?,
+                ),
             ),
-            projection: linear(hidden, hidden, vb.pp("self_attn.out_proj"))?,
+            projection: linear_dtype(hidden, hidden, vb.pp("self_attn.out_proj"), compute_dtype)?,
             norm1: layer_norm(hidden, 1e-5, vb.pp("norm1"))?,
             norm2: layer_norm(hidden, 1e-5, vb.pp("norm2"))?,
-            linear1: linear(hidden, hidden * 4, vb.pp("linear1"))?,
-            linear2: linear(hidden * 4, hidden, vb.pp("linear2"))?,
+            linear1: linear_dtype(hidden, hidden * 4, vb.pp("linear1"), compute_dtype)?,
+            linear2: linear_dtype(hidden * 4, hidden, vb.pp("linear2"), compute_dtype)?,
             heads: hidden / 64,
+            compute_dtype,
         })
     }
 
@@ -75,27 +87,53 @@ impl HeadLayer {
         let size = hidden / self.heads;
         let qkv = xs
             .apply(&self.norm1)?
+            .to_dtype(self.compute_dtype)?
             .apply(&self.qkv)?
             .reshape((batch, length, 3, self.heads, size))?
             .permute((2, 0, 3, 1, 4))?;
-        let q = (qkv.get(0)? * (size as f64).powf(-0.5))?;
+        let q = qkv.get(0)?;
         let k = qkv.get(1)?;
         let v = qkv.get(2)?;
-        let attention = q
-            .matmul(&k.transpose(D::Minus2, D::Minus1)?)?
-            .broadcast_add(mask)?;
-        let attention = softmax(&attention, D::Minus1)?;
+        let scale = (size as f64).powf(-0.5);
+
+        #[cfg(feature = "metal")]
+        let attention = if xs.device().is_metal() {
+            let mask = mask
+                .broadcast_as((batch, self.heads, length, length))?
+                .contiguous()?;
+            candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
+        } else {
+            let scores = (&q * scale)?
+                .matmul(&k.transpose(D::Minus2, D::Minus1)?)?
+                .to_dtype(mask.dtype())?
+                .broadcast_add(mask)?;
+            softmax(&scores, D::Minus1)?.matmul(&v)?
+        };
+        #[cfg(not(feature = "metal"))]
+        let attention = {
+            let scores = (&q * scale)?
+                .matmul(&k.transpose(D::Minus2, D::Minus1)?)?
+                .broadcast_add(mask)?;
+            let probabilities = if scores.dtype() == DType::F16 {
+                softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(DType::F16)?
+            } else {
+                softmax(&scores, D::Minus1)?
+            };
+            probabilities.to_dtype(v.dtype())?.matmul(&v)?
+        };
         let attention = attention
-            .matmul(&v)?
             .transpose(1, 2)?
             .reshape((batch, length, hidden))?
-            .apply(&self.projection)?;
+            .apply(&self.projection)?
+            .to_dtype(xs.dtype())?;
         let xs = (xs + attention)?;
         let feed_forward = xs
             .apply(&self.norm2)?
+            .to_dtype(self.compute_dtype)?
             .apply(&self.linear1)?
             .relu()?
-            .apply(&self.linear2)?;
+            .apply(&self.linear2)?
+            .to_dtype(xs.dtype())?;
         xs + feed_forward
     }
 }
@@ -110,6 +148,8 @@ pub struct Laya {
     scorer_out: Linear,
     config: LayaConfig,
     device: Device,
+    dtype: DType,
+    compute_dtype: DType,
     pad_id: u32,
     cls_id: u32,
     sep_id: u32,
@@ -117,24 +157,26 @@ pub struct Laya {
 }
 
 impl Laya {
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
+    pub fn load(path: &Path, dtype: DType) -> anyhow::Result<Self> {
         let device = device::load()?;
+        let (model_dtype, compute_dtype) = execution_dtypes(dtype, device.is_cuda());
         let config: LayaConfig =
             serde_json::from_slice(&fs::read(path.join("rl_agent_config.json"))?)?;
         let encoder_config = ModernBertConfig::load(&path.join("encoder/config.json"))?;
         let weights = path.join("model.safetensors");
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device)? };
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], model_dtype, &device)? };
         let encoder_vb = vb.clone().rename_f(|name| {
             name.strip_prefix("model.")
                 .map(|name| format!("encoder.{name}"))
                 .unwrap_or_else(|| name.to_owned())
         });
-        let encoder = ModernBertEncoder::load(encoder_vb, &encoder_config)?;
+        let encoder = ModernBertEncoder::load(encoder_vb, &encoder_config, compute_dtype)?;
         let head = (0..2)
             .map(|index| {
                 HeadLayer::load(
                     vb.pp(format!("head.layers.{index}")),
                     encoder_config.hidden_size(),
+                    compute_dtype,
                 )
             })
             .collect::<candle_core::Result<Vec<_>>>()?;
@@ -162,14 +204,22 @@ impl Laya {
             head,
             type_embedding: embedding(3, encoder_config.hidden_size(), vb.pp("type_emb"))?,
             scorer_norm: layer_norm(encoder_config.hidden_size(), 1e-5, vb.pp("scorer.0"))?,
-            scorer_in: linear(
+            scorer_in: linear_dtype(
                 encoder_config.hidden_size(),
                 encoder_config.hidden_size(),
                 vb.pp("scorer.1"),
+                compute_dtype,
             )?,
-            scorer_out: linear(encoder_config.hidden_size(), 1, vb.pp("scorer.3"))?,
+            scorer_out: linear_dtype(
+                encoder_config.hidden_size(),
+                1,
+                vb.pp("scorer.3"),
+                compute_dtype,
+            )?,
             config,
             device,
+            dtype: model_dtype,
+            compute_dtype,
             pad_id,
             cls_id,
             sep_id,
@@ -194,6 +244,8 @@ impl Laya {
             return Err(ApiError::new("questions must not be empty"));
         }
         let state = render_value(&request.state);
+        let sanitized_state = state.replace("[MASK]", " ");
+        let state_ids = self.encode(&sanitized_state)?;
         let mut items = Vec::with_capacity(request.questions.len());
         for (id, value) in request.questions {
             let object = value
@@ -224,7 +276,7 @@ impl Laya {
                 labels,
                 options,
             };
-            let (ids, markers) = self.build_sequence(&state, &question)?;
+            let (ids, markers) = self.build_sequence(&state_ids, &question)?;
             items.push(Item {
                 question,
                 ids,
@@ -236,7 +288,7 @@ impl Laya {
 
     fn build_sequence(
         &self,
-        state: &str,
+        state_ids: &[u32],
         question: &Question,
     ) -> Result<(Vec<u32>, Vec<usize>), ApiError> {
         let instructions = question.instructions.replace("[MASK]", " ");
@@ -273,11 +325,7 @@ impl Laya {
         }
         ids.push(self.sep_id);
         let room = self.config.max_len.saturating_sub(ids.len() + 1);
-        ids.extend(
-            self.encode(&state.replace("[MASK]", " "))?
-                .into_iter()
-                .take(room),
-        );
+        ids.extend(state_ids.iter().copied().take(room));
         ids.push(self.sep_id);
         ids.truncate(self.config.max_len);
         markers.retain(|marker| *marker < self.config.max_len);
@@ -292,31 +340,58 @@ impl Laya {
 
     fn forward(&self, prepared: &[RequestItems]) -> anyhow::Result<Vec<Vec<f32>>> {
         let items: Vec<_> = prepared.iter().flat_map(|request| &request.items).collect();
-        let batch = items.len();
-        let length = items.iter().map(|item| item.ids.len()).max().unwrap_or(0);
+        let (unique, indices) = deduplicate(&items);
+        let batch = unique.len();
+        let length = unique.iter().map(|item| item.ids.len()).max().unwrap_or(0);
         let mut ids = vec![self.pad_id; batch * length];
         let mut mask = vec![0f32; batch * length];
         let mut kinds = Vec::with_capacity(batch);
-        for (row, item) in items.iter().enumerate() {
+        for (row, item) in unique.iter().enumerate() {
             let start = row * length;
             ids[start..start + item.ids.len()].copy_from_slice(&item.ids);
             mask[start..start + item.ids.len()].fill(1.0);
             kinds.push(item.question.kind as u32);
         }
         let ids = Tensor::from_vec(ids, (batch, length), &self.device)?;
-        let attention_mask = Tensor::from_vec(mask.clone(), (batch, length), &self.device)?;
         let head_mask: Vec<_> = mask
-            .into_iter()
-            .map(|value| if value == 0.0 { f32::NEG_INFINITY } else { 0.0 })
+            .iter()
+            .map(|value| {
+                if *value == 0.0 {
+                    f32::NEG_INFINITY
+                } else {
+                    0.0
+                }
+            })
             .collect();
-        let head_mask = Tensor::from_vec(head_mask, (batch, 1, 1, length), &self.device)?;
+        let attention_mask =
+            Tensor::from_vec(mask, (batch, length), &self.device)?.to_dtype(self.dtype)?;
+        let head_mask = Tensor::from_vec(head_mask, (batch, 1, 1, length), &self.device)?
+            .to_dtype(self.compute_dtype)?;
         let type_ids = Tensor::from_vec(kinds, batch, &self.device)?;
-        let mut hidden = self.encoder.forward(&ids, &attention_mask)?;
+        let has_padding = unique.iter().any(|item| item.ids.len() != length);
+        let mut hidden = self
+            .encoder
+            .forward(&ids, &attention_mask, has_padding)
+            .context("encoder forward")?;
         hidden = hidden.broadcast_add(&type_ids.apply(&self.type_embedding)?.unsqueeze(1)?)?;
-        for layer in &self.head {
-            hidden = layer.forward(&hidden, &head_mask)?;
+        for (index, layer) in self.head.iter().enumerate() {
+            hidden = layer
+                .forward(&hidden, &head_mask)
+                .with_context(|| format!("decision head layer {index}"))?;
         }
-        let mut output = Vec::with_capacity(batch);
+        let output = if batch >= 8 && !self.device.is_cpu() {
+            self.score_batched(&hidden, &unique, length)?
+        } else {
+            self.score_rows(&hidden, &unique)?
+        };
+        Ok(indices
+            .into_iter()
+            .map(|index| output[index].clone())
+            .collect())
+    }
+
+    fn score_rows(&self, hidden: &Tensor, items: &[&Item]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let mut output = Vec::with_capacity(items.len());
         for (row, item) in items.iter().enumerate() {
             let markers = Tensor::from_vec(
                 item.markers
@@ -327,16 +402,54 @@ impl Laya {
                 &self.device,
             )?;
             let selected = hidden.i(row)?.index_select(&markers, 0)?;
-            let logits = selected
-                .apply(&self.scorer_norm)?
-                .apply(&self.scorer_in)?
-                .gelu_erf()?
-                .apply(&self.scorer_out)?
-                .squeeze(1)?
-                .to_vec1::<f32>()?;
-            output.push(logits);
+            output.push(self.score(&selected)?);
         }
         Ok(output)
+    }
+
+    fn score_batched(
+        &self,
+        hidden: &Tensor,
+        items: &[&Item],
+        length: usize,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let hidden_size = hidden.dim(D::Minus1)?;
+        let counts: Vec<_> = items.iter().map(|item| item.markers.len()).collect();
+        let marker_count = counts.iter().sum();
+        let mut markers = Vec::with_capacity(marker_count);
+        for (row, item) in items.iter().enumerate() {
+            markers.extend(
+                item.markers
+                    .iter()
+                    .map(|position| (row * length + position) as u32),
+            );
+        }
+        let markers = Tensor::from_vec(markers, marker_count, &self.device)?;
+        let selected = hidden
+            .reshape((items.len() * length, hidden_size))?
+            .index_select(&markers, 0)?;
+        let logits = self.score(&selected)?;
+        let mut offset = 0;
+        Ok(counts
+            .into_iter()
+            .map(|count| {
+                let values = logits[offset..offset + count].to_vec();
+                offset += count;
+                values
+            })
+            .collect())
+    }
+
+    fn score(&self, selected: &Tensor) -> anyhow::Result<Vec<f32>> {
+        Ok(selected
+            .apply(&self.scorer_norm)?
+            .to_dtype(self.compute_dtype)?
+            .apply(&self.scorer_in)?
+            .gelu_erf()?
+            .apply(&self.scorer_out)?
+            .squeeze(1)?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?)
     }
 
     fn response(
@@ -425,6 +538,47 @@ impl Laya {
             },
         }
     }
+}
+
+fn linear_dtype(
+    input: usize,
+    output: usize,
+    vb: VarBuilder,
+    dtype: DType,
+) -> candle_core::Result<Linear> {
+    Ok(Linear::new(
+        vb.get((output, input), "weight")?.to_dtype(dtype)?,
+        Some(vb.get(output, "bias")?.to_dtype(dtype)?),
+    ))
+}
+
+fn execution_dtypes(requested: DType, is_cuda: bool) -> (DType, DType) {
+    let model = if requested == DType::F16 && is_cuda {
+        DType::F32
+    } else {
+        requested
+    };
+    (model, requested)
+}
+
+fn deduplicate<'a>(items: &[&'a Item]) -> (Vec<&'a Item>, Vec<usize>) {
+    let mut unique = Vec::with_capacity(items.len());
+    let mut indices = Vec::with_capacity(items.len());
+    let mut seen = HashMap::with_capacity(items.len());
+    for item in items {
+        let key = ItemKey {
+            kind: item.question.kind,
+            ids: &item.ids,
+            markers: &item.markers,
+        };
+        let index = *seen.entry(key).or_insert_with(|| {
+            let index = unique.len();
+            unique.push(*item);
+            index
+        });
+        indices.push(index);
+    }
+    (unique, indices)
 }
 
 impl DecisionModel for Laya {
@@ -638,4 +792,47 @@ fn argmax(values: &[f32]) -> usize {
 
 fn round4(value: f32) -> f64 {
     ((value as f64) * 10_000.0).round() / 10_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(id: &str, kind: usize, ids: &[u32]) -> Item {
+        Item {
+            question: Question {
+                id: id.to_owned(),
+                kind,
+                instructions: String::new(),
+                criteria: Value::Null,
+                labels: Vec::new(),
+                options: Vec::new(),
+            },
+            ids: ids.to_vec(),
+            markers: vec![1],
+        }
+    }
+
+    #[test]
+    fn deduplicates_identical_model_inputs_without_losing_order() {
+        let first = item("first", 0, &[1, 2, 3]);
+        let duplicate = item("duplicate", 0, &[1, 2, 3]);
+        let other_kind = item("other-kind", 1, &[1, 2, 3]);
+        let items = vec![&first, &duplicate, &other_kind, &first];
+
+        let (unique, indices) = deduplicate(&items);
+
+        assert_eq!(unique.len(), 2);
+        assert_eq!(indices, vec![0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn cuda_f16_uses_autocast_style_storage_and_compute_dtypes() {
+        assert_eq!(execution_dtypes(DType::F16, true), (DType::F32, DType::F16));
+        assert_eq!(
+            execution_dtypes(DType::F16, false),
+            (DType::F16, DType::F16)
+        );
+        assert_eq!(execution_dtypes(DType::F32, true), (DType::F32, DType::F32));
+    }
 }
