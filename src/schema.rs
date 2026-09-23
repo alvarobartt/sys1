@@ -28,12 +28,36 @@ pub struct Usage {
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ApiError {
     pub error: String,
+    #[serde(skip)]
+    #[schema(ignore)]
+    status: u16,
 }
 
 impl ApiError {
     pub fn new(message: impl Into<String>) -> Self {
+        Self::with_status(message, 400)
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::with_status(message, 503)
+    }
+
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self::with_status(message, 504)
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::with_status(message, 500)
+    }
+
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    fn with_status(message: impl Into<String>, status: u16) -> Self {
         Self {
             error: message.into(),
+            status,
         }
     }
 }
