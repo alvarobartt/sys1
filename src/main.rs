@@ -1,5 +1,6 @@
 use anyhow::Context;
-use clap::Parser;
+use candle_core::DType;
+use clap::{Parser, ValueEnum};
 use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
@@ -47,6 +48,8 @@ struct Args {
     request_timeout_ms: u64,
     #[arg(long, default_value_t = 1_048_576)]
     max_request_bytes: usize,
+    #[arg(long, value_enum, default_value_t = Precision::Auto)]
+    dtype: Precision,
 }
 
 impl Args {
@@ -73,6 +76,24 @@ impl Args {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum Precision {
+    Auto,
+    F32,
+    F16,
+    Bf16,
+}
+
+impl Precision {
+    fn resolve(self) -> DType {
+        match self {
+            Self::Auto | Self::F32 => DType::F32,
+            Self::F16 => DType::F16,
+            Self::Bf16 => DType::BF16,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -84,11 +105,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     args.validate()?;
+    let dtype = args.dtype.resolve();
     info!(
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),
         backend = backend(),
         ?args,
+        ?dtype,
         "sys1 starting"
     );
     let address = SocketAddr::new(args.host, args.port);
@@ -123,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
         path = %model_path.display(),
         "loading model"
     );
-    let model = models::load(&model_path, architecture)
+    let model = models::load(&model_path, architecture, dtype)
         .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     info!(
         model = %served_model_name,
@@ -213,12 +236,24 @@ mod tests {
         assert_eq!(args.max_queue_size, 256);
         assert_eq!(args.request_timeout_ms, 30_000);
         assert_eq!(args.max_request_bytes, 1_048_576);
+        assert_eq!(args.dtype, Precision::Auto);
     }
 
     #[test]
     fn accepts_a_local_model_path() {
         let args = Args::try_parse_from(["sys1", "--model-path", "/models/laya"]).unwrap();
         assert_eq!(args.model_path, Some(PathBuf::from("/models/laya")));
+    }
+
+    #[test]
+    fn resolves_requested_and_backend_default_dtypes() {
+        assert_eq!(Precision::F32.resolve(), DType::F32);
+        assert_eq!(Precision::F16.resolve(), DType::F16);
+        assert_eq!(Precision::Bf16.resolve(), DType::BF16);
+        assert_eq!(Precision::Auto.resolve(), DType::F32);
+
+        let args = Args::try_parse_from(["sys1", "--dtype", "bf16"]).unwrap();
+        assert_eq!(args.dtype, Precision::Bf16);
     }
 
     #[test]

@@ -37,7 +37,7 @@ jobs:
             file: Dockerfile.cuda
             suffix: -ampere
             cache_scope: cuda-ampere
-            build_args: CUDA_COMPUTE_CAPS=80
+            build_args: CUDA_COMPUTE_CAPS=80;86
           - name: ada-lovelace
             file: Dockerfile.cuda
             suffix: -ada-lovelace
