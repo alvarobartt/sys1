@@ -20,7 +20,7 @@
 - Dynamic, token-based batching
 - Support for ModernBert with Laya custom decision heads
 - CPU, CUDA and Metal (MPS) supported
-- Up to ~14ms per query on NVIDIA RTX Pro 6000
+- ~14ms per query on NVIDIA RTX Pro 6000
 
 ## Get started
 
