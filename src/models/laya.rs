@@ -157,12 +157,20 @@ pub struct Laya {
 }
 
 impl Laya {
-    pub fn load(path: &Path, dtype: DType) -> anyhow::Result<Self> {
+    pub fn load(path: &Path, dtype: DType, max_model_len: Option<usize>) -> anyhow::Result<Self> {
         let device = device::load()?;
         let (model_dtype, compute_dtype) = execution_dtypes(dtype, device.is_cuda());
-        let config: LayaConfig =
+        let mut config: LayaConfig =
             serde_json::from_slice(&fs::read(path.join("rl_agent_config.json"))?)?;
         let encoder_config = ModernBertConfig::load(&path.join("encoder/config.json"))?;
+        if let Some(max_model_len) = max_model_len {
+            anyhow::ensure!(
+                max_model_len <= encoder_config.max_position_embeddings(),
+                "--max-model-len {max_model_len} exceeds the encoder limit of {}",
+                encoder_config.max_position_embeddings()
+            );
+            config.max_len = max_model_len;
+        }
         let weights = path.join("model.safetensors");
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], model_dtype, &device)? };
         let encoder_vb = vb.clone().rename_f(|name| {
@@ -189,15 +197,16 @@ impl Laya {
         };
         let tokenizer_json = fs::read(tokenizer_path)?;
         let tokenizer = tokenizer::from_json(&tokenizer_json)?;
-        let token = |value: &str| {
-            tokenizer
-                .token_to_id(value)
-                .ok_or_else(|| anyhow::anyhow!("tokenizer is missing {value}"))
+        let token = |values: &[&str]| {
+            values
+                .iter()
+                .find_map(|value| tokenizer.token_to_id(value))
+                .ok_or_else(|| anyhow::anyhow!("tokenizer is missing one of {values:?}"))
         };
-        let pad_id = token("[PAD]")?;
-        let cls_id = token("[CLS]")?;
-        let sep_id = token("[SEP]")?;
-        let mask_id = token("[MASK]")?;
+        let pad_id = token(&["[PAD]", "<pad>"])?;
+        let cls_id = token(&["[CLS]", "<bos>"])?;
+        let sep_id = token(&["[SEP]", "<eos>"])?;
+        let mask_id = token(&["[MASK]", "<mask>"])?;
         Ok(Self {
             tokenizer,
             encoder,
@@ -244,7 +253,7 @@ impl Laya {
             return Err(ApiError::new("questions must not be empty"));
         }
         let state = render_value(&request.state);
-        let sanitized_state = state.replace("[MASK]", " ");
+        let sanitized_state = sanitize_masks(&state);
         let state_ids = self.encode(&sanitized_state)?;
         let mut items = Vec::with_capacity(request.questions.len());
         for (id, value) in request.questions {
@@ -291,7 +300,7 @@ impl Laya {
         state_ids: &[u32],
         question: &Question,
     ) -> Result<(Vec<u32>, Vec<usize>), ApiError> {
-        let instructions = question.instructions.replace("[MASK]", " ");
+        let instructions = sanitize_masks(&question.instructions);
         let mut head = self.encode(&format!(
             "{} question: {instructions}",
             TYPES[question.kind]
@@ -300,7 +309,7 @@ impl Laya {
         for option in &question.options {
             let mut ids = vec![self.mask_id];
             ids.extend(
-                self.encode(&format!(" {}", option.replace("[MASK]", " ")))?
+                self.encode(&format!(" {}", sanitize_masks(option)))?
                     .into_iter()
                     .take(48),
             );
@@ -538,6 +547,10 @@ impl Laya {
             },
         }
     }
+}
+
+fn sanitize_masks(value: &str) -> String {
+    value.replace("[MASK]", " ").replace("<mask>", " ")
 }
 
 fn linear_dtype(
@@ -800,70 +813,89 @@ mod tests {
 
     #[tokio::test]
     async fn fp32_logits_and_probabilities() -> anyhow::Result<()> {
-        let path = crate::hub::download(
-            "convaiinnovations/laya",
-            "aa8c91ca088ec597df95a0d1c76b3063cb2ae5e8",
-        )
-        .await?;
+        let models = [
+            (
+                "laya",
+                "convaiinnovations/laya",
+                "aa8c91ca088ec597df95a0d1c76b3063cb2ae5e8",
+            ),
+            (
+                "laya_typed_decisions",
+                "convaiinnovations/laya-typed-decisions",
+                "1a793eb568e6718f15941d08f85432581df534e3",
+            ),
+            (
+                "laya_multilingual",
+                "convaiinnovations/laya-multilingual",
+                "e4e9ddf21a7b1903b7acffd8814ad4307bf63a67",
+            ),
+        ];
 
-        let model = Laya::load(&path, DType::F32)?;
-        let request: DecisionRequest = serde_json::from_value(json!({
-            "state": {
-                "message": "I was charged twice for invoice 4411. Please refund me today.",
-                "account_tier": "enterprise"
-            },
-            "questions": {
-                "route": {
-                    "type": "choice",
-                    "instructions": "Where should this ticket go?",
-                    "criteria": {
-                        "billing": "payments, refunds, invoices",
-                        "bug": "the product is broken",
-                        "account": "login or access"
+        for (snapshot, model_id, revision) in models {
+            let path = crate::hub::download(model_id, revision).await?;
+            let model = Laya::load(&path, DType::F32, None)?;
+            let request: DecisionRequest = serde_json::from_value(json!({
+                "state": {
+                    "message": "I was charged twice for invoice 4411. Please refund me today.",
+                    "account_tier": "enterprise"
+                },
+                "questions": {
+                    "route": {
+                        "type": "choice",
+                        "instructions": "Where should this ticket go?",
+                        "criteria": {
+                            "billing": "payments, refunds, invoices",
+                            "bug": "the product is broken",
+                            "account": "login or access"
+                        }
+                    },
+                    "urgency": {
+                        "type": "score",
+                        "instructions": "How urgent is this message?",
+                        "criteria": [
+                            "routine, no rush",
+                            "today",
+                            "urgent",
+                            "critical, about to churn"
+                        ]
+                    },
+                    "escalate": {
+                        "type": "noul",
+                        "instructions": "Escalate to a human immediately?"
                     }
-                },
-                "urgency": {
-                    "type": "score",
-                    "instructions": "How urgent is this message?",
-                    "criteria": [
-                        "routine, no rush",
-                        "today",
-                        "urgent",
-                        "critical, about to churn"
-                    ]
-                },
-                "escalate": {
-                    "type": "noul",
-                    "instructions": "Escalate to a human immediately?"
                 }
-            }
-        }))?;
+            }))?;
 
-        let prepared = model.prepare(request).expect("prepare the test request");
-        let logits = model.forward(std::slice::from_ref(&prepared))?;
-        let probabilities: Vec<_> = prepared
-            .items
-            .iter()
-            .zip(&logits)
-            .map(|(item, logits)| {
-                let bucket = bucket(item.question.kind, logits.len());
-                let temperature = model
-                    .config
-                    .temperature_by_options
-                    .get(&bucket)
-                    .copied()
-                    .unwrap_or(model.config.temperature[item.question.kind])
-                    .clamp(0.5, 5.0);
-                probability(logits, temperature)
-            })
-            .collect();
+            let prepared = model.prepare(request).expect("prepare the test request");
+            let logits = model.forward(std::slice::from_ref(&prepared))?;
+            let probabilities: Vec<_> = prepared
+                .items
+                .iter()
+                .zip(&logits)
+                .map(|(item, logits)| {
+                    let bucket = bucket(item.question.kind, logits.len());
+                    let temperature = model
+                        .config
+                        .temperature_by_options
+                        .get(&bucket)
+                        .copied()
+                        .unwrap_or(model.config.temperature[item.question.kind])
+                        .clamp(0.5, 5.0);
+                    probability(logits, temperature)
+                })
+                .collect();
 
-        insta::assert_yaml_snapshot!("laya_fp32_logits", logits, {
-            "[][]" => insta::rounded_redaction(3),
-        });
-        insta::assert_yaml_snapshot!("laya_fp32_probabilities", probabilities, {
-            "[][]" => insta::rounded_redaction(4),
-        });
+            insta::assert_yaml_snapshot!(format!("{snapshot}_fp32_logits"), logits, {
+                "[][]" => insta::rounded_redaction(3),
+            });
+            insta::assert_yaml_snapshot!(
+                format!("{snapshot}_fp32_probabilities"),
+                probabilities,
+                {
+                    "[][]" => insta::rounded_redaction(4),
+                }
+            );
+        }
 
         Ok(())
     }

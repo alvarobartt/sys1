@@ -48,6 +48,8 @@ struct Args {
     request_timeout_ms: u64,
     #[arg(long, default_value_t = 1_048_576)]
     max_request_bytes: usize,
+    #[arg(long)]
+    max_model_len: Option<usize>,
     #[arg(long, value_enum, default_value_t = Precision::Auto)]
     dtype: Precision,
 }
@@ -71,6 +73,10 @@ impl Args {
         anyhow::ensure!(
             self.max_request_bytes > 0,
             "--max-request-bytes must be positive"
+        );
+        anyhow::ensure!(
+            self.max_model_len != Some(0),
+            "--max-model-len must be positive"
         );
         Ok(())
     }
@@ -146,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
         path = %model_path.display(),
         "loading model"
     );
-    let model = models::load(&model_path, architecture, dtype)
+    let model = models::load(&model_path, architecture, dtype, args.max_model_len)
         .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     info!(
         model = %served_model_name,
@@ -236,6 +242,7 @@ mod tests {
         assert_eq!(args.max_queue_size, 256);
         assert_eq!(args.request_timeout_ms, 30_000);
         assert_eq!(args.max_request_bytes, 1_048_576);
+        assert_eq!(args.max_model_len, None);
         assert_eq!(args.dtype, Precision::Auto);
     }
 
@@ -254,6 +261,16 @@ mod tests {
 
         let args = Args::try_parse_from(["sys1", "--dtype", "bf16"]).unwrap();
         assert_eq!(args.dtype, Precision::Bf16);
+    }
+
+    #[test]
+    fn accepts_a_model_length_override() {
+        let args = Args::try_parse_from(["sys1", "--max-model-len", "8192"]).unwrap();
+        assert_eq!(args.max_model_len, Some(8192));
+        assert!(args.validate().is_ok());
+
+        let args = Args::try_parse_from(["sys1", "--max-model-len", "0"]).unwrap();
+        assert!(args.validate().is_err());
     }
 
     #[test]

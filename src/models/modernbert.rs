@@ -38,6 +38,10 @@ impl Config {
         self.hidden_size
     }
 
+    pub fn max_position_embeddings(&self) -> usize {
+        self.max_position_embeddings
+    }
+
     fn global_rope_theta(&self) -> f64 {
         self.rope_parameters["full_attention"].rope_theta
     }

@@ -11,6 +11,14 @@ use std::{fs, path::Path};
 pub use laya::Laya;
 
 pub const LAYA_MODEL_ID: &str = "convaiinnovations/laya";
+pub const LAYA_TYPED_DECISIONS_MODEL_ID: &str = "convaiinnovations/laya-typed-decisions";
+pub const LAYA_MULTILINGUAL_MODEL_ID: &str = "convaiinnovations/laya-multilingual";
+
+pub const LAYA_MODEL_IDS: &[&str] = &[
+    LAYA_MODEL_ID,
+    LAYA_TYPED_DECISIONS_MODEL_ID,
+    LAYA_MULTILINGUAL_MODEL_ID,
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Architecture {
@@ -19,9 +27,13 @@ pub enum Architecture {
 
 impl Architecture {
     pub fn from_model_id(model_id: &str) -> anyhow::Result<Self> {
-        match model_id {
-            LAYA_MODEL_ID => Ok(Self::Laya),
-            _ => bail!("unsupported model id {model_id:?}; supported model: {LAYA_MODEL_ID}"),
+        if LAYA_MODEL_IDS.contains(&model_id) {
+            Ok(Self::Laya)
+        } else {
+            bail!(
+                "unsupported model id {model_id:?}; supported models: {}",
+                LAYA_MODEL_IDS.join(", ")
+            )
         }
     }
 
@@ -45,7 +57,10 @@ impl Architecture {
                     .with_context(|| format!("failed to read {}", laya_config_path.display()))?,
             )
             .with_context(|| format!("failed to parse {}", laya_config_path.display()))?;
-            if laya_config.model_name == "rl-agent" {
+            if matches!(
+                laya_config.model_name.as_str(),
+                "rl-agent" | "laya-typed-decisions"
+            ) {
                 return Ok(Self::Laya);
             }
         }
@@ -89,9 +104,14 @@ impl DecisionModel for Model {
     }
 }
 
-pub fn load(path: &Path, architecture: Architecture, dtype: DType) -> anyhow::Result<Model> {
+pub fn load(
+    path: &Path,
+    architecture: Architecture,
+    dtype: DType,
+    max_model_len: Option<usize>,
+) -> anyhow::Result<Model> {
     match architecture {
-        Architecture::Laya => Laya::load(path, dtype).map(Model::Laya),
+        Architecture::Laya => Laya::load(path, dtype, max_model_len).map(Model::Laya),
     }
 }
 
@@ -100,11 +120,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn routes_the_supported_hub_model() {
-        assert_eq!(
-            Architecture::from_model_id(LAYA_MODEL_ID).unwrap(),
-            Architecture::Laya
-        );
+    fn routes_the_supported_hub_models() {
+        for model_id in LAYA_MODEL_IDS {
+            assert_eq!(
+                Architecture::from_model_id(model_id).unwrap(),
+                Architecture::Laya
+            );
+        }
         assert!(Architecture::from_model_id("owner/other").is_err());
     }
 }
