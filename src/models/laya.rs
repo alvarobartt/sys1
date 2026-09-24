@@ -798,6 +798,76 @@ fn round4(value: f32) -> f64 {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn fp32_logits_and_probabilities() -> anyhow::Result<()> {
+        let path = crate::hub::download(
+            "convaiinnovations/laya",
+            "aa8c91ca088ec597df95a0d1c76b3063cb2ae5e8",
+        )
+        .await?;
+
+        let model = Laya::load(&path, DType::F32)?;
+        let request: DecisionRequest = serde_json::from_value(json!({
+            "state": {
+                "message": "I was charged twice for invoice 4411. Please refund me today.",
+                "account_tier": "enterprise"
+            },
+            "questions": {
+                "route": {
+                    "type": "choice",
+                    "instructions": "Where should this ticket go?",
+                    "criteria": {
+                        "billing": "payments, refunds, invoices",
+                        "bug": "the product is broken",
+                        "account": "login or access"
+                    }
+                },
+                "urgency": {
+                    "type": "score",
+                    "instructions": "How urgent is this message?",
+                    "criteria": [
+                        "routine, no rush",
+                        "today",
+                        "urgent",
+                        "critical, about to churn"
+                    ]
+                },
+                "escalate": {
+                    "type": "noul",
+                    "instructions": "Escalate to a human immediately?"
+                }
+            }
+        }))?;
+
+        let prepared = model.prepare(request).expect("prepare the test request");
+        let logits = model.forward(std::slice::from_ref(&prepared))?;
+        let probabilities: Vec<_> = prepared
+            .items
+            .iter()
+            .zip(&logits)
+            .map(|(item, logits)| {
+                let bucket = bucket(item.question.kind, logits.len());
+                let temperature = model
+                    .config
+                    .temperature_by_options
+                    .get(&bucket)
+                    .copied()
+                    .unwrap_or(model.config.temperature[item.question.kind])
+                    .clamp(0.5, 5.0);
+                probability(logits, temperature)
+            })
+            .collect();
+
+        insta::assert_yaml_snapshot!("laya_fp32_logits", logits, {
+            "[][]" => insta::rounded_redaction(3),
+        });
+        insta::assert_yaml_snapshot!("laya_fp32_probabilities", probabilities, {
+            "[][]" => insta::rounded_redaction(4),
+        });
+
+        Ok(())
+    }
+
     fn item(id: &str, kind: usize, ids: &[u32]) -> Item {
         Item {
             question: Question {
