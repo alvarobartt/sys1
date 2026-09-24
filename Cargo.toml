@@ -1,8 +1,8 @@
 [package]
 name = "sys1"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
-description = "System One compatible API for open decision models, e.g. Laya, written in Rust."
+description = "System One compatible API for open decision models, written in Rust."
 authors = ["Alvaro Bartolome <36760800+alvarobartt@users.noreply.github.com>"]
 default-run = "sys1"
 license = "Apache-2.0"
