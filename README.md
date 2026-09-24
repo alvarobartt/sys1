@@ -44,6 +44,7 @@ And, just query your Jev-compatible API at `/v1/systemone` (or `/v1/decide`).
 curl http://localhost:3000/v1/systemone \
     -H "Content-Type: application/json" \
     -d '{
+      "model": "convaiinnovations/laya",
       "state": {
         "message": "I was charged twice for invoice 4411. Please refund me today."
       },
