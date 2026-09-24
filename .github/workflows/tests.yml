@@ -1,20 +1,35 @@
 name: Tests
 
 on:
-  workflow_call:
-    secrets:
-      HF_TOKEN:
-        required: false
+  workflow_run:
+    workflows: [Lint]
+    types: [completed]
 
 permissions:
   contents: read
 
+concurrency:
+  group: tests-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
 jobs:
+  prerequisite:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful linting
+        env:
+          LINT_RESULT: ${{ github.event.workflow_run.conclusion }}
+        run: test "${LINT_RESULT}" = success
+
   cpu:
+    needs: prerequisite
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -22,18 +37,22 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: test-cpu-${{ hashFiles('Cargo.lock') }}-aa8c91ca088ec597df95a0d1c76b3063cb2ae5e8
-          restore-keys: test-cpu-
+          key: test-${{ github.event.workflow_run.event }}-cpu-${{ hashFiles('Cargo.lock') }}-aa8c91ca088ec597df95a0d1c76b3063cb2ae5e8
+          restore-keys: test-${{ github.event.workflow_run.event }}-cpu-
       - name: Test
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ github.event.workflow_run.event != 'pull_request' && secrets.HF_TOKEN || '' }}
         run: cargo test --release --locked --no-default-features --features cpu
 
   metal:
-    runs-on: macos-14
+    needs: prerequisite
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -41,9 +60,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: test-metal-${{ hashFiles('Cargo.lock') }}-aa8c91ca088ec597df95a0d1c76b3063cb2ae5e8
-          restore-keys: test-metal-
+          key: test-${{ github.event.workflow_run.event }}-metal-${{ hashFiles('Cargo.lock') }}-aa8c91ca088ec597df95a0d1c76b3063cb2ae5e8
+          restore-keys: test-${{ github.event.workflow_run.event }}-metal-
       - name: Test
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ github.event.workflow_run.event != 'pull_request' && secrets.HF_TOKEN || '' }}
         run: cargo test --release --locked --no-default-features --features metal

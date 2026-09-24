@@ -1,11 +1,9 @@
-name: Build and publish images
+name: Build images
 
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-  pull_request:
-    branches: [main]
+  workflow_run:
+    workflows: [Tests]
+    types: [completed]
 
 permissions:
   actions: write
@@ -13,21 +11,42 @@ permissions:
   packages: write
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: build-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: true
 
 jobs:
-  lint:
-    uses: ./.github/workflows/linting.yml
+  context:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      event: ${{ steps.source.outputs.event }}
+      sha: ${{ steps.source.outputs.sha }}
+      short_sha: ${{ steps.source.outputs.short_sha }}
+      tag: ${{ steps.source.outputs.tag }}
+    steps:
+      - name: Resolve tested source
+        id: source
+        env:
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_REF: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-  tests:
-    needs: lint
-    uses: ./.github/workflows/tests.yml
-    secrets: inherit
+          tag=""
+          if [[ "${SOURCE_EVENT}" == "push" && "${SOURCE_REF}" == v* ]]; then
+            tag="${SOURCE_REF}"
+          fi
+
+          echo "event=${SOURCE_EVENT}" >> "${GITHUB_OUTPUT}"
+          echo "sha=${SOURCE_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "short_sha=${SOURCE_SHA:0:7}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
 
   build:
-    needs: tests
-    if: github.ref_type != 'tag'
+    needs: context
+    if: needs.context.outputs.tag == ''
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -99,10 +118,13 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.context.outputs.sha }}
       - name: Determine cache permissions
         id: cache
         env:
-          TRUSTED_CACHE_WRITER: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          TRUSTED_CACHE_WRITER: ${{ needs.context.outputs.event == 'push' }}
         shell: bash
         run: |
           if [[ "${TRUSTED_CACHE_WRITER}" == "true" ]]; then
@@ -140,7 +162,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           flavor: latest=false
           tags: |
-            type=sha,format=short,prefix=,suffix=${{ matrix.staging_suffix }}
+            type=raw,value=${{ needs.context.outputs.short_sha }}${{ matrix.staging_suffix }}
       - name: Build ${{ matrix.name }} image for ${{ matrix.platform }}
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -154,15 +176,15 @@ jobs:
             ACTIONS_RESULTS_URL=${{ env.ACTIONS_RESULTS_URL }}
             ACTIONS_RUNTIME_TOKEN=${{ env.ACTIONS_RUNTIME_TOKEN }}
           platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ needs.context.outputs.event == 'push' }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: ${{ matrix.name == 'cpu' && format('type=gha,scope={0}', matrix.cache_scope) || format('type=registry,ref=ghcr.io/{0}:buildcache-{1}', github.repository, matrix.cache_scope) }}
           cache-to: ${{ matrix.name == 'cpu' && format('type=gha,mode=max,scope={0}', matrix.cache_scope) || (steps.cache.outputs.write == 'true' && format('type=registry,ref=ghcr.io/{0}:buildcache-{1},mode=max', github.repository, matrix.cache_scope) || '') }}
 
   assemble:
-    if: github.event_name == 'push' && github.ref_type != 'tag'
-    needs: build
+    if: needs.context.outputs.event == 'push' && needs.context.outputs.tag == ''
+    needs: [context, build]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -215,8 +237,8 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           flavor: latest=false
           tags: |
-            type=sha,format=short,prefix=,suffix=${{ matrix.suffix }},priority=300
-            type=sha,format=short,prefix=,priority=300,enable=${{ matrix.name == 'cpu' }}
+            type=raw,value=${{ needs.context.outputs.short_sha }}${{ matrix.suffix }},priority=300
+            type=raw,value=${{ needs.context.outputs.short_sha }},priority=300,enable=${{ matrix.name == 'cpu' }}
             type=raw,value=latest${{ matrix.suffix }}
             type=raw,value=latest,enable=${{ matrix.name == 'cpu' }}
       - name: Assemble ${{ matrix.name }} image
@@ -224,6 +246,7 @@ jobs:
           DESTINATION_TAGS: ${{ steps.metadata.outputs.tags }}
           EXPECTED_PLATFORMS: ${{ matrix.expected_platforms }}
           SOURCE_SUFFIXES: ${{ matrix.source_suffixes }}
+          SOURCE_SHA: ${{ needs.context.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -231,7 +254,7 @@ jobs:
           sources=()
           while IFS= read -r source_suffix; do
             if [[ -n "${source_suffix}" ]]; then
-              sources+=("ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_SHA:0:7}${source_suffix}")
+              sources+=("ghcr.io/${GITHUB_REPOSITORY}:${SOURCE_SHA:0:7}${source_suffix}")
             fi
           done <<< "${SOURCE_SUFFIXES}"
 
@@ -261,8 +284,8 @@ jobs:
           fi
 
   promote:
-    needs: tests
-    if: github.ref_type == 'tag'
+    needs: context
+    if: needs.context.outputs.tag != ''
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -296,18 +319,19 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           flavor: latest=false
           tags: |
-            type=semver,pattern={{version}},suffix=${{ matrix.suffix }}
-            type=semver,pattern={{version}},enable=${{ matrix.name == 'cpu' }}
+            type=semver,pattern={{version}},value=${{ needs.context.outputs.tag }},suffix=${{ matrix.suffix }}
+            type=semver,pattern={{version}},value=${{ needs.context.outputs.tag }},enable=${{ matrix.name == 'cpu' }}
             type=raw,value=latest${{ matrix.suffix }}
             type=raw,value=latest,enable=${{ matrix.name == 'cpu' }}
       - name: Promote ${{ matrix.name }} image
         env:
           DESTINATION_TAGS: ${{ steps.metadata.outputs.tags }}
+          SOURCE_SHA: ${{ needs.context.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
 
-          source_tag="ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_SHA:0:7}${{ matrix.suffix }}"
+          source_tag="ghcr.io/${GITHUB_REPOSITORY}:${SOURCE_SHA:0:7}${{ matrix.suffix }}"
           source_digest=""
 
           for attempt in {1..60}; do
@@ -348,8 +372,8 @@ jobs:
           done <<< "${DESTINATION_TAGS}"
 
   publish-crate:
-    needs: tests
-    if: github.ref_type == 'tag'
+    needs: context
+    if: needs.context.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -362,5 +386,5 @@ jobs:
         run: |
           gh workflow run publish.yml \
             --ref "${DEFAULT_BRANCH}" \
-            -f tag="${GITHUB_REF_NAME}" \
-            -f sha="${GITHUB_SHA}"
+            -f tag="${{ needs.context.outputs.tag }}" \
+            -f sha="${{ needs.context.outputs.sha }}"
