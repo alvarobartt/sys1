@@ -407,3 +407,91 @@ fn local_attention_mask(
         .collect();
     Tensor::from_vec(mask, (length, length), device)?.to_dtype(dtype)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::IndexOp;
+
+    #[test]
+    fn local_attention_mask_only_exposes_nearby_tokens() -> Result<()> {
+        let mask = local_attention_mask(4, 1, DType::F32, &Device::Cpu)?.to_vec2::<f32>()?;
+
+        assert_eq!(
+            mask,
+            vec![
+                vec![0.0, 0.0, f32::NEG_INFINITY, f32::NEG_INFINITY],
+                vec![0.0, 0.0, 0.0, f32::NEG_INFINITY],
+                vec![f32::NEG_INFINITY, 0.0, 0.0, 0.0],
+                vec![f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0, 0.0],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn global_attention_mask_hides_padding_tokens() -> Result<()> {
+        let mask = Tensor::new(&[[1u32, 1, 0]], &Device::Cpu)?;
+        let mask = global_attention_mask(&mask, 2, DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+
+        assert_eq!(mask, vec![0.0, 0.0, f32::MIN, 0.0, 0.0, f32::MIN]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fp32_hidden_states() -> anyhow::Result<()> {
+        let path = crate::hub::download(
+            "convaiinnovations/laya",
+            "aa8c91ca088ec597df95a0d1c76b3063cb2ae5e8",
+        )
+        .await?;
+
+        let device = crate::device::load()?;
+        let config = Config::load(&path.join("encoder/config.json"))?;
+        let weights = path.join("model.safetensors");
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device)? };
+        let vb = vb.rename_f(|name| {
+            name.strip_prefix("model.")
+                .map(|name| format!("encoder.{name}"))
+                .unwrap_or_else(|| name.to_owned())
+        });
+        let encoder = Encoder::load(vb, &config, DType::F32)?;
+
+        let tokenizer_path = path.join("tokenizer/tokenizer.json");
+        let tokenizer = crate::tokenizer::from_json(&fs::read(tokenizer_path)?)?;
+        let cls_id = tokenizer
+            .token_to_id("[CLS]")
+            .ok_or_else(|| anyhow::anyhow!("tokenizer is missing [CLS]"))?;
+        let sep_id = tokenizer
+            .token_to_id("[SEP]")
+            .ok_or_else(|| anyhow::anyhow!("tokenizer is missing [SEP]"))?;
+        let pad_id = tokenizer
+            .token_to_id("[PAD]")
+            .ok_or_else(|| anyhow::anyhow!("tokenizer is missing [PAD]"))?;
+
+        let mut ids = vec![cls_id];
+        ids.extend(tokenizer.encode("What is Deep Learning?")?);
+        ids.push(sep_id);
+
+        let mut mask = vec![1f32; ids.len()];
+        ids.resize(32, pad_id);
+        mask.resize(32, 0.0);
+
+        let length = ids.len();
+        let ids = Tensor::from_vec(ids, (1, length), &device)?;
+        let mask = Tensor::from_vec(mask, (1, length), &device)?;
+        let hidden = encoder.forward(&ids, &mask, true)?;
+
+        insta::assert_yaml_snapshot!(
+            "modernbert_fp32_hidden_states",
+            hidden.i((0, 0, 0..128))?.to_vec1::<f32>()?,
+            {
+                "[]" => insta::rounded_redaction(3),
+            }
+        );
+
+        Ok(())
+    }
+}
