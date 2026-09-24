@@ -127,7 +127,9 @@ FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
 ARG CUDA_COMPAT_VERSION
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates "cuda-compat-${CUDA_COMPAT_VERSION}" \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates "cuda-compat-${CUDA_COMPAT_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --system --uid 10001 --user-group --create-home sys1 \
