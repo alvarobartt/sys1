@@ -4,8 +4,15 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
 
 permissions:
   contents: read
@@ -37,28 +44,52 @@ jobs:
     secrets:
       HF_TOKEN: ${{ github.event_name == 'push' && secrets.HF_TOKEN || '' }}
 
-  build:
-    name: Build
+  build_main:
+    name: Build main
     needs: tests
-    if: github.ref_type != 'tag'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       actions: write
       contents: read
       packages: write
     uses: ./.github/workflows/build.yml
     with:
-      push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      push: true
+      source_sha: ${{ github.sha }}
+
+  approve_pr_build:
+    name: Approve PR build
+    needs: tests
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    environment: pr-build
+    steps:
+      - run: echo "PR build approved"
+
+  build_pr:
+    name: Build PR
+    needs: approve_pr_build
+    permissions:
+      actions: write
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build.yml
+    with:
+      push: true
       source_sha: ${{ github.sha }}
 
   push:
     name: Push
-    needs: [tests, build]
+    needs: [tests, build_main]
     if: >-
       always() &&
       needs.tests.result == 'success' &&
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' || github.ref_type == 'tag') &&
-      (github.ref_type == 'tag' || needs.build.result == 'success')
+      (github.ref_type == 'tag' || needs.build_main.result == 'success')
     permissions:
       contents: read
       packages: write
