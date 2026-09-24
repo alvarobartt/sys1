@@ -32,7 +32,11 @@ cargo install sys1 --features cpu
 # cargo install sys1 --no-default-features --features cuda
 ```
 
-Then run it with [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya) (more models coming soon!).
+Then run it with any of the supported models (more coming soon!).
+
+- [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya) for English text, guardrails, email triage
+- [`convaiinnovations/laya-multilingual`](https://huggingface.co/convaiinnovations/laya-multilingual) for 100+ languages, ~2.2x faster
+- [`convaiinnovations/laya-typed-decisions`](https://huggingface.co/convaiinnovations/laya-typed-decisions) for typed-decisions workflows
 
 ```bash
 sys1 --model-id convaiinnovations/laya --dtype auto

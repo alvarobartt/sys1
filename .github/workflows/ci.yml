@@ -39,7 +39,6 @@ jobs:
     needs: [trufflehog, lint]
     uses: ./.github/workflows/tests.yml
     with:
-      cache_scope: ${{ github.event_name }}
       source_sha: ${{ github.sha }}
     secrets:
       HF_TOKEN: ${{ github.event_name == 'push' && secrets.HF_TOKEN || '' }}
