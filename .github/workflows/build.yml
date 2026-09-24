@@ -1,4 +1,4 @@
-name: Build containers
+name: Build and publish images
 
 on:
   push:
@@ -8,15 +8,25 @@ on:
     branches: [main]
 
 permissions:
+  actions: write
   contents: read
   packages: write
 
 concurrency:
-  group: build-containers-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  lint:
+    uses: ./.github/workflows/linting.yml
+
+  tests:
+    needs: lint
+    uses: ./.github/workflows/tests.yml
+    secrets: inherit
+
   build:
+    needs: tests
     if: github.ref_type != 'tag'
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -251,6 +261,7 @@ jobs:
           fi
 
   promote:
+    needs: tests
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -335,3 +346,21 @@ jobs:
               exit 1
             fi
           done <<< "${DESTINATION_TAGS}"
+
+  publish-crate:
+    needs: tests
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Dispatch crates.io publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          gh workflow run publish.yml \
+            --ref "${DEFAULT_BRANCH}" \
+            -f tag="${GITHUB_REF_NAME}" \
+            -f sha="${GITHUB_SHA}"
