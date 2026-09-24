@@ -1,5 +1,5 @@
-ARG CUDA_VERSION=12.9.1
-ARG CUDA_COMPAT_VERSION=12-9
+ARG CUDA_VERSION=13.0.2
+ARG CUDA_COMPAT_VERSION=13-0
 ARG CUDA_COMPUTE_CAPS=80
 ARG UBUNTU_VERSION=24.04
 
@@ -68,7 +68,7 @@ RUN --mount=type=cache,id=sys1-sccache,target=/root/.cache/sccache,sharing=locke
         unset SCCACHE_GHA_ENABLED; \
     fi; \
     if ! printf '%s\n' "${CUDA_COMPUTE_CAPS}" \
-        | grep -Eq '^(75|80|86|89|90|100|120)(;(75|80|86|89|90|100|120))*$'; then \
+        | grep -Eq '^(75|80|86|89|90|100|120|121)(;(75|80|86|89|90|100|120|121))*$'; then \
         echo "unsupported CUDA compute capabilities: ${CUDA_COMPUTE_CAPS}" >&2; \
         exit 1; \
     fi; \
