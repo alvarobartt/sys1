@@ -1,0 +1,202 @@
+name: Push
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        required: false
+        type: string
+        default: ""
+      source_sha:
+        required: true
+        type: string
+
+jobs:
+  commit:
+    name: ${{ matrix.name }}
+    if: inputs.release_tag == ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cpu
+            suffix: -cpu
+            source_suffixes: |-
+              -cpu-amd64
+              -cpu-arm64
+            expected_platforms: |-
+              linux/amd64
+              linux/arm64
+          - name: turing
+            suffix: -turing
+            source_suffixes: -turing-amd64
+            expected_platforms: linux/amd64
+          - name: ampere
+            suffix: -ampere
+            source_suffixes: -ampere-amd64
+            expected_platforms: linux/amd64
+          - name: ada-lovelace
+            suffix: -ada-lovelace
+            source_suffixes: -ada-lovelace-amd64
+            expected_platforms: linux/amd64
+          - name: hopper
+            suffix: -hopper
+            source_suffixes: -hopper-amd64
+            expected_platforms: linux/amd64
+          - name: blackwell
+            suffix: -blackwell
+            source_suffixes: |-
+              -blackwell-amd64
+              -blackwell-arm64
+            expected_platforms: |-
+              linux/amd64
+              linux/arm64
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Docker metadata
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ inputs.source_sha }}${{ matrix.suffix }}
+            type=raw,value=${{ inputs.source_sha }},enable=${{ matrix.name == 'cpu' }}
+            type=raw,value=main${{ matrix.suffix }}
+            type=raw,value=main,enable=${{ matrix.name == 'cpu' }}
+      - name: Push
+        env:
+          DESTINATION_TAGS: ${{ steps.metadata.outputs.tags }}
+          EXPECTED_PLATFORMS: ${{ matrix.expected_platforms }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_SUFFIXES: ${{ matrix.source_suffixes }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sources=()
+          while IFS= read -r source_suffix; do
+            if [[ -n "${source_suffix}" ]]; then
+              sources+=("ghcr.io/${GITHUB_REPOSITORY}:${SOURCE_SHA}${source_suffix}")
+            fi
+          done <<< "${SOURCE_SUFFIXES}"
+
+          create_args=()
+          while IFS= read -r destination_tag; do
+            if [[ -n "${destination_tag}" ]]; then
+              create_args+=(--tag "${destination_tag}")
+            fi
+          done <<< "${DESTINATION_TAGS}"
+
+          docker buildx imagetools create "${create_args[@]}" "${sources[@]}"
+
+          first_destination="${DESTINATION_TAGS%%$'\n'*}"
+          expected_platforms="$(printf '%s\n' "${EXPECTED_PLATFORMS}" | sort)"
+          actual_platforms="$(
+            docker buildx imagetools inspect "${first_destination}" --raw |
+              jq -r '.manifests[].platform | select(.architecture != "unknown") | "\(.os)/\(.architecture)"' |
+              sort -u
+          )"
+          if [[ "${actual_platforms}" != "${expected_platforms}" ]]; then
+            echo "Platform mismatch for ${first_destination}" >&2
+            echo "Expected:" >&2
+            printf '%s\n' "${expected_platforms}" >&2
+            echo "Actual:" >&2
+            printf '%s\n' "${actual_platforms}" >&2
+            exit 1
+          fi
+
+  release:
+    name: ${{ matrix.name }}
+    if: inputs.release_tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cpu
+            suffix: -cpu
+          - name: turing
+            suffix: -turing
+          - name: ampere
+            suffix: -ampere
+          - name: ada-lovelace
+            suffix: -ada-lovelace
+          - name: hopper
+            suffix: -hopper
+          - name: blackwell
+            suffix: -blackwell
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Docker metadata
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.release_tag }},suffix=${{ matrix.suffix }}
+            type=semver,pattern={{version}},value=${{ inputs.release_tag }},enable=${{ matrix.name == 'cpu' }}
+            type=raw,value=latest${{ matrix.suffix }}
+            type=raw,value=latest,enable=${{ matrix.name == 'cpu' }}
+      - name: Push
+        env:
+          DESTINATION_TAGS: ${{ steps.metadata.outputs.tags }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source_tag="ghcr.io/${GITHUB_REPOSITORY}:${SOURCE_SHA}${{ matrix.suffix }}"
+          source_digest=""
+
+          for attempt in {1..60}; do
+            if source_digest="$(docker buildx imagetools inspect "${source_tag}" --format '{{json .Manifest}}' 2>/dev/null | jq -r '.digest')" \
+              && [[ "${source_digest}" == sha256:* ]]; then
+              break
+            fi
+
+            if [[ "${attempt}" -eq 60 ]]; then
+              echo "Source image ${source_tag} was not published within 20 minutes" >&2
+              exit 1
+            fi
+
+            echo "Waiting for ${source_tag} to be published (attempt ${attempt}/60)"
+            sleep 20
+          done
+
+          immutable_source="ghcr.io/${GITHUB_REPOSITORY}@${source_digest}"
+          create_args=()
+          while IFS= read -r destination_tag; do
+            if [[ -n "${destination_tag}" ]]; then
+              create_args+=(--tag "${destination_tag}")
+            fi
+          done <<< "${DESTINATION_TAGS}"
+
+          docker buildx imagetools create "${create_args[@]}" "${immutable_source}"
+
+          while IFS= read -r destination_tag; do
+            if [[ -z "${destination_tag}" ]]; then
+              continue
+            fi
+
+            destination_digest="$(docker buildx imagetools inspect "${destination_tag}" --format '{{json .Manifest}}' | jq -r '.digest')"
+            if [[ "${destination_digest}" != "${source_digest}" ]]; then
+              echo "Digest mismatch for ${destination_tag}: expected ${source_digest}, got ${destination_digest}" >&2
+              exit 1
+            fi
+          done <<< "${DESTINATION_TAGS}"

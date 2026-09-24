@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trufflehog:
+    name: TruffleHog
+    uses: ./.github/workflows/trufflehog.yml
+    with:
+      source_sha: ${{ github.sha }}
+
+  lint:
+    name: Lint
+    uses: ./.github/workflows/linting.yml
+    with:
+      source_sha: ${{ github.sha }}
+
+  tests:
+    name: Tests
+    needs: [trufflehog, lint]
+    uses: ./.github/workflows/tests.yml
+    with:
+      cache_scope: ${{ github.event_name }}
+      source_sha: ${{ github.sha }}
+    secrets:
+      HF_TOKEN: ${{ github.event_name == 'push' && secrets.HF_TOKEN || '' }}
+
+  build:
+    name: Build
+    needs: tests
+    if: github.ref_type != 'tag'
+    permissions:
+      actions: write
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build.yml
+    with:
+      push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      source_sha: ${{ github.sha }}
+
+  push:
+    name: Push
+    needs: [tests, build]
+    if: >-
+      always() &&
+      needs.tests.result == 'success' &&
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref_type == 'tag') &&
+      (github.ref_type == 'tag' || needs.build.result == 'success')
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/push.yml
+    with:
+      release_tag: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+      source_sha: ${{ github.sha }}
+
+  publish:
+    name: Publish
+    needs: tests
+    if: github.ref_type == 'tag'
+    uses: ./.github/workflows/publish.yml
+    with:
+      sha: ${{ github.sha }}
+      tag: ${{ github.ref_name }}
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
