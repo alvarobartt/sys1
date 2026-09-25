@@ -1,14 +1,12 @@
 <div align="center">
   <img
     src="https://github.com/user-attachments/assets/8b2774a7-6439-422e-bbd3-3fdd85117c5d"
-    alt="System One"
+    alt="sys1"
     width="1200"
   />
   <br/>
   <em>
-    System One compatible API for open decision models, e.g.
-    <a href="https://huggingface.co/convaiinnovations/laya">Laya</a>,
-    written in Rust.
+    System One compatible API for open decision models, written in Rust.
   </em>
 </div>
 
@@ -18,9 +16,8 @@
 - System One compatible API Spec
 - `candle` with [`tokenizers` release candidate](https://huggingface.co/blog/tokenizers-v1)!
 - Dynamic, token-based batching
-- Support for ModernBert with Laya custom decision heads
-- CPU, CUDA and Metal (MPS) supported
-- ~14ms per query on NVIDIA RTX Pro 6000
+- SDPA on CPU, Metal, and CUDA
+- Flash Attention on Ampere, Ada Lovelace, and Hopper
 
 ## Get started
 
@@ -30,6 +27,8 @@ Install it with support for CPU, Metal or CUDA.
 cargo install sys1 --features cpu
 # cargo install sys1 --no-default-features --features metal
 # cargo install sys1 --no-default-features --features cuda
+# cargo install sys1 --no-default-features --features cuda,flash-attn-2 # Ampere, Ada Lovelace, or Hopper
+# cargo install sys1 --no-default-features --features cuda,flash-attn-3 # Hopper
 ```
 
 Then run it with any of the supported models (more coming soon!).

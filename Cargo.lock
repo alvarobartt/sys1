@@ -449,6 +449,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-flash-attn"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5f1e2f29f5123d7a627171209fdaeb4ee91d076aefeac588922aa9842e30c2c"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "cudaforge",
+ "half",
+]
+
+[[package]]
+name = "candle-flash-attn-v3"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5280d06b34f1c9370db620d6d08ea22577a5e26edb7665e6393c6bf5a4900a9f"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "cudaforge",
+ "half",
+ "num_cpus",
+ "rayon",
+]
+
+[[package]]
 name = "candle-kernels"
 version = "0.11.0"
 source = "git+https://github.com/huggingface/candle?rev=e68b659fd096ed0947855d43b2eaa55634759c56#e68b659fd096ed0947855d43b2eaa55634759c56"
@@ -4010,6 +4036,8 @@ dependencies = [
  "anyhow",
  "axum",
  "candle-core",
+ "candle-flash-attn",
+ "candle-flash-attn-v3",
  "candle-nn",
  "clap",
  "hf-hub",

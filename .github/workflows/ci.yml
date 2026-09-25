@@ -43,8 +43,8 @@ jobs:
     secrets:
       HF_TOKEN: ${{ github.event_name == 'push' && secrets.HF_TOKEN || '' }}
 
-  build_main:
-    name: Build main
+  build:
+    name: Build
     needs: tests
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
@@ -82,13 +82,13 @@ jobs:
 
   push:
     name: Push
-    needs: [tests, build_main]
+    needs: [tests, build]
     if: >-
       always() &&
       needs.tests.result == 'success' &&
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/main' || github.ref_type == 'tag') &&
-      (github.ref_type == 'tag' || needs.build_main.result == 'success')
+      (github.ref_type == 'tag' || needs.build.result == 'success')
     permissions:
       contents: read
       packages: write

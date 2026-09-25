@@ -1,5 +1,19 @@
 use candle_core::Device;
 
+pub fn validate_available() -> anyhow::Result<()> {
+    #[cfg(feature = "cuda")]
+    anyhow::ensure!(
+        candle_core::utils::cuda_is_available(),
+        "CUDA backend selected, but no CUDA device is available"
+    );
+    #[cfg(feature = "metal")]
+    anyhow::ensure!(
+        candle_core::utils::metal_is_available(),
+        "Metal backend selected, but no Metal device is available"
+    );
+    Ok(())
+}
+
 #[cfg(all(feature = "cpu", not(any(feature = "cuda", feature = "metal"))))]
 pub fn load() -> anyhow::Result<Device> {
     Ok(Device::Cpu)
