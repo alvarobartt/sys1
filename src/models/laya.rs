@@ -1,8 +1,8 @@
-use super::AttentionImplementation;
-use super::DecisionModel;
 use super::modernbert::{
     AttentionOptions, Config as ModernBertConfig, Encoder as ModernBertEncoder,
 };
+use super::AttentionImplementation;
+use super::DecisionModel;
 use crate::{
     device,
     schema::{ApiError, DecisionRequest, DecisionResponse, Usage},
@@ -10,10 +10,10 @@ use crate::{
 };
 
 use anyhow::Context;
-use candle_core::{D, DType, Device, IndexOp, Tensor};
-use candle_nn::{Embedding, LayerNorm, Linear, VarBuilder, embedding, layer_norm};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
+use candle_nn::{embedding, layer_norm, Embedding, LayerNorm, Linear, VarBuilder};
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::{collections::HashMap, fs, path::Path};
 
 const TYPES: [&str; 3] = ["choice", "score", "noul"];
@@ -201,6 +201,11 @@ impl Laya {
             config.max_len = max_model_len;
         }
         let weights = path.join("model.safetensors");
+        // SAFETY: All file-backed mmap constructors are marked `unsafe` because of the potential
+        // for undefined behavior using the map if the underlying file is modified or out of
+        // process.
+        //
+        // More information at https://github.com/RazrFalcon/memmap2-rs/blob/a02e2a/src/lib.rs#L135-L165
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], model_dtype, &device)? };
         let encoder_vb = vb.clone().rename_f(|name| {
             name.strip_prefix("model.")
@@ -1020,14 +1025,12 @@ mod tests {
 
     #[test]
     fn rejects_flash_attention_without_a_compatible_backend() {
-        assert!(
-            validate_attention(
-                AttentionImplementation::FlashAttention2,
-                &Device::Cpu,
-                DType::BF16,
-            )
-            .is_err()
-        );
+        assert!(validate_attention(
+            AttentionImplementation::FlashAttention2,
+            &Device::Cpu,
+            DType::BF16,
+        )
+        .is_err());
         validate_attention(AttentionImplementation::Eager, &Device::Cpu, DType::F32).unwrap();
     }
 
