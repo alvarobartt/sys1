@@ -76,8 +76,7 @@ RUN --mount=type=cache,id=sys1-sccache,target=/root/.cache/sccache,sharing=locke
     compute_caps="$(printf '%s' "${CUDA_COMPUTE_CAPS}" | tr ';' ' ')"; \
     for compute_cap in ${compute_caps}; do \
         case "${compute_cap}" in \
-            80|86|89) features=cuda,flash-attn-2 ;; \
-            90) features=cuda,flash-attn-3 ;; \
+            80|86|89|90) features=cuda,flash-attn-2 ;; \
             *) features=cuda ;; \
         esac; \
         CUDA_COMPUTE_CAP="${compute_cap}" \
@@ -114,8 +113,7 @@ RUN --mount=type=cache,id=sys1-sccache,target=/root/.cache/sccache,sharing=locke
     install -d /app/bin; \
     for compute_cap do \
         case "${compute_cap}" in \
-            80|86|89) features=cuda,flash-attn-2 ;; \
-            90) features=cuda,flash-attn-3 ;; \
+            80|86|89|90) features=cuda,flash-attn-2 ;; \
             *) features=cuda ;; \
         esac; \
         CUDA_COMPUTE_CAP="${compute_cap}" \
