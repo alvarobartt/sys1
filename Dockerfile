@@ -27,6 +27,7 @@ WORKDIR /app
 FROM chef AS planner
 
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
 COPY rust-toolchain.toml ./
 COPY src ./src
 RUN cargo chef prepare --recipe-path recipe.json
@@ -55,6 +56,7 @@ RUN --mount=type=cache,id=sys1-sccache,target=/root/.cache/sccache,sharing=locke
     sccache --show-stats
 
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
 COPY rust-toolchain.toml ./
 COPY src ./src
 

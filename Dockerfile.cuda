@@ -14,7 +14,7 @@ ARG TARGETARCH
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential ca-certificates curl pkg-config \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal
@@ -41,6 +41,7 @@ WORKDIR /app
 FROM chef AS planner
 
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
 COPY rust-toolchain.toml ./
 COPY src ./src
 
@@ -74,17 +75,22 @@ RUN --mount=type=cache,id=sys1-sccache,target=/root/.cache/sccache,sharing=locke
     fi; \
     compute_caps="$(printf '%s' "${CUDA_COMPUTE_CAPS}" | tr ';' ' ')"; \
     for compute_cap in ${compute_caps}; do \
+        case "${compute_cap}" in \
+            80|86|89|90) features=cuda,flash-attn-2 ;; \
+            *) features=cuda ;; \
+        esac; \
         CUDA_COMPUTE_CAP="${compute_cap}" \
         CARGO_TARGET_DIR="target/${compute_cap}" \
         cargo chef cook \
             --release \
             --no-default-features \
-            --features cuda \
+            --features "${features}" \
             --recipe-path recipe.json; \
     done; \
     sccache --show-stats
 
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
 COPY rust-toolchain.toml ./
 COPY src ./src
 
@@ -106,13 +112,17 @@ RUN --mount=type=cache,id=sys1-sccache,target=/root/.cache/sccache,sharing=locke
     set -- ${compute_caps}; \
     install -d /app/bin; \
     for compute_cap do \
+        case "${compute_cap}" in \
+            80|86|89|90) features=cuda,flash-attn-2 ;; \
+            *) features=cuda ;; \
+        esac; \
         CUDA_COMPUTE_CAP="${compute_cap}" \
         CARGO_TARGET_DIR="target/${compute_cap}" \
         cargo build \
             --release \
             --locked \
             --no-default-features \
-            --features cuda \
+            --features "${features}" \
             --bin sys1; \
         if [ "$#" -eq 1 ]; then \
             install "target/${compute_cap}/release/sys1" /app/bin/sys1; \
