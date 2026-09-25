@@ -210,24 +210,26 @@ pub(super) fn scaled_dot_product_attention(
     scale: f64,
     options: AttentionOptions<'_>,
 ) -> Result<Tensor> {
-    if options.implementation != AttentionImplementation::Eager {
-        return flash_attention(
+    match options.implementation {
+        AttentionImplementation::Eager => {
+            let scores = (q * scale)?.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+            let scores = match options.mask {
+                Some(mask) => scores.to_dtype(mask.dtype())?.broadcast_add(mask)?,
+                None => scores,
+            };
+            let probabilities = attention_softmax(&scores)?;
+            probabilities.to_dtype(v.dtype())?.matmul(v)
+        }
+        implementation => flash_attention(
             q,
             k,
             v,
             options.lengths,
             scale as f32,
             options.window,
-            options.implementation,
-        );
+            implementation,
+        ),
     }
-    let scores = (q * scale)?.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
-    let scores = match options.mask {
-        Some(mask) => scores.to_dtype(mask.dtype())?.broadcast_add(mask)?,
-        None => scores,
-    };
-    let probabilities = attention_softmax(&scores)?;
-    probabilities.to_dtype(v.dtype())?.matmul(v)
 }
 
 fn attention_softmax(scores: &Tensor) -> Result<Tensor> {

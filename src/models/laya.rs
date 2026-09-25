@@ -112,7 +112,7 @@ impl HeadLayer {
         let scale = (size as f64).powf(-0.5);
 
         #[cfg(feature = "metal")]
-        let attended = if xs.device().is_metal() {
+        let attention = if xs.device().is_metal() {
             let mask = mask
                 .broadcast_as((batch, self.heads, length, length))?
                 .contiguous()?;
@@ -132,7 +132,7 @@ impl HeadLayer {
             )?
         };
         #[cfg(not(feature = "metal"))]
-        let attended = super::modernbert::scaled_dot_product_attention(
+        let attention = super::modernbert::scaled_dot_product_attention(
             &q,
             &k,
             &v,
@@ -144,7 +144,7 @@ impl HeadLayer {
                 window: None,
             },
         )?;
-        let attention = attended
+        let attention = attention
             .transpose(1, 2)?
             .reshape((batch, length, hidden))?
             .apply(&self.projection)?
@@ -613,21 +613,24 @@ fn validate_attention(
 ) -> anyhow::Result<()> {
     attention.validate(compute_dtype)?;
     #[cfg(any(feature = "flash-attn-2", feature = "flash-attn-3"))]
-    if attention != AttentionImplementation::Eager {
-        anyhow::ensure!(
-            _device.is_cuda(),
-            "{} requires a CUDA device",
-            attention.cli_name()
-        );
-        let (major, minor) = match _device {
-            Device::Cuda(cuda) => cuda
-                .cuda_stream()
-                .context()
-                .compute_capability()
-                .context("failed to query CUDA compute capability")?,
-            _ => unreachable!(),
-        };
-        validate_flash_capability(attention, major, minor)?;
+    match attention {
+        AttentionImplementation::Eager => {}
+        implementation => {
+            anyhow::ensure!(
+                _device.is_cuda(),
+                "{} requires a CUDA device",
+                implementation.cli_name()
+            );
+            let (major, minor) = match _device {
+                Device::Cuda(cuda) => cuda
+                    .cuda_stream()
+                    .context()
+                    .compute_capability()
+                    .context("failed to query CUDA compute capability")?,
+                _ => unreachable!(),
+            };
+            validate_flash_capability(implementation, major, minor)?;
+        }
     }
     Ok(())
 }
