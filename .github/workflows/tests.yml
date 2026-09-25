@@ -3,9 +3,6 @@ name: Tests
 on:
   workflow_call:
     inputs:
-      cache_scope:
-        required: true
-        type: string
       source_sha:
         required: true
         type: string
@@ -25,14 +22,19 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.source_sha }}
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Cache models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/huggingface/hub
+          key: models-v1-${{ runner.os }}-aa8c91ca-1a793eb5-e4e9ddf2
+      - name: Cache Cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cache/huggingface/hub
             ~/.cargo/registry
             ~/.cargo/git
-          key: test-v2-${{ inputs.cache_scope }}-cpu-${{ hashFiles('Cargo.lock') }}-aa8c91ca088ec597df95a0d1c76b3063cb2ae5e8
-          restore-keys: test-v2-${{ inputs.cache_scope }}-cpu-
+          key: test-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: test-v3-${{ runner.os }}-
       - name: Test
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -46,14 +48,19 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.source_sha }}
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Cache models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/huggingface/hub
+          key: models-v1-${{ runner.os }}-aa8c91ca-1a793eb5-e4e9ddf2
+      - name: Cache Cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cache/huggingface/hub
             ~/.cargo/registry
             ~/.cargo/git
-          key: test-v2-${{ inputs.cache_scope }}-metal-${{ hashFiles('Cargo.lock') }}-aa8c91ca088ec597df95a0d1c76b3063cb2ae5e8
-          restore-keys: test-v2-${{ inputs.cache_scope }}-metal-
+          key: test-v3-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: test-v3-${{ runner.os }}-
       - name: Test
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}

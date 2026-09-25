@@ -95,25 +95,72 @@ fn migrate(value: &mut Value) -> anyhow::Result<()> {
         .filter(|token| (50254..=50279).contains(&token.id))
         .map(|token| token.content.clone())
         .collect();
-    if removable.len() != 26 {
+    if !matches!(removable.len(), 0 | 26) {
         bail!("unexpected Laya added-token layout");
     }
-    let vocab = value
+    if !removable.is_empty() {
+        let vocab = value
+            .get_mut("model")
+            .and_then(|model| model.get_mut("vocab"))
+            .and_then(Value::as_object_mut)
+            .context("tokenizer has no model vocab")?;
+        for token in removable {
+            vocab.remove(&token);
+        }
+        for (offset, atom) in MISSING_ATOMS.into_iter().enumerate() {
+            vocab.insert(atom.to_string(), Value::from(50254 + offset as u32));
+        }
+    }
+    let model = value
         .get_mut("model")
-        .and_then(|model| model.get_mut("vocab"))
         .and_then(Value::as_object_mut)
-        .context("tokenizer has no model vocab")?;
-    for token in removable {
-        vocab.remove(&token);
-    }
-    for (offset, atom) in MISSING_ATOMS.into_iter().enumerate() {
-        vocab.insert(atom.to_string(), Value::from(50254 + offset as u32));
-    }
+        .context("tokenizer has no model")?;
+    migrate_byte_fallback_tabs(model)?;
     canonicalize_value(value).map_err(|error| anyhow::anyhow!(error.to_string()))?;
     value
         .as_object_mut()
         .unwrap()
         .insert("laya_migration".into(), Value::from(1));
+    Ok(())
+}
+
+fn migrate_byte_fallback_tabs(model: &mut serde_json::Map<String, Value>) -> anyhow::Result<()> {
+    if model.get("byte_fallback").and_then(Value::as_bool) == Some(true) {
+        let vocab = model
+            .get_mut("vocab")
+            .and_then(Value::as_object_mut)
+            .context("tokenizer has no model vocab")?;
+        if !vocab.contains_key("<0x09>") {
+            let tab_tokens: Vec<_> = vocab
+                .keys()
+                .filter(|token| token.contains('\t'))
+                .cloned()
+                .collect();
+            if tab_tokens.is_empty() {
+                bail!("byte-fallback tokenizer is missing <0x09>");
+            }
+            for token in tab_tokens {
+                let id = vocab.remove(&token).unwrap();
+                vocab.insert(token.replace('\t', "<0x09>"), id);
+            }
+            let merges = model
+                .get_mut("merges")
+                .and_then(Value::as_array_mut)
+                .context("byte-fallback tokenizer has no BPE merges")?;
+            for merge in merges {
+                let parts = merge
+                    .as_array_mut()
+                    .context("byte-fallback tokenizer has an invalid BPE merge")?;
+                for part in parts {
+                    if let Some(token) = part.as_str()
+                        && token.contains('\t')
+                    {
+                        *part = Value::String(token.replace('\t', "<0x09>"));
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -137,4 +184,30 @@ fn read_added(value: &Value) -> anyhow::Result<Vec<AddedToken>> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn migrates_tab_tokens_without_duplicate_vocabulary_ids() {
+        let mut model = json!({
+            "byte_fallback": true,
+            "vocab": {"\t": 9, "\t\t": 10, "word": 11},
+            "merges": [["\t", "\t"], ["\t\t", "\t"]]
+        });
+
+        migrate_byte_fallback_tabs(model.as_object_mut().unwrap()).unwrap();
+
+        assert_eq!(
+            model["vocab"],
+            json!({"<0x09>": 9, "<0x09><0x09>": 10, "word": 11})
+        );
+        assert_eq!(
+            model["merges"],
+            json!([["<0x09>", "<0x09>"], ["<0x09><0x09>", "<0x09>"]])
+        );
+    }
 }
