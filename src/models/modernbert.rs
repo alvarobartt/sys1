@@ -1,3 +1,4 @@
+use super::AttentionImplementation;
 use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::{
     Embedding, LayerNorm, Linear, Module, VarBuilder, embedding, layer_norm_no_bias, ops::softmax,
@@ -9,6 +10,8 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
+
+const ATTENTION_MASK_VALUE: f32 = -10_000.0;
 
 #[derive(Deserialize)]
 pub struct Config {
@@ -101,6 +104,7 @@ struct Attention {
     head_size: usize,
     rotary: Arc<RotaryEmbedding>,
     compute_dtype: DType,
+    implementation: AttentionImplementation,
 }
 
 impl Attention {
@@ -109,6 +113,7 @@ impl Attention {
         config: &Config,
         rotary: Arc<RotaryEmbedding>,
         compute_dtype: DType,
+        implementation: AttentionImplementation,
     ) -> Result<Self> {
         Ok(Self {
             qkv: linear_no_bias_dtype(
@@ -127,10 +132,17 @@ impl Attention {
             head_size: config.hidden_size / config.num_attention_heads,
             rotary,
             compute_dtype,
+            implementation,
         })
     }
 
-    fn forward(&self, xs: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    fn forward(
+        &self,
+        xs: &Tensor,
+        mask: Option<&Tensor>,
+        lengths: &[usize],
+        window: Option<usize>,
+    ) -> Result<Tensor> {
         let (batch, length, hidden) = xs.dims3()?;
         let qkv = xs
             .to_dtype(self.compute_dtype)?
@@ -150,10 +162,32 @@ impl Attention {
                 .transpose()?;
             candle_nn::ops::sdpa(&q, &k, &v, mask.as_ref(), false, scale as f32, 1.0)?
         } else {
-            unfused_attention(&q, &k, &v, mask, scale)?
+            scaled_dot_product_attention(
+                &q,
+                &k,
+                &v,
+                scale,
+                AttentionOptions {
+                    mask,
+                    implementation: self.implementation,
+                    lengths,
+                    window,
+                },
+            )?
         };
         #[cfg(not(feature = "metal"))]
-        let attention = unfused_attention(&q, &k, &v, mask, scale)?;
+        let attention = scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            AttentionOptions {
+                mask,
+                implementation: self.implementation,
+                lengths,
+                window,
+            },
+        )?;
 
         attention
             .transpose(1, 2)?
@@ -162,24 +196,159 @@ impl Attention {
     }
 }
 
-fn unfused_attention(
+pub(super) struct AttentionOptions<'a> {
+    pub mask: Option<&'a Tensor>,
+    pub implementation: AttentionImplementation,
+    pub lengths: &'a [usize],
+    pub window: Option<usize>,
+}
+
+pub(super) fn scaled_dot_product_attention(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
-    mask: Option<&Tensor>,
     scale: f64,
+    options: AttentionOptions<'_>,
 ) -> Result<Tensor> {
+    if options.implementation != AttentionImplementation::Eager {
+        return flash_attention(
+            q,
+            k,
+            v,
+            options.lengths,
+            scale as f32,
+            options.window,
+            options.implementation,
+        );
+    }
     let scores = (q * scale)?.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
-    let scores = match mask {
+    let scores = match options.mask {
         Some(mask) => scores.to_dtype(mask.dtype())?.broadcast_add(mask)?,
         None => scores,
     };
-    let probabilities = if scores.dtype() == DType::F16 {
-        softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(DType::F16)?
-    } else {
-        softmax(&scores, D::Minus1)?
-    };
+    let probabilities = attention_softmax(&scores)?;
     probabilities.to_dtype(v.dtype())?.matmul(v)
+}
+
+fn attention_softmax(scores: &Tensor) -> Result<Tensor> {
+    if matches!(scores.dtype(), DType::F16 | DType::BF16) {
+        softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(scores.dtype())
+    } else {
+        softmax(scores, D::Minus1)
+    }
+}
+
+#[cfg(any(feature = "flash-attn-2", feature = "flash-attn-3"))]
+fn flash_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    lengths: &[usize],
+    scale: f32,
+    window: Option<usize>,
+    implementation: AttentionImplementation,
+) -> Result<Tensor> {
+    let (batch, heads, max_length, head_size) = q.dims4()?;
+    if lengths.len() != batch || lengths.iter().any(|&length| length > max_length) {
+        candle_core::bail!(
+            "invalid Flash Attention sequence lengths {:?} for shape {:?}",
+            lengths,
+            q.shape()
+        )
+    }
+    let q = q.transpose(1, 2)?.contiguous()?;
+    let k = k.transpose(1, 2)?.contiguous()?;
+    let v = v.transpose(1, 2)?.contiguous()?;
+    let attention = if lengths.iter().all(|&length| length == max_length) {
+        match implementation {
+            #[cfg(feature = "flash-attn-2")]
+            AttentionImplementation::FlashAttention2 => {
+                candle_flash_attn::flash_attn_windowed(&q, &k, &v, scale, window, window)?
+            }
+            #[cfg(feature = "flash-attn-3")]
+            AttentionImplementation::FlashAttention3 => {
+                candle_flash_attn_v3::flash_attn_windowed(&q, &k, &v, scale, window, window, false)?
+            }
+            _ => candle_core::bail!("{} support is not compiled in", implementation.cli_name()),
+        }
+    } else {
+        let mut indices = Vec::with_capacity(lengths.iter().sum());
+        let mut cumulative = Vec::with_capacity(batch + 1);
+        cumulative.push(0u32);
+        for (row, &length) in lengths.iter().enumerate() {
+            indices.extend((0..length).map(|column| (row * max_length + column) as u32));
+            cumulative.push(cumulative.last().copied().unwrap() + length as u32);
+        }
+        let indices = Tensor::from_vec(
+            indices,
+            cumulative.last().copied().unwrap() as usize,
+            q.device(),
+        )?;
+        let cumulative = Tensor::from_vec(cumulative, batch + 1, q.device())?;
+        let pack = |tensor: &Tensor| {
+            tensor
+                .reshape((batch * max_length, heads, head_size))?
+                .index_select(&indices, 0)
+        };
+        let packed_q = pack(&q)?;
+        let packed_k = pack(&k)?;
+        let packed_v = pack(&v)?;
+        let packed = match implementation {
+            #[cfg(feature = "flash-attn-2")]
+            AttentionImplementation::FlashAttention2 => {
+                candle_flash_attn::flash_attn_varlen_windowed(
+                    &packed_q,
+                    &packed_k,
+                    &packed_v,
+                    &cumulative,
+                    &cumulative,
+                    max_length,
+                    max_length,
+                    scale,
+                    window,
+                    window,
+                )?
+            }
+            #[cfg(feature = "flash-attn-3")]
+            AttentionImplementation::FlashAttention3 => {
+                candle_flash_attn_v3::flash_attn_varlen_windowed(
+                    &packed_q,
+                    &packed_k,
+                    &packed_v,
+                    &cumulative,
+                    &cumulative,
+                    max_length,
+                    max_length,
+                    scale,
+                    window,
+                    window,
+                    false,
+                )?
+            }
+            _ => candle_core::bail!("{} support is not compiled in", implementation.cli_name()),
+        };
+        Tensor::zeros(
+            (batch * max_length, heads, head_size),
+            packed.dtype(),
+            packed.device(),
+        )?
+        .index_add(&indices, &packed, 0)?
+        .reshape((batch, max_length, heads, head_size))?
+    };
+    attention.transpose(1, 2)
+}
+
+#[cfg(not(any(feature = "flash-attn-2", feature = "flash-attn-3")))]
+fn flash_attention(
+    _q: &Tensor,
+    _k: &Tensor,
+    _v: &Tensor,
+    _lengths: &[usize],
+    _scale: f32,
+    _window: Option<usize>,
+    implementation: AttentionImplementation,
+) -> Result<Tensor> {
+    candle_core::bail!("{} support is not compiled in", implementation.cli_name())
 }
 
 struct Mlp {
@@ -233,9 +402,16 @@ impl Layer {
         rotary: Arc<RotaryEmbedding>,
         uses_local_attention: bool,
         compute_dtype: DType,
+        implementation: AttentionImplementation,
     ) -> Result<Self> {
         Ok(Self {
-            attention: Attention::load(vb.pp("attn"), config, rotary, compute_dtype)?,
+            attention: Attention::load(
+                vb.pp("attn"),
+                config,
+                rotary,
+                compute_dtype,
+                implementation,
+            )?,
             mlp: Mlp::load(vb.pp("mlp"), config, compute_dtype)?,
             attention_norm: layer_norm_no_bias(
                 config.hidden_size,
@@ -257,6 +433,8 @@ impl Layer {
         xs: &Tensor,
         global_mask: Option<&Tensor>,
         local_mask: &Tensor,
+        lengths: &[usize],
+        local_window: usize,
     ) -> Result<Tensor> {
         let normalized = match &self.attention_norm {
             Some(norm) => xs.apply(norm)?,
@@ -272,7 +450,12 @@ impl Layer {
         };
         let attention = self
             .attention
-            .forward(&normalized, mask.as_ref())?
+            .forward(
+                &normalized,
+                mask.as_ref(),
+                lengths,
+                self.uses_local_attention.then_some(local_window),
+            )?
             .to_dtype(xs.dtype())?;
         let xs = (attention + xs)?;
         let mlp = xs.apply(&self.mlp_norm)?.apply(&self.mlp)?;
@@ -292,7 +475,12 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    pub fn load(vb: VarBuilder, config: &Config, compute_dtype: DType) -> Result<Self> {
+    pub fn load(
+        vb: VarBuilder,
+        config: &Config,
+        compute_dtype: DType,
+        implementation: AttentionImplementation,
+    ) -> Result<Self> {
         let global_rotary = Arc::new(RotaryEmbedding::new(
             vb.dtype(),
             config,
@@ -318,6 +506,7 @@ impl Encoder {
                 },
                 local,
                 compute_dtype,
+                implementation,
             )?);
         }
         Ok(Self {
@@ -343,15 +532,28 @@ impl Encoder {
         })
     }
 
-    pub fn forward(&self, ids: &Tensor, mask: &Tensor, has_padding: bool) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        ids: &Tensor,
+        mask: &Tensor,
+        lengths: &[usize],
+        has_padding: bool,
+    ) -> Result<Tensor> {
         let length = ids.dim(1)?;
         let global_mask = has_padding
             .then(|| global_attention_mask(mask, length, self.dtype))
             .transpose()?;
         let local_mask = self.local_mask(length, ids.device())?;
+        let local_window = self.local_attention_size / 2;
         let mut xs = ids.apply(&self.embeddings)?.apply(&self.norm)?;
         for layer in &self.layers {
-            xs = layer.forward(&xs, global_mask.as_ref(), &local_mask)?;
+            xs = layer.forward(
+                &xs,
+                global_mask.as_ref(),
+                &local_mask,
+                lengths,
+                local_window,
+            )?;
         }
         xs.apply(&self.final_norm)
     }
@@ -389,7 +591,7 @@ fn global_attention_mask(mask: &Tensor, target_length: usize, dtype: DType) -> R
         .unsqueeze(2)?
         .expand((batch, 1, target_length, source_length))?
         .to_dtype(dtype)?;
-    ((1.0 - expanded)? * f32::MIN as f64)?.to_dtype(dtype)
+    ((1.0 - expanded)? * ATTENTION_MASK_VALUE as f64)?.to_dtype(dtype)
 }
 
 fn local_attention_mask(
@@ -402,7 +604,7 @@ fn local_attention_mask(
         .flat_map(|left| {
             (0..length).map(move |right| {
                 if left.abs_diff(right) > max_distance {
-                    f32::NEG_INFINITY
+                    ATTENTION_MASK_VALUE
                 } else {
                     0.0
                 }
@@ -424,10 +626,10 @@ mod tests {
         assert_eq!(
             mask,
             vec![
-                vec![0.0, 0.0, f32::NEG_INFINITY, f32::NEG_INFINITY],
-                vec![0.0, 0.0, 0.0, f32::NEG_INFINITY],
-                vec![f32::NEG_INFINITY, 0.0, 0.0, 0.0],
-                vec![f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0, 0.0],
+                vec![0.0, 0.0, ATTENTION_MASK_VALUE, ATTENTION_MASK_VALUE],
+                vec![0.0, 0.0, 0.0, ATTENTION_MASK_VALUE],
+                vec![ATTENTION_MASK_VALUE, 0.0, 0.0, 0.0],
+                vec![ATTENTION_MASK_VALUE, ATTENTION_MASK_VALUE, 0.0, 0.0],
             ]
         );
         Ok(())
@@ -440,7 +642,17 @@ mod tests {
             .flatten_all()?
             .to_vec1::<f32>()?;
 
-        assert_eq!(mask, vec![0.0, 0.0, f32::MIN, 0.0, 0.0, f32::MIN]);
+        assert_eq!(
+            mask,
+            vec![
+                0.0,
+                0.0,
+                ATTENTION_MASK_VALUE,
+                0.0,
+                0.0,
+                ATTENTION_MASK_VALUE
+            ]
+        );
         Ok(())
     }
 
@@ -461,7 +673,7 @@ mod tests {
                 .map(|name| format!("encoder.{name}"))
                 .unwrap_or_else(|| name.to_owned())
         });
-        let encoder = Encoder::load(vb, &config, DType::F32)?;
+        let encoder = Encoder::load(vb, &config, DType::F32, AttentionImplementation::Eager)?;
 
         let tokenizer_path = path.join("tokenizer/tokenizer.json");
         let tokenizer = crate::tokenizer::from_json(&fs::read(tokenizer_path)?)?;
@@ -478,6 +690,7 @@ mod tests {
         let mut ids = vec![cls_id];
         ids.extend(tokenizer.encode("What is Deep Learning?")?);
         ids.push(sep_id);
+        let valid_length = ids.len();
 
         let mut mask = vec![1f32; ids.len()];
         ids.resize(32, pad_id);
@@ -486,7 +699,7 @@ mod tests {
         let length = ids.len();
         let ids = Tensor::from_vec(ids, (1, length), &device)?;
         let mask = Tensor::from_vec(mask, (1, length), &device)?;
-        let hidden = encoder.forward(&ids, &mask, true)?;
+        let hidden = encoder.forward(&ids, &mask, &[valid_length], true)?;
 
         insta::assert_yaml_snapshot!(
             "modernbert_fp32_hidden_states",
@@ -497,5 +710,52 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn eager_bf16_softmax_handles_padding_masks_without_nans() {
+        let device = Device::Cpu;
+        let scores = Tensor::new(&[[0f32, f32::NEG_INFINITY]], &device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+
+        let output = attention_softmax(&scores)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        assert!(output.iter().all(|value| value.is_finite()));
+        assert_eq!(output, vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn bf16_attention_masks_remain_finite() {
+        let device = Device::Cpu;
+        let padding = Tensor::new(&[[1f32, 0.0]], &device).unwrap();
+        let global = global_attention_mask(&padding, 2, DType::BF16)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let local = local_attention_mask(4, 1, DType::BF16, &device)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        assert!(global.iter().chain(&local).all(|value| value.is_finite()));
+        assert!(global.iter().any(|value| *value < -1_000.0));
+        assert!(local.iter().any(|value| *value < -1_000.0));
     }
 }

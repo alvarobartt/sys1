@@ -52,6 +52,8 @@ struct Args {
     max_model_len: Option<usize>,
     #[arg(long, value_enum, default_value_t = Precision::Auto)]
     dtype: Precision,
+    #[arg(long, value_enum, default_value_t = models::AttentionImplementation::Eager)]
+    attention: models::AttentionImplementation,
 }
 
 impl Args {
@@ -78,6 +80,7 @@ impl Args {
             self.max_model_len != Some(0),
             "--max-model-len must be positive"
         );
+        self.attention.validate(self.dtype.resolve())?;
         Ok(())
     }
 }
@@ -111,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     args.validate()?;
+    sys1::validate_backend()?;
     let dtype = args.dtype.resolve();
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -152,8 +156,14 @@ async fn main() -> anyhow::Result<()> {
         path = %model_path.display(),
         "loading model"
     );
-    let model = models::load(&model_path, architecture, dtype, args.max_model_len)
-        .with_context(|| format!("failed to load model from {}", model_path.display()))?;
+    let model = models::load(
+        &model_path,
+        architecture,
+        dtype,
+        args.max_model_len,
+        args.attention,
+    )
+    .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     info!(
         model = %served_model_name,
         elapsed_ms = started.elapsed().as_millis(),
@@ -244,6 +254,7 @@ mod tests {
         assert_eq!(args.max_request_bytes, 1_048_576);
         assert_eq!(args.max_model_len, None);
         assert_eq!(args.dtype, Precision::Auto);
+        assert_eq!(args.attention, models::AttentionImplementation::Eager);
     }
 
     #[test]
@@ -261,6 +272,12 @@ mod tests {
 
         let args = Args::try_parse_from(["sys1", "--dtype", "bf16"]).unwrap();
         assert_eq!(args.dtype, Precision::Bf16);
+
+        let args = Args::try_parse_from(["sys1", "--attention", "flash-attn-2"]).unwrap();
+        assert_eq!(
+            args.attention,
+            models::AttentionImplementation::FlashAttention2
+        );
     }
 
     #[test]
@@ -300,6 +317,13 @@ mod tests {
         assert!(args.validate().is_err());
 
         let args = Args::try_parse_from(["sys1", "--max-queue-size", "0"]).unwrap();
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_flash_attention_with_f32() {
+        let args = Args::try_parse_from(["sys1", "--attention", "flash-attn-3", "--dtype", "f32"])
+            .unwrap();
         assert!(args.validate().is_err());
     }
 }

@@ -5,6 +5,7 @@ use crate::schema::{ApiError, DecisionRequest, DecisionResponse};
 
 use anyhow::{Context, bail};
 use candle_core::DType;
+use clap::ValueEnum;
 use serde::Deserialize;
 use std::{fs, path::Path};
 
@@ -19,6 +20,44 @@ pub const LAYA_MODEL_IDS: &[&str] = &[
     LAYA_TYPED_DECISIONS_MODEL_ID,
     LAYA_MULTILINGUAL_MODEL_ID,
 ];
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum AttentionImplementation {
+    #[default]
+    Eager,
+    #[value(name = "flash-attn-2")]
+    FlashAttention2,
+    #[value(name = "flash-attn-3")]
+    FlashAttention3,
+}
+
+impl AttentionImplementation {
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            Self::Eager => "eager",
+            Self::FlashAttention2 => "flash-attn-2",
+            Self::FlashAttention3 => "flash-attn-3",
+        }
+    }
+
+    pub fn validate(self, dtype: DType) -> anyhow::Result<()> {
+        let name = self.cli_name();
+        let enabled = match self {
+            Self::Eager => return Ok(()),
+            Self::FlashAttention2 => cfg!(feature = "flash-attn-2"),
+            Self::FlashAttention3 => cfg!(feature = "flash-attn-3"),
+        };
+        anyhow::ensure!(
+            enabled,
+            "--attention {name} requires a binary built with --features {name}"
+        );
+        anyhow::ensure!(
+            matches!(dtype, DType::F16 | DType::BF16),
+            "--attention {name} requires --dtype f16 or --dtype bf16"
+        );
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Architecture {
@@ -109,9 +148,10 @@ pub fn load(
     architecture: Architecture,
     dtype: DType,
     max_model_len: Option<usize>,
+    attention: AttentionImplementation,
 ) -> anyhow::Result<Model> {
     match architecture {
-        Architecture::Laya => Laya::load(path, dtype, max_model_len).map(Model::Laya),
+        Architecture::Laya => Laya::load(path, dtype, max_model_len, attention).map(Model::Laya),
     }
 }
 

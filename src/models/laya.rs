@@ -1,5 +1,8 @@
+use super::AttentionImplementation;
 use super::DecisionModel;
-use super::modernbert::{Config as ModernBertConfig, Encoder as ModernBertEncoder};
+use super::modernbert::{
+    AttentionOptions, Config as ModernBertConfig, Encoder as ModernBertEncoder,
+};
 use crate::{
     device,
     schema::{ApiError, DecisionRequest, DecisionResponse, Usage},
@@ -8,7 +11,7 @@ use crate::{
 
 use anyhow::Context;
 use candle_core::{D, DType, Device, IndexOp, Tensor};
-use candle_nn::{Embedding, LayerNorm, Linear, VarBuilder, embedding, layer_norm, ops::softmax};
+use candle_nn::{Embedding, LayerNorm, Linear, VarBuilder, embedding, layer_norm};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::{collections::HashMap, fs, path::Path};
@@ -59,10 +62,16 @@ struct HeadLayer {
     linear2: Linear,
     heads: usize,
     compute_dtype: DType,
+    attention: AttentionImplementation,
 }
 
 impl HeadLayer {
-    fn load(vb: VarBuilder, hidden: usize, compute_dtype: DType) -> candle_core::Result<Self> {
+    fn load(
+        vb: VarBuilder,
+        hidden: usize,
+        compute_dtype: DType,
+        attention: AttentionImplementation,
+    ) -> candle_core::Result<Self> {
         Ok(Self {
             qkv: Linear::new(
                 vb.get((hidden * 3, hidden), "self_attn.in_proj_weight")?
@@ -79,10 +88,16 @@ impl HeadLayer {
             linear2: linear_dtype(hidden * 4, hidden, vb.pp("linear2"), compute_dtype)?,
             heads: hidden / 64,
             compute_dtype,
+            attention,
         })
     }
 
-    fn forward(&self, xs: &Tensor, mask: &Tensor) -> candle_core::Result<Tensor> {
+    fn forward(
+        &self,
+        xs: &Tensor,
+        mask: &Tensor,
+        lengths: &[usize],
+    ) -> candle_core::Result<Tensor> {
         let (batch, length, hidden) = xs.dims3()?;
         let size = hidden / self.heads;
         let qkv = xs
@@ -97,31 +112,39 @@ impl HeadLayer {
         let scale = (size as f64).powf(-0.5);
 
         #[cfg(feature = "metal")]
-        let attention = if xs.device().is_metal() {
+        let attended = if xs.device().is_metal() {
             let mask = mask
                 .broadcast_as((batch, self.heads, length, length))?
                 .contiguous()?;
             candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
         } else {
-            let scores = (&q * scale)?
-                .matmul(&k.transpose(D::Minus2, D::Minus1)?)?
-                .to_dtype(mask.dtype())?
-                .broadcast_add(mask)?;
-            softmax(&scores, D::Minus1)?.matmul(&v)?
+            super::modernbert::scaled_dot_product_attention(
+                &q,
+                &k,
+                &v,
+                scale,
+                AttentionOptions {
+                    mask: Some(mask),
+                    implementation: self.attention,
+                    lengths,
+                    window: None,
+                },
+            )?
         };
         #[cfg(not(feature = "metal"))]
-        let attention = {
-            let scores = (&q * scale)?
-                .matmul(&k.transpose(D::Minus2, D::Minus1)?)?
-                .broadcast_add(mask)?;
-            let probabilities = if scores.dtype() == DType::F16 {
-                softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(DType::F16)?
-            } else {
-                softmax(&scores, D::Minus1)?
-            };
-            probabilities.to_dtype(v.dtype())?.matmul(&v)?
-        };
-        let attention = attention
+        let attended = super::modernbert::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            AttentionOptions {
+                mask: Some(mask),
+                implementation: self.attention,
+                lengths,
+                window: None,
+            },
+        )?;
+        let attention = attended
             .transpose(1, 2)?
             .reshape((batch, length, hidden))?
             .apply(&self.projection)?
@@ -157,9 +180,15 @@ pub struct Laya {
 }
 
 impl Laya {
-    pub fn load(path: &Path, dtype: DType, max_model_len: Option<usize>) -> anyhow::Result<Self> {
+    pub fn load(
+        path: &Path,
+        dtype: DType,
+        max_model_len: Option<usize>,
+        attention: AttentionImplementation,
+    ) -> anyhow::Result<Self> {
         let device = device::load()?;
         let (model_dtype, compute_dtype) = execution_dtypes(dtype, device.is_cuda());
+        validate_attention(attention, &device, compute_dtype)?;
         let mut config: LayaConfig =
             serde_json::from_slice(&fs::read(path.join("rl_agent_config.json"))?)?;
         let encoder_config = ModernBertConfig::load(&path.join("encoder/config.json"))?;
@@ -178,13 +207,15 @@ impl Laya {
                 .map(|name| format!("encoder.{name}"))
                 .unwrap_or_else(|| name.to_owned())
         });
-        let encoder = ModernBertEncoder::load(encoder_vb, &encoder_config, compute_dtype)?;
+        let encoder =
+            ModernBertEncoder::load(encoder_vb, &encoder_config, compute_dtype, attention)?;
         let head = (0..2)
             .map(|index| {
                 HeadLayer::load(
                     vb.pp(format!("head.layers.{index}")),
                     encoder_config.hidden_size(),
                     compute_dtype,
+                    attention,
                 )
             })
             .collect::<candle_core::Result<Vec<_>>>()?;
@@ -378,14 +409,15 @@ impl Laya {
             .to_dtype(self.compute_dtype)?;
         let type_ids = Tensor::from_vec(kinds, batch, &self.device)?;
         let has_padding = unique.iter().any(|item| item.ids.len() != length);
+        let lengths: Vec<_> = unique.iter().map(|item| item.ids.len()).collect();
         let mut hidden = self
             .encoder
-            .forward(&ids, &attention_mask, has_padding)
+            .forward(&ids, &attention_mask, &lengths, has_padding)
             .context("encoder forward")?;
         hidden = hidden.broadcast_add(&type_ids.apply(&self.type_embedding)?.unsqueeze(1)?)?;
         for (index, layer) in self.head.iter().enumerate() {
             hidden = layer
-                .forward(&hidden, &head_mask)
+                .forward(&hidden, &head_mask, &lengths)
                 .with_context(|| format!("decision head layer {index}"))?;
         }
         let output = if batch >= 8 && !self.device.is_cpu() {
@@ -572,6 +604,51 @@ fn execution_dtypes(requested: DType, is_cuda: bool) -> (DType, DType) {
         requested
     };
     (model, requested)
+}
+
+fn validate_attention(
+    attention: AttentionImplementation,
+    _device: &Device,
+    compute_dtype: DType,
+) -> anyhow::Result<()> {
+    attention.validate(compute_dtype)?;
+    #[cfg(any(feature = "flash-attn-2", feature = "flash-attn-3"))]
+    if attention != AttentionImplementation::Eager {
+        anyhow::ensure!(
+            _device.is_cuda(),
+            "{} requires a CUDA device",
+            attention.cli_name()
+        );
+        let (major, minor) = match _device {
+            Device::Cuda(cuda) => cuda
+                .cuda_stream()
+                .context()
+                .compute_capability()
+                .context("failed to query CUDA compute capability")?,
+            _ => unreachable!(),
+        };
+        validate_flash_capability(attention, major, minor)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "flash-attn-2", feature = "flash-attn-3", test))]
+fn validate_flash_capability(
+    attention: AttentionImplementation,
+    major: i32,
+    minor: i32,
+) -> anyhow::Result<()> {
+    let supported = match attention {
+        AttentionImplementation::Eager => true,
+        AttentionImplementation::FlashAttention2 => (8..=9).contains(&major),
+        AttentionImplementation::FlashAttention3 => (major, minor) == (9, 0),
+    };
+    anyhow::ensure!(
+        supported,
+        "{} does not support CUDA compute capability {major}.{minor}",
+        attention.cli_name()
+    );
+    Ok(())
 }
 
 fn deduplicate<'a>(items: &[&'a Item]) -> (Vec<&'a Item>, Vec<usize>) {
@@ -833,7 +910,7 @@ mod tests {
 
         for (snapshot, model_id, revision) in models {
             let path = crate::hub::download(model_id, revision).await?;
-            let model = Laya::load(&path, DType::F32, None)?;
+            let model = Laya::load(&path, DType::F32, None, AttentionImplementation::Eager)?;
             let request: DecisionRequest = serde_json::from_value(json!({
                 "state": {
                     "message": "I was charged twice for invoice 4411. Please refund me today.",
@@ -936,5 +1013,35 @@ mod tests {
             (DType::F16, DType::F16)
         );
         assert_eq!(execution_dtypes(DType::F32, true), (DType::F32, DType::F32));
+    }
+
+    #[test]
+    fn rejects_flash_attention_without_a_compatible_backend() {
+        assert!(
+            validate_attention(
+                AttentionImplementation::FlashAttention2,
+                &Device::Cpu,
+                DType::BF16,
+            )
+            .is_err()
+        );
+        validate_attention(AttentionImplementation::Eager, &Device::Cpu, DType::F32).unwrap();
+    }
+
+    #[test]
+    fn validates_flash_attention_compute_capabilities() {
+        validate_flash_capability(AttentionImplementation::FlashAttention2, 8, 9).unwrap();
+        validate_flash_capability(AttentionImplementation::FlashAttention2, 9, 0).unwrap();
+        validate_flash_capability(AttentionImplementation::FlashAttention3, 9, 0).unwrap();
+
+        assert!(validate_flash_capability(AttentionImplementation::FlashAttention2, 7, 5).is_err());
+        assert!(
+            validate_flash_capability(AttentionImplementation::FlashAttention2, 10, 0).is_err()
+        );
+        assert!(validate_flash_capability(AttentionImplementation::FlashAttention3, 8, 9).is_err());
+        assert!(validate_flash_capability(AttentionImplementation::FlashAttention3, 9, 1).is_err());
+        assert!(
+            validate_flash_capability(AttentionImplementation::FlashAttention3, 12, 0).is_err()
+        );
     }
 }
