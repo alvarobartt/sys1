@@ -1,7 +1,7 @@
 use super::AttentionImplementation;
-use candle_core::{D, DType, Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{
-    Embedding, LayerNorm, Linear, Module, VarBuilder, embedding, layer_norm_no_bias, ops::softmax,
+    embedding, layer_norm_no_bias, ops::softmax, Embedding, LayerNorm, Linear, Module, VarBuilder,
 };
 use serde::Deserialize;
 use std::{
@@ -669,6 +669,11 @@ mod tests {
         let device = crate::device::load()?;
         let config = Config::load(&path.join("encoder/config.json"))?;
         let weights = path.join("model.safetensors");
+        // SAFETY: All file-backed mmap constructors are marked `unsafe` because of the potential
+        // for undefined behavior using the map if the underlying file is modified or out of
+        // process.
+        //
+        // More information at https://github.com/RazrFalcon/memmap2-rs/blob/a02e2a/src/lib.rs#L135-L165
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device)? };
         let vb = vb.rename_f(|name| {
             name.strip_prefix("model.")
