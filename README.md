@@ -18,6 +18,7 @@
 - Dynamic, token-based batching
 - SDPA on CPU, Metal, and CUDA
 - Flash Attention on Ampere, Ada Lovelace, and Hopper
+- Blazing fast inference for Laya
 
 ## Get started
 
