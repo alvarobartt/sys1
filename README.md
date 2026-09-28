@@ -12,10 +12,9 @@
 
 ## Features
 
-- `tokio`, `axum` and `serde`, the usual suspects
-- System One compatible API Spec
+- [TypeSafe AI compatible API](https://docs.typesafe.ai/api)
 - `candle` with [`tokenizers` release candidate](https://huggingface.co/blog/tokenizers-v1)!
-- Dynamic, token-based batching
+- Token-based, dynamic batching
 - SDPA on CPU, Metal, and CUDA
 - Flash Attention on Ampere, Ada Lovelace, and Hopper
 - Blazing fast inference for ModernBERT and Qwen3.5
@@ -47,7 +46,7 @@ Then run it with any of the supported models (more coming soon!).
 sys1 --model-id convaiinnovations/laya --dtype auto
 ```
 
-And, just query your Jev-compatible API at `/v1/systemone` (or `/v1/decide`).
+And, just query your TypeSafe AI compatible API at `/v1/systemone` (or `/v1/decide`).
 
 ```bash
 curl http://localhost:3000/v1/systemone \
@@ -108,6 +107,7 @@ print(response.choices["route"].choice)
 ## References
 
 - [TypeSafe AI API](https://api.typesafe.ai)
+- [TypeSafe AI System One](https://docs.typesafe.ai/concepts/system-one)
 - [TypeSafe AI Python SDK](https://github.com/typesafe-ai/typesafe-sdk-python)
 - [Laya: Multilingual, non-autoregressive System 1 decision engine](https://github.com/NandhaKishorM/laya)
 - [Introducing Clef: our open-source decision models, and new RL fine-tuning platform](https://blog.cloudflare.com/clef-decision-models/)
