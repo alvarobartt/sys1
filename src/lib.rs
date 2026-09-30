@@ -19,6 +19,7 @@ pub mod api;
 pub mod batching;
 mod device;
 pub mod hub;
+mod metrics;
 pub mod models;
 pub mod schema;
 pub mod tokenizer;

@@ -18,41 +18,121 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
+    /// Hugging Face model repository to load.
     #[arg(
+        short = 'm',
         long,
+        env,
         default_value = "convaiinnovations/laya",
-        conflicts_with = "model_path"
+        conflicts_with = "model_path",
+        help_heading = "Model options"
     )]
     model_id: String,
-    #[arg(long, conflicts_with = "model_id")]
+    /// Local model directory to load instead of a Hugging Face repository.
+    #[arg(
+        short = 'M',
+        long,
+        env,
+        conflicts_with = "model_id",
+        help_heading = "Model options"
+    )]
     model_path: Option<PathBuf>,
-    #[arg(long, default_value = "main")]
+    /// Hugging Face model revision (branch, tag, or commit).
+    #[arg(
+        short,
+        long,
+        env,
+        default_value = "main",
+        help_heading = "Model options"
+    )]
     revision: String,
-    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    /// Model name returned by the API.
+    #[arg(
+        short = 'n',
+        long,
+        env,
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        help_heading = "Model options"
+    )]
     served_model_name: Option<String>,
-    #[arg(long, default_value = "0.0.0.0")]
+    /// Address on which the HTTP server listens.
+    #[arg(
+        short = 'H',
+        long,
+        env,
+        default_value = "0.0.0.0",
+        help_heading = "Server options"
+    )]
     host: IpAddr,
-    #[arg(long, default_value_t = 3000)]
+    /// Port on which the HTTP server listens.
+    #[arg(
+        short,
+        long,
+        env,
+        default_value_t = 3000,
+        help_heading = "Server options"
+    )]
     port: u16,
-    #[arg(long, default_value_t = 32)]
+    /// Maximum number of requests processed in one batch.
+    #[arg(
+        short = 'b',
+        long,
+        env,
+        default_value_t = 32,
+        help_heading = "Batching options"
+    )]
     max_batch_size: usize,
-    #[arg(long, default_value_t = 128)]
+    /// Maximum total number of questions processed in one batch.
+    #[arg(long, env, default_value_t = 128, help_heading = "Batching options")]
     max_batch_questions: usize,
-    #[arg(long, default_value_t = 64)]
+    /// Maximum number of questions accepted in one request.
+    #[arg(long, env, default_value_t = 64, help_heading = "Batching options")]
     max_questions_per_request: usize,
-    #[arg(long, default_value_t = 256)]
+    /// Maximum number of requests waiting to be processed.
+    #[arg(long, env, default_value_t = 256, help_heading = "Batching options")]
     max_queue_size: usize,
-    #[arg(long, default_value_t = 0)]
+    /// Time to wait for more requests before processing a batch, in milliseconds.
+    #[arg(long, env, default_value_t = 0, help_heading = "Batching options")]
     batch_wait_ms: u64,
-    #[arg(long, default_value_t = 30_000)]
+    /// Per-request timeout in milliseconds; 0 disables the timeout.
+    #[arg(
+        short = 't',
+        long,
+        env,
+        default_value_t = 30_000,
+        help_heading = "Batching options"
+    )]
     request_timeout_ms: u64,
-    #[arg(long, default_value_t = 1_048_576)]
+    /// Maximum request body size in bytes.
+    #[arg(
+        long,
+        env,
+        default_value_t = 1_048_576,
+        help_heading = "Server options"
+    )]
     max_request_bytes: usize,
-    #[arg(long)]
+    /// Maximum model context length; uses the model configuration when omitted.
+    #[arg(long, env, help_heading = "Model options")]
     max_model_len: Option<usize>,
-    #[arg(long, value_enum, default_value_t = Precision::Auto)]
+    /// Floating-point precision used for inference.
+    #[arg(
+        short = 'd',
+        long,
+        env,
+        value_enum,
+        default_value_t = Precision::Auto,
+        help_heading = "Model options"
+    )]
     dtype: Precision,
-    #[arg(long, value_enum, default_value_t = models::AttentionImplementation::Eager)]
+    /// Attention implementation used for inference.
+    #[arg(
+        short = 'a',
+        long,
+        env,
+        value_enum,
+        default_value_t = models::AttentionImplementation::Eager,
+        help_heading = "Model options"
+    )]
     attention: models::AttentionImplementation,
 }
 
@@ -194,7 +274,6 @@ async fn main() -> anyhow::Result<()> {
         elapsed_ms = started.elapsed().as_millis(),
         "model warmup completed"
     );
-    batcher.reset_stats();
     let app = api::router(batcher, args.max_request_bytes);
     let listener = tokio::net::TcpListener::bind(address).await?;
     info!(%address, model = %served_model_name, "sys1 ready");
@@ -236,6 +315,7 @@ fn backend() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn defaults_to_laya_on_hugging_face() {
@@ -261,6 +341,92 @@ mod tests {
     fn accepts_a_local_model_path() {
         let args = Args::try_parse_from(["sys1", "--model-path", "/models/laya"]).unwrap();
         assert_eq!(args.model_path, Some(PathBuf::from("/models/laya")));
+    }
+
+    #[test]
+    fn accepts_short_options() {
+        let args = Args::try_parse_from([
+            "sys1",
+            "-m",
+            "owner/model",
+            "-r",
+            "release",
+            "-n",
+            "public-name",
+            "-H",
+            "127.0.0.1",
+            "-p",
+            "8080",
+            "-b",
+            "4",
+            "-t",
+            "100",
+            "-d",
+            "f16",
+            "-a",
+            "eager",
+        ])
+        .unwrap();
+
+        assert_eq!(args.model_id, "owner/model");
+        assert_eq!(args.revision, "release");
+        assert_eq!(args.served_model_name.as_deref(), Some("public-name"));
+        assert_eq!(args.host, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(args.port, 8080);
+        assert_eq!(args.max_batch_size, 4);
+        assert_eq!(args.request_timeout_ms, 100);
+        assert_eq!(args.dtype, Precision::F16);
+        assert_eq!(args.attention, models::AttentionImplementation::Eager);
+    }
+
+    #[test]
+    fn exposes_environment_variables_and_help_metadata() {
+        let mut command = Args::command();
+        assert_eq!(
+            command.get_about().map(ToString::to_string).as_deref(),
+            Some(env!("CARGO_PKG_DESCRIPTION"))
+        );
+        let environment_variables = command
+            .get_arguments()
+            .filter_map(|argument| {
+                argument.get_env().map(|environment| {
+                    (
+                        argument.get_id().as_str(),
+                        environment.to_str().expect("environment names are UTF-8"),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            environment_variables,
+            [
+                ("model_id", "MODEL_ID"),
+                ("model_path", "MODEL_PATH"),
+                ("revision", "REVISION"),
+                ("served_model_name", "SERVED_MODEL_NAME"),
+                ("host", "HOST"),
+                ("port", "PORT"),
+                ("max_batch_size", "MAX_BATCH_SIZE"),
+                ("max_batch_questions", "MAX_BATCH_QUESTIONS"),
+                ("max_questions_per_request", "MAX_QUESTIONS_PER_REQUEST"),
+                ("max_queue_size", "MAX_QUEUE_SIZE"),
+                ("batch_wait_ms", "BATCH_WAIT_MS"),
+                ("request_timeout_ms", "REQUEST_TIMEOUT_MS"),
+                ("max_request_bytes", "MAX_REQUEST_BYTES"),
+                ("max_model_len", "MAX_MODEL_LEN"),
+                ("dtype", "DTYPE"),
+                ("attention", "ATTENTION"),
+            ]
+        );
+
+        let help = command.render_help().to_string();
+        assert!(help.contains("Model options:"));
+        assert!(help.contains("Server options:"));
+        assert!(help.contains("Batching options:"));
+        assert!(!help.contains("Inference options:"));
+        assert!(help.contains("[env: MODEL_ID=]"));
+        assert!(help.contains("[default: convaiinnovations/laya]"));
     }
 
     #[test]

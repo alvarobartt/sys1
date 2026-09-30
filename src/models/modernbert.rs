@@ -211,15 +211,10 @@ pub(super) fn scaled_dot_product_attention(
     options: AttentionOptions<'_>,
 ) -> Result<Tensor> {
     match options.implementation {
-        AttentionImplementation::Eager => {
-            let scores = (q * scale)?.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
-            let scores = match options.mask {
-                Some(mask) => scores.to_dtype(mask.dtype())?.broadcast_add(mask)?,
-                None => scores,
-            };
-            let probabilities = attention_softmax(&scores)?;
-            probabilities.to_dtype(v.dtype())?.matmul(v)
+        AttentionImplementation::Eager if q.device().is_cpu() && options.window.is_some() => {
+            cpu_windowed_attention(q, k, v, scale, options.mask, options.window.unwrap())
         }
+        AttentionImplementation::Eager => eager_attention(q, k, v, scale, options.mask),
         implementation => flash_attention(
             q,
             k,
@@ -230,6 +225,59 @@ pub(super) fn scaled_dot_product_attention(
             implementation,
         ),
     }
+}
+
+fn eager_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+) -> Result<Tensor> {
+    let scores = (q * scale)?.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+    let scores = match mask {
+        Some(mask) => scores.to_dtype(mask.dtype())?.broadcast_add(mask)?,
+        None => scores,
+    };
+    let probabilities = attention_softmax(&scores)?;
+    probabilities.to_dtype(v.dtype())?.matmul(v)
+}
+
+fn cpu_windowed_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    mask: Option<&Tensor>,
+    window: usize,
+) -> Result<Tensor> {
+    let length = q.dim(2)?;
+    let block = window.div_ceil(2).max(1);
+    let mut output = Vec::with_capacity(length.div_ceil(block));
+    for query_start in (0..length).step_by(block) {
+        let query_length = block.min(length - query_start);
+        let query_end = query_start + query_length;
+        let key_start = query_start.saturating_sub(window);
+        let key_end = (query_end + window).min(length);
+        let key_length = key_end - key_start;
+        let q = q.narrow(2, query_start, query_length)?;
+        let k = k.narrow(2, key_start, key_length)?;
+        let v = v.narrow(2, key_start, key_length)?;
+        let mask = match mask {
+            Some(mask) if mask.rank() == 2 => Some(
+                mask.narrow(0, query_start, query_length)?
+                    .narrow(1, key_start, key_length)?
+                    .reshape((1, 1, query_length, key_length))?,
+            ),
+            Some(mask) => Some(
+                mask.narrow(2, query_start, query_length)?
+                    .narrow(3, key_start, key_length)?,
+            ),
+            None => None,
+        };
+        output.push(eager_attention(&q, &k, &v, scale, mask.as_ref())?);
+    }
+    Tensor::cat(&output.iter().collect::<Vec<_>>(), 2)
 }
 
 fn attention_softmax(scores: &Tensor) -> Result<Tensor> {
@@ -715,6 +763,35 @@ mod tests {
                 "[]" => insta::rounded_redaction(3),
             }
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_windowed_attention_matches_dense_attention() -> Result<()> {
+        let device = Device::Cpu;
+        let values = Tensor::arange(0u32, 48, &device)?
+            .to_dtype(DType::F32)?
+            .reshape((1, 2, 6, 4))?;
+        let q = (&values / 37.0)?;
+        let k = (&values / 29.0)?;
+        let v = (&values / 19.0)?;
+        let local = local_attention_mask(6, 2, DType::F32, &device)?;
+        let padding = Tensor::new(&[[1f32, 1.0, 1.0, 1.0, 0.0, 0.0]], &device)?;
+        let global = global_attention_mask(&padding, 6, DType::F32)?;
+
+        for mask in [&local, &global.broadcast_add(&local)?] {
+            let dense = eager_attention(&q, &k, &v, 0.5, Some(mask))?;
+            let windowed = cpu_windowed_attention(&q, &k, &v, 0.5, Some(mask), 2)?;
+            let dense = dense.flatten_all()?.to_vec1::<f32>()?;
+            let windowed = windowed.flatten_all()?.to_vec1::<f32>()?;
+            let difference = dense
+                .iter()
+                .zip(windowed)
+                .map(|(left, right)| (left - right).abs())
+                .fold(0f32, f32::max);
+            assert!(difference < 1e-5, "maximum difference was {difference}");
+        }
 
         Ok(())
     }
