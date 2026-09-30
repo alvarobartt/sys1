@@ -6,7 +6,7 @@
   />
   <br/>
   <em>
-    Blazing fast structured decisions for System One open-models self-hosted with a TypeSafe AI compatible API, written in Rust.
+    Blazing fast, self-hosted structured decisions for open-weight models with a TypeSafe AI compatible API, written in Rust.
   </em>
 </div>
 
@@ -14,7 +14,7 @@
 
 - [TypeSafe AI compatible API](https://docs.typesafe.ai/api)
 - `candle` with [`tokenizers` release candidate](https://huggingface.co/blog/tokenizers-v1)!
-- Token-based, dynamic batching
+- Dynamic batching bounded by requests and questions
 - Support on CPU, Metal and CUDA
 - F32, F16 and B16 support
 
@@ -40,7 +40,7 @@ Then run it with any of the supported models (more coming soon!).
 sys1 --model-id convaiinnovations/laya --dtype auto
 ```
 
-And, just query your TypeSafe AI compatible API at `/v1/systemone` (or `/v1/decide`).
+Then query the System One compatible endpoint at `/v1/systemone` (or `/v1/decide`).
 
 ```bash
 curl http://localhost:3000/v1/systemone \
@@ -80,7 +80,7 @@ curl http://localhost:3000/v1/systemone \
 
 ## References
 
-- [TypeSafe AI API](https://api.typesafe.ai)
+- [TypeSafe AI API](https://docs.typesafe.ai/api)
 - [TypeSafe AI System One](https://docs.typesafe.ai/concepts/system-one)
 - [TypeSafe AI Python SDK](https://github.com/typesafe-ai/typesafe-sdk-python)
 - [Laya: Multilingual, non-autoregressive System 1 decision engine](https://github.com/NandhaKishorM/laya)

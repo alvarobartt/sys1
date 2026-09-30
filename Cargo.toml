@@ -2,7 +2,7 @@
 name = "sys1"
 version = "0.0.3"
 edition = "2024"
-description = "Blazing fast structured decisions for System One open-models self-hosted with a TypeSafe AI compatible API, written in Rust."
+description = "Blazing fast, self-hosted structured decisions for open-weight models with a TypeSafe AI compatible API, written in Rust."
 authors = ["Alvaro Bartolome <36760800+alvarobartt@users.noreply.github.com>"]
 default-run = "sys1"
 license = "Apache-2.0"
