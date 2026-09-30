@@ -2,7 +2,7 @@
 name = "sys1"
 version = "0.0.3"
 edition = "2024"
-description = "System One compatible API for open decision models, written in Rust."
+description = "Blazing fast structured decisions for System One open-models self-hosted with a TypeSafe AI compatible API, written in Rust."
 authors = ["Alvaro Bartolome <36760800+alvarobartt@users.noreply.github.com>"]
 default-run = "sys1"
 license = "Apache-2.0"
@@ -16,7 +16,7 @@ candle-core = "0.11.0"
 candle-flash-attn = { version = "0.11.0", optional = true }
 candle-flash-attn-v3 = { version = "0.11.0", optional = true }
 candle-nn = "0.11.0"
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 hf-hub = "1.0.0"
 prometheus = "0.14.0"
 serde = { version = "1.0.229", features = ["derive"] }
