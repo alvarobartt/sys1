@@ -1,22 +1,30 @@
 use crate::{
+    metrics::{BatcherMetrics, EncodedMetrics},
     models::DecisionModel,
     schema::{ApiError, DecisionRequest, DecisionResponse},
 };
 
 use serde_json::{Map, json};
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error};
 
 struct Job {
     request: DecisionRequest,
     response: oneshot::Sender<Result<DecisionResponse, ApiError>>,
+    kind: RequestKind,
+}
+
+#[derive(Clone, Copy)]
+enum RequestKind {
+    Warmup,
+    Inference,
+}
+
+impl RequestKind {
+    fn records_metrics(self) -> bool {
+        matches!(self, Self::Inference)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -27,32 +35,6 @@ pub struct BatcherConfig {
     pub wait: Duration,
     pub queue_capacity: usize,
     pub response_timeout: Option<Duration>,
-}
-
-#[derive(Debug)]
-pub struct BatcherStats {
-    pub accepted_requests: u64,
-    pub rejected_requests: u64,
-    pub timed_out_requests: u64,
-    pub queued_requests: u64,
-    pub in_flight_requests: u64,
-    pub batches: u64,
-    pub batch_questions: u64,
-    pub model_failures: u64,
-    pub inference_microseconds: u64,
-}
-
-#[derive(Default)]
-struct BatcherMetrics {
-    accepted_requests: AtomicU64,
-    rejected_requests: AtomicU64,
-    timed_out_requests: AtomicU64,
-    queued_requests: AtomicU64,
-    in_flight_requests: AtomicU64,
-    batches: AtomicU64,
-    batch_questions: AtomicU64,
-    model_failures: AtomicU64,
-    inference_microseconds: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -78,7 +60,7 @@ impl Batcher {
             .min(max_batch_questions);
         let wait = config.wait;
         let (sender, mut receiver) = mpsc::channel::<Job>(config.queue_capacity.max(1));
-        let metrics = Arc::new(BatcherMetrics::default());
+        let metrics = Arc::new(BatcherMetrics::new());
         let worker_metrics = metrics.clone();
         tokio::spawn(async move {
             let mut pending = None;
@@ -87,9 +69,9 @@ impl Batcher {
                     Some(job) => job,
                     None => match receiver.recv().await {
                         Some(job) => {
-                            worker_metrics
-                                .queued_requests
-                                .fetch_sub(1, Ordering::Relaxed);
+                            if job.kind.records_metrics() {
+                                worker_metrics.request_dequeued();
+                            }
                             job
                         }
                         None => break,
@@ -101,9 +83,9 @@ impl Batcher {
                 while jobs.len() < max_batch_size {
                     match tokio::time::timeout_at(deadline, receiver.recv()).await {
                         Ok(Some(job)) => {
-                            worker_metrics
-                                .queued_requests
-                                .fetch_sub(1, Ordering::Relaxed);
+                            if job.kind.records_metrics() {
+                                worker_metrics.request_dequeued();
+                            }
                             let next_questions = job.request.questions.len();
                             if question_count + next_questions > max_batch_questions {
                                 pending = Some(job);
@@ -116,18 +98,21 @@ impl Batcher {
                     }
                 }
                 let batch_size = jobs.len();
+                let metric_batch_size =
+                    jobs.iter().filter(|job| job.kind.records_metrics()).count();
+                let metric_question_count = jobs
+                    .iter()
+                    .filter(|job| job.kind.records_metrics())
+                    .map(|job| job.request.questions.len())
+                    .sum::<usize>();
                 let started = std::time::Instant::now();
-                worker_metrics.batches.fetch_add(1, Ordering::Relaxed);
-                worker_metrics
-                    .batch_questions
-                    .fetch_add(question_count as u64, Ordering::Relaxed);
-                worker_metrics
-                    .in_flight_requests
-                    .fetch_add(batch_size as u64, Ordering::Relaxed);
+                let batch_guard = (metric_batch_size > 0).then(|| {
+                    worker_metrics.batch_started(metric_batch_size, metric_question_count)
+                });
                 debug!(batch_size, question_count, "inference batch started");
-                let (requests, channels): (Vec<_>, Vec<_>) = jobs
+                let (requests, deliveries): (Vec<_>, Vec<_>) = jobs
                     .into_iter()
-                    .map(|job| (job.request, job.response))
+                    .map(|job| (job.request, (job.response, job.kind)))
                     .unzip();
                 let model = model.clone();
                 let responses = tokio::task::spawn_blocking(move || model.predict_batch(requests))
@@ -140,17 +125,16 @@ impl Batcher {
                     });
                 let failures = responses
                     .iter()
-                    .filter(|response| response.is_err())
-                    .count();
-                worker_metrics
-                    .model_failures
-                    .fetch_add(failures as u64, Ordering::Relaxed);
-                worker_metrics
-                    .inference_microseconds
-                    .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-                worker_metrics
-                    .in_flight_requests
-                    .fetch_sub(batch_size as u64, Ordering::Relaxed);
+                    .zip(&deliveries)
+                    .filter(|(response, (_, kind))| kind.records_metrics() && response.is_err())
+                    .count()
+                    + deliveries
+                        .iter()
+                        .skip(responses.len())
+                        .filter(|(_, kind)| kind.records_metrics())
+                        .count();
+                worker_metrics.model_requests_failed(failures);
+                drop(batch_guard);
                 debug!(
                     batch_size,
                     failures,
@@ -159,7 +143,7 @@ impl Batcher {
                 );
                 let response_count = responses.len();
                 let mut responses = responses.into_iter();
-                for channel in channels {
+                for (channel, _) in deliveries {
                     let response = responses.next().unwrap_or_else(|| {
                         Err(ApiError::internal(
                             "inference worker returned fewer responses than requests",
@@ -192,32 +176,8 @@ impl Batcher {
         !self.sender.is_closed()
     }
 
-    pub fn stats(&self) -> BatcherStats {
-        BatcherStats {
-            accepted_requests: self.metrics.accepted_requests.load(Ordering::Relaxed),
-            rejected_requests: self.metrics.rejected_requests.load(Ordering::Relaxed),
-            timed_out_requests: self.metrics.timed_out_requests.load(Ordering::Relaxed),
-            queued_requests: self.metrics.queued_requests.load(Ordering::Relaxed),
-            in_flight_requests: self.metrics.in_flight_requests.load(Ordering::Relaxed),
-            batches: self.metrics.batches.load(Ordering::Relaxed),
-            batch_questions: self.metrics.batch_questions.load(Ordering::Relaxed),
-            model_failures: self.metrics.model_failures.load(Ordering::Relaxed),
-            inference_microseconds: self.metrics.inference_microseconds.load(Ordering::Relaxed),
-        }
-    }
-
-    pub fn reset_stats(&self) {
-        self.metrics.accepted_requests.store(0, Ordering::Relaxed);
-        self.metrics.rejected_requests.store(0, Ordering::Relaxed);
-        self.metrics.timed_out_requests.store(0, Ordering::Relaxed);
-        self.metrics.queued_requests.store(0, Ordering::Relaxed);
-        self.metrics.in_flight_requests.store(0, Ordering::Relaxed);
-        self.metrics.batches.store(0, Ordering::Relaxed);
-        self.metrics.batch_questions.store(0, Ordering::Relaxed);
-        self.metrics.model_failures.store(0, Ordering::Relaxed);
-        self.metrics
-            .inference_microseconds
-            .store(0, Ordering::Relaxed);
+    pub(crate) fn encode_metrics(&self) -> prometheus::Result<EncodedMetrics> {
+        self.metrics.encode()
     }
 
     pub async fn warmup(&self) -> Result<(), ApiError> {
@@ -240,19 +200,22 @@ impl Batcher {
                 questions,
             },
             None,
+            RequestKind::Warmup,
         )
         .await
         .map(|_| ())
     }
 
     pub async fn predict(&self, request: DecisionRequest) -> Result<DecisionResponse, ApiError> {
-        self.predict_inner(request, self.response_timeout).await
+        self.predict_inner(request, self.response_timeout, RequestKind::Inference)
+            .await
     }
 
     async fn predict_inner(
         &self,
         request: DecisionRequest,
         response_timeout: Option<Duration>,
+        kind: RequestKind,
     ) -> Result<DecisionResponse, ApiError> {
         if !matches_model(request.model.as_deref(), &self.served_model_name) {
             let model = request.model.as_deref().unwrap();
@@ -269,12 +232,18 @@ impl Batcher {
             )));
         }
         let (response, receiver) = oneshot::channel();
-        self.metrics.queued_requests.fetch_add(1, Ordering::Relaxed);
-        if let Err(error) = self.sender.try_send(Job { request, response }) {
-            self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
-            self.metrics
-                .rejected_requests
-                .fetch_add(1, Ordering::Relaxed);
+        if kind.records_metrics() {
+            self.metrics.request_queued();
+        }
+        if let Err(error) = self.sender.try_send(Job {
+            request,
+            response,
+            kind,
+        }) {
+            if kind.records_metrics() {
+                self.metrics.request_dequeued();
+                self.metrics.request_rejected();
+            }
             return Err(match error {
                 mpsc::error::TrySendError::Full(_) => {
                     ApiError::unavailable("inference queue is full")
@@ -284,21 +253,39 @@ impl Batcher {
                 }
             });
         }
-        self.metrics
-            .accepted_requests
-            .fetch_add(1, Ordering::Relaxed);
+        if kind.records_metrics() {
+            self.metrics.request_accepted();
+        }
         let received = if let Some(timeout) = response_timeout {
             tokio::time::timeout(timeout, receiver).await.map_err(|_| {
-                self.metrics
-                    .timed_out_requests
-                    .fetch_add(1, Ordering::Relaxed);
+                if kind.records_metrics() {
+                    self.metrics.request_timed_out();
+                }
                 ApiError::timeout("inference request timed out")
             })?
         } else {
             receiver.await
         };
-        let mut response =
-            received.map_err(|_| ApiError::unavailable("inference worker stopped"))??;
+        let response = received.map_err(|_| {
+            if kind.records_metrics() {
+                self.metrics.request_failed();
+            }
+            ApiError::unavailable("inference worker stopped")
+        })?;
+        let mut response = match response {
+            Ok(response) => {
+                if kind.records_metrics() {
+                    self.metrics.request_succeeded();
+                }
+                response
+            }
+            Err(error) => {
+                if kind.records_metrics() {
+                    self.metrics.request_failed();
+                }
+                return Err(error);
+            }
+        };
         response.model = self.served_model_name.to_string();
         Ok(response)
     }
@@ -312,7 +299,14 @@ fn matches_model(requested: Option<&str>, served: &str) -> bool {
 mod tests {
     use super::*;
     use crate::schema::Usage;
-    use std::{sync::Mutex, thread, time::Duration};
+    use std::{
+        sync::{
+            Arc, Barrier, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
 
     struct SlowModel;
 
@@ -322,6 +316,51 @@ mod tests {
             requests: Vec<DecisionRequest>,
         ) -> Vec<Result<DecisionResponse, ApiError>> {
             thread::sleep(Duration::from_millis(20));
+            requests
+                .into_iter()
+                .map(|_| {
+                    Ok(DecisionResponse {
+                        model: String::new(),
+                        answers: Map::new(),
+                        usage: Usage {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                        },
+                    })
+                })
+                .collect()
+        }
+    }
+
+    struct FailingModel;
+
+    impl DecisionModel for FailingModel {
+        fn predict_batch(
+            &self,
+            requests: Vec<DecisionRequest>,
+        ) -> Vec<Result<DecisionResponse, ApiError>> {
+            requests
+                .into_iter()
+                .map(|_| Err(ApiError::internal("model failed")))
+                .collect()
+        }
+    }
+
+    struct BlockOnceModel {
+        block: AtomicBool,
+        started: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl DecisionModel for BlockOnceModel {
+        fn predict_batch(
+            &self,
+            requests: Vec<DecisionRequest>,
+        ) -> Vec<Result<DecisionResponse, ApiError>> {
+            if self.block.swap(false, Ordering::SeqCst) {
+                self.started.wait();
+                self.release.wait();
+            }
             requests
                 .into_iter()
                 .map(|_| {
@@ -378,6 +417,30 @@ mod tests {
         }
     }
 
+    fn metric_value(batcher: &Batcher, name: &str) -> f64 {
+        let encoded = batcher.encode_metrics().expect("encode metrics");
+        let text = std::str::from_utf8(&encoded.body).expect("metrics are UTF-8");
+        text.lines()
+            .find_map(|line| {
+                let (metric, value) = line.split_once(' ')?;
+                (metric == name).then(|| value.parse().expect("metric value is numeric"))
+            })
+            .unwrap_or_else(|| panic!("missing metric {name}"))
+    }
+
+    async fn wait_for_metric(batcher: &Batcher, name: &str, expected: f64) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if metric_value(batcher, name) == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{name} did not reach {expected} in time"));
+    }
+
     #[test]
     fn accepts_optional_or_matching_model_names() {
         let served = "convaiinnovations/laya";
@@ -412,6 +475,123 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.status(), 504);
+        wait_for_metric(&batcher, "sys1_inference_duration_seconds_count", 1.0).await;
+        assert_eq!(metric_value(&batcher, "sys1_requests_accepted_total"), 1.0);
+        assert_eq!(metric_value(&batcher, "sys1_requests_timed_out_total"), 1.0);
+        assert_eq!(
+            metric_value(&batcher, "sys1_requests_successful_total"),
+            0.0
+        );
+        assert_eq!(metric_value(&batcher, "sys1_requests_in_flight"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn tracks_failed_model_requests() {
+        let batcher = Batcher::new(
+            Arc::new(FailingModel),
+            "test-model".to_owned(),
+            BatcherConfig {
+                max_batch_size: 1,
+                max_batch_questions: 1,
+                max_questions_per_request: 1,
+                wait: Duration::ZERO,
+                queue_capacity: 1,
+                response_timeout: None,
+            },
+        );
+
+        let error = batcher.predict(one_question_request()).await.unwrap_err();
+        assert_eq!(error.status(), 500);
+        assert_eq!(metric_value(&batcher, "sys1_requests_failed_total"), 1.0);
+        assert_eq!(metric_value(&batcher, "sys1_model_failures_total"), 1.0);
+        assert_eq!(
+            metric_value(&batcher, "sys1_requests_successful_total"),
+            0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn excludes_warmup_from_metrics() {
+        let batcher = Batcher::new(
+            Arc::new(RecordingModel::default()),
+            "test-model".to_owned(),
+            BatcherConfig {
+                max_batch_size: 1,
+                max_batch_questions: 1,
+                max_questions_per_request: 1,
+                wait: Duration::ZERO,
+                queue_capacity: 1,
+                response_timeout: None,
+            },
+        );
+
+        batcher.warmup().await.unwrap();
+        assert_eq!(metric_value(&batcher, "sys1_requests_accepted_total"), 0.0);
+        assert_eq!(
+            metric_value(&batcher, "sys1_requests_successful_total"),
+            0.0
+        );
+        assert_eq!(metric_value(&batcher, "sys1_batches_total"), 0.0);
+        assert_eq!(metric_value(&batcher, "sys1_batch_size_count"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn tracks_requests_rejected_by_a_full_queue() {
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let model = Arc::new(BlockOnceModel {
+            block: AtomicBool::new(true),
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let batcher = Batcher::new(
+            model,
+            "test-model".to_owned(),
+            BatcherConfig {
+                max_batch_size: 1,
+                max_batch_questions: 1,
+                max_questions_per_request: 1,
+                wait: Duration::ZERO,
+                queue_capacity: 1,
+                response_timeout: None,
+            },
+        );
+
+        let first_batcher = batcher.clone();
+        let first =
+            tokio::spawn(async move { first_batcher.predict(one_question_request()).await });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || started.wait()),
+        )
+        .await
+        .expect("model started in time")
+        .unwrap();
+
+        let second_batcher = batcher.clone();
+        let second =
+            tokio::spawn(async move { second_batcher.predict(one_question_request()).await });
+        wait_for_metric(&batcher, "sys1_requests_queued", 1.0).await;
+        assert_eq!(metric_value(&batcher, "sys1_requests_queued"), 1.0);
+
+        let error = batcher.predict(one_question_request()).await.unwrap_err();
+        assert_eq!(error.status(), 503);
+        assert_eq!(metric_value(&batcher, "sys1_requests_rejected_total"), 1.0);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || release.wait()),
+        )
+        .await
+        .expect("model released in time")
+        .unwrap();
+        assert!(first.await.unwrap().is_ok());
+        assert!(second.await.unwrap().is_ok());
+        assert_eq!(metric_value(&batcher, "sys1_requests_accepted_total"), 2.0);
+        assert_eq!(
+            metric_value(&batcher, "sys1_requests_successful_total"),
+            2.0
+        );
     }
 
     #[tokio::test]
@@ -478,5 +658,9 @@ mod tests {
         assert_eq!(counts.iter().sum::<usize>(), 3);
         assert_eq!(counts.len(), 2);
         assert!(counts.into_iter().all(|count| count <= 2));
+        assert_eq!(metric_value(&batcher, "sys1_batches_total"), 2.0);
+        assert_eq!(metric_value(&batcher, "sys1_batch_size_count"), 2.0);
+        assert_eq!(metric_value(&batcher, "sys1_batch_size_sum"), 3.0);
+        assert_eq!(metric_value(&batcher, "sys1_batch_questions_sum"), 3.0);
     }
 }

@@ -27,7 +27,6 @@ use utoipa_swagger_ui::SwaggerUi;
     paths(health, metrics, models, decide, systemone),
     components(schemas(
         HealthResponse,
-        MetricsResponse,
         ModelsResponse,
         Model,
         DecisionRequest,
@@ -42,19 +41,6 @@ pub struct ApiDoc;
 #[derive(Serialize, ToSchema)]
 struct HealthResponse {
     status: &'static str,
-}
-
-#[derive(Serialize, ToSchema)]
-struct MetricsResponse {
-    accepted_requests: u64,
-    rejected_requests: u64,
-    timed_out_requests: u64,
-    queued_requests: u64,
-    in_flight_requests: u64,
-    batches: u64,
-    batch_questions: u64,
-    model_failures: u64,
-    inference_microseconds: u64,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -124,26 +110,28 @@ async fn health(State(batcher): State<Batcher>) -> (StatusCode, Json<HealthRespo
     }
 }
 
-/// Return lightweight inference and admission-control counters.
+/// Return inference and admission-control metrics in Prometheus text format.
 #[utoipa::path(
     get,
     path = "/metrics",
     tag = "sys1",
-    responses((status = OK, description = "Inference counters", body = MetricsResponse))
+    responses((
+        status = OK,
+        description = "Prometheus metrics",
+        content_type = "text/plain",
+        body = String
+    ), (status = INTERNAL_SERVER_ERROR, description = "Metrics encoding failed"))
 )]
-async fn metrics(State(batcher): State<Batcher>) -> Json<MetricsResponse> {
-    let stats = batcher.stats();
-    Json(MetricsResponse {
-        accepted_requests: stats.accepted_requests,
-        rejected_requests: stats.rejected_requests,
-        timed_out_requests: stats.timed_out_requests,
-        queued_requests: stats.queued_requests,
-        in_flight_requests: stats.in_flight_requests,
-        batches: stats.batches,
-        batch_questions: stats.batch_questions,
-        model_failures: stats.model_failures,
-        inference_microseconds: stats.inference_microseconds,
-    })
+async fn metrics(State(batcher): State<Batcher>) -> Result<Response, StatusCode> {
+    let metrics = batcher.encode_metrics().map_err(|error| {
+        tracing::error!(%error, "failed to encode Prometheus metrics");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, metrics.content_type)],
+        metrics.body,
+    )
+        .into_response())
 }
 
 /// List the model served by this instance.
@@ -303,16 +291,44 @@ mod tests {
 
     #[tokio::test]
     async fn serves_inference_metrics() {
-        let response = test_router()
+        let app = test_router();
+        let inference_response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/decide")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"state":"test","questions":{"q0":{}}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inference_response.status(), StatusCode::OK);
+
+        let response = app
             .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["accepted_requests"], 0);
-        assert_eq!(value["queued_requests"], 0);
-        assert_eq!(value["in_flight_requests"], 0);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/plain; version=0.0.4"
+        );
+        let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("# TYPE sys1_requests_accepted_total counter"));
+        assert!(
+            body.lines()
+                .any(|line| line == "sys1_requests_accepted_total 1")
+        );
+        assert!(
+            body.lines()
+                .any(|line| line == "sys1_requests_successful_total 1")
+        );
+        assert!(body.contains("# TYPE sys1_requests_queued gauge"));
+        assert!(body.lines().any(|line| line == "sys1_requests_queued 0"));
+        assert!(body.contains("# TYPE sys1_batch_size histogram"));
+        assert!(body.lines().any(|line| line == "sys1_batch_size_count 1"));
+        assert!(body.lines().any(|line| line == "sys1_batches_total 1"));
     }
 
     #[tokio::test]
