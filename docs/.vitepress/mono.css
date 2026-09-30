@@ -1,0 +1,113 @@
+html {
+  scrollbar-gutter: stable;
+}
+
+:root {
+  --vp-c-brand-1: #111111;
+  --vp-c-brand-2: #2f2f2f;
+  --vp-c-brand-3: #4f4f4f;
+  --vp-c-brand-soft: rgba(17, 17, 17, 0.08);
+}
+
+.dark {
+  --vp-c-brand-1: #f0f0f0;
+  --vp-c-brand-2: #d0d0d0;
+  --vp-c-brand-3: #aaaaaa;
+  --vp-c-brand-soft: rgba(255, 255, 255, 0.09);
+}
+
+/* Keep the sidebar as one compact list instead of separated groups. */
+.VPSidebar .group {
+  padding-top: 0 !important;
+}
+
+.VPSidebar .group + .group {
+  border-top: 0 !important;
+}
+
+/* Keep Changelog separate and at the foot of the sidebar. */
+.VPSidebar {
+  display: flex;
+  flex-direction: column;
+}
+
+.VPSidebar #VPSidebarNav {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+}
+
+.VPSidebar #VPSidebarNav > .group:last-of-type {
+  margin-top: auto;
+  padding-top: 24px !important;
+}
+
+.VPSidebar .VPSidebarItem.level-0,
+.VPSidebar .VPSidebarItem.collapsed.level-0 {
+  padding-bottom: 8px !important;
+}
+
+.VPSidebar .VPSidebarItem.level-0:is(.collapsible, .is-link) > .items {
+  padding-left: 14px;
+}
+
+.VPNavBarTitle.has-sidebar .title {
+  border-bottom-color: transparent !important;
+}
+
+/* Keep the outline label available to screen readers without showing a title. */
+.VPDocAsideOutline .outline-title {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.VPDocAsideOutline .outline-marker {
+  transform: translateY(-32px);
+}
+
+.overview-banner {
+  display: block;
+  width: 100%;
+  margin: 0 0 2rem;
+  border: 1px solid var(--vp-c-divider);
+}
+
+.model-publisher {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 1.5rem;
+  color: var(--vp-c-text-2);
+  font-size: 0.875rem;
+  text-decoration: none !important;
+}
+
+.model-publisher:hover {
+  color: var(--vp-c-text-1);
+}
+
+.model-publisher-avatar,
+.model-publisher-avatar img {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+}
+
+.model-publisher-avatar {
+  overflow: hidden;
+  background: var(--vp-c-bg-soft);
+  color: var(--vp-c-text-2);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.model-publisher-avatar img {
+  object-fit: cover;
+}
