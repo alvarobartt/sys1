@@ -1,0 +1,13 @@
+{
+  "name": "sys1-docs",
+  "private": true,
+  "scripts": {
+    "dev": "node scripts/generate-reference.mjs && vitepress dev --host 127.0.0.1 --port 8102",
+    "build": "node scripts/generate-reference.mjs && vitepress build",
+    "reference:generate": "node scripts/generate-reference.mjs",
+    "preview": "vitepress preview --host 127.0.0.1 --port 8102"
+  },
+  "devDependencies": {
+    "vitepress": "1.6.4"
+  }
+}

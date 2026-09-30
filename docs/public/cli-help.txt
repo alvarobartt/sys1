@@ -1,0 +1,45 @@
+Blazing fast, self-hosted structured decisions for open-weight models with a TypeSafe AI compatible API, written in Rust.
+
+Usage: sys1 [OPTIONS]
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+Model options:
+  -m, --model-id <MODEL_ID>
+          Hugging Face model repository to load [env: MODEL_ID=] [default: convaiinnovations/laya]
+  -M, --model-path <MODEL_PATH>
+          Local model directory to load instead of a Hugging Face repository [env: MODEL_PATH=]
+  -r, --revision <REVISION>
+          Hugging Face model revision (branch, tag, or commit) [env: REVISION=] [default: main]
+  -n, --served-model-name <SERVED_MODEL_NAME>
+          Model name returned by the API [env: SERVED_MODEL_NAME=]
+      --max-model-len <MAX_MODEL_LEN>
+          Maximum model context length; uses the model configuration when omitted [env: MAX_MODEL_LEN=]
+  -d, --dtype <DTYPE>
+          Floating-point precision used for inference [env: DTYPE=] [default: auto] [possible values: auto, f32, f16, bf16]
+  -a, --attention <ATTENTION>
+          Attention implementation used for inference [env: ATTENTION=] [default: eager] [possible values: eager, flash-attn-2, flash-attn-3]
+
+Server options:
+  -H, --host <HOST>
+          Address on which the HTTP server listens [env: HOST=] [default: 0.0.0.0]
+  -p, --port <PORT>
+          Port on which the HTTP server listens [env: PORT=] [default: 3000]
+      --max-request-bytes <MAX_REQUEST_BYTES>
+          Maximum request body size in bytes [env: MAX_REQUEST_BYTES=] [default: 1048576]
+
+Batching options:
+  -b, --max-batch-size <MAX_BATCH_SIZE>
+          Maximum number of requests processed in one batch [env: MAX_BATCH_SIZE=] [default: 32]
+      --max-batch-questions <MAX_BATCH_QUESTIONS>
+          Maximum total number of questions processed in one batch [env: MAX_BATCH_QUESTIONS=] [default: 128]
+      --max-questions-per-request <MAX_QUESTIONS_PER_REQUEST>
+          Maximum number of questions accepted in one request [env: MAX_QUESTIONS_PER_REQUEST=] [default: 64]
+      --max-queue-size <MAX_QUEUE_SIZE>
+          Maximum number of requests waiting to be processed [env: MAX_QUEUE_SIZE=] [default: 256]
+      --batch-wait-ms <BATCH_WAIT_MS>
+          Time to wait for more requests before processing a batch, in milliseconds [env: BATCH_WAIT_MS=] [default: 0]
+  -t, --request-timeout-ms <REQUEST_TIMEOUT_MS>
+          Per-request timeout in milliseconds; 0 disables the timeout [env: REQUEST_TIMEOUT_MS=] [default: 30000]

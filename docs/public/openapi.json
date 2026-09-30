@@ -1,0 +1,356 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "sys1",
+    "description": "Blazing fast, self-hosted structured decisions for open-weight models with a TypeSafe AI compatible API, written in Rust.",
+    "contact": {
+      "name": "Alvaro Bartolome",
+      "email": "36760800+alvarobartt@users.noreply.github.com"
+    },
+    "license": {
+      "name": "Apache-2.0",
+      "identifier": "Apache-2.0"
+    },
+    "version": "0.0.3"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "sys1"
+        ],
+        "summary": "Check whether the service is running.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Service is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Inference worker is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": [
+          "sys1"
+        ],
+        "summary": "Return inference and admission-control metrics in Prometheus text format.",
+        "operationId": "metrics",
+        "responses": {
+          "200": {
+            "description": "Prometheus metrics",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Metrics encoding failed"
+          }
+        }
+      }
+    },
+    "/v1/decide": {
+      "post": {
+        "tags": [
+          "sys1"
+        ],
+        "summary": "Make a decision.",
+        "operationId": "decide",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Decision generated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Inference failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Inference queue or worker is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Inference request timed out",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": [
+          "sys1"
+        ],
+        "summary": "List the model served by this instance.",
+        "operationId": "models",
+        "responses": {
+          "200": {
+            "description": "Available models",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/systemone": {
+      "post": {
+        "tags": [
+          "sys1"
+        ],
+        "summary": "Make a decision using the TypeSafe AI System One compatible route.",
+        "operationId": "systemone",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Decision generated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Inference failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Inference queue or worker is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Inference request timed out",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "DecisionRequest": {
+        "type": "object",
+        "required": [
+          "state",
+          "questions"
+        ],
+        "properties": {
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "questions": {
+            "type": "object"
+          },
+          "state": {}
+        }
+      },
+      "DecisionResponse": {
+        "type": "object",
+        "required": [
+          "model",
+          "answers",
+          "usage"
+        ],
+        "properties": {
+          "answers": {
+            "type": "object"
+          },
+          "model": {
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Usage"
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "Model": {
+        "type": "object",
+        "required": [
+          "id",
+          "object",
+          "owned_by"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string"
+          },
+          "owned_by": {
+            "type": "string"
+          }
+        }
+      },
+      "ModelsResponse": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Model"
+            }
+          }
+        }
+      },
+      "Usage": {
+        "type": "object",
+        "required": [
+          "input_tokens",
+          "output_tokens"
+        ],
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "sys1",
+      "description": "TypeSafe AI compatible decision API"
+    }
+  ]
+}

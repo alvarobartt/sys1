@@ -34,7 +34,7 @@ use utoipa_swagger_ui::SwaggerUi;
         crate::schema::Usage,
         ApiError
     )),
-    tags((name = "sys1", description = "System One decision API"))
+    tags((name = "sys1", description = "TypeSafe AI compatible decision API"))
 )]
 pub struct ApiDoc;
 
@@ -95,7 +95,10 @@ async fn trace_request(request: Request, next: Next) -> Response {
     get,
     path = "/health",
     tag = "sys1",
-    responses((status = OK, description = "Service is healthy", body = HealthResponse))
+    responses(
+        (status = OK, description = "Service is healthy", body = HealthResponse),
+        (status = SERVICE_UNAVAILABLE, description = "Inference worker is unavailable", body = HealthResponse)
+    )
 )]
 async fn health(State(batcher): State<Batcher>) -> (StatusCode, Json<HealthResponse>) {
     if batcher.is_ready() {
@@ -159,7 +162,10 @@ async fn models(State(batcher): State<Batcher>) -> Json<ModelsResponse> {
     request_body = DecisionRequest,
     responses(
         (status = OK, description = "Decision generated", body = crate::schema::DecisionResponse),
-        (status = BAD_REQUEST, description = "Invalid request", body = ApiError)
+        (status = BAD_REQUEST, description = "Invalid request", body = ApiError),
+        (status = SERVICE_UNAVAILABLE, description = "Inference queue or worker is unavailable", body = ApiError),
+        (status = GATEWAY_TIMEOUT, description = "Inference request timed out", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Inference failed", body = ApiError)
     )
 )]
 async fn decide(
@@ -169,7 +175,7 @@ async fn decide(
     batcher.predict(request).await.map(Json)
 }
 
-/// Make a decision using the Jev-compatible route.
+/// Make a decision using the TypeSafe AI System One compatible route.
 #[utoipa::path(
     post,
     path = "/v1/systemone",
@@ -177,7 +183,10 @@ async fn decide(
     request_body = DecisionRequest,
     responses(
         (status = OK, description = "Decision generated", body = crate::schema::DecisionResponse),
-        (status = BAD_REQUEST, description = "Invalid request", body = ApiError)
+        (status = BAD_REQUEST, description = "Invalid request", body = ApiError),
+        (status = SERVICE_UNAVAILABLE, description = "Inference queue or worker is unavailable", body = ApiError),
+        (status = GATEWAY_TIMEOUT, description = "Inference request timed out", body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, description = "Inference failed", body = ApiError)
     )
 )]
 async fn systemone(
