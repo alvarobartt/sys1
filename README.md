@@ -6,7 +6,7 @@
   />
   <br/>
   <em>
-    System One compatible API for open decision models, written in Rust.
+    Blazing fast structured decisions for System One open-models self-hosted with a TypeSafe AI compatible API, written in Rust.
   </em>
 </div>
 
