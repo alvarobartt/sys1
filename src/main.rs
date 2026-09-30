@@ -194,7 +194,6 @@ async fn main() -> anyhow::Result<()> {
         elapsed_ms = started.elapsed().as_millis(),
         "model warmup completed"
     );
-    batcher.reset_stats();
     let app = api::router(batcher, args.max_request_bytes);
     let listener = tokio::net::TcpListener::bind(address).await?;
     info!(%address, model = %served_model_name, "sys1 ready");
