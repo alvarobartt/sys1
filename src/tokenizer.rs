@@ -82,6 +82,20 @@ pub fn from_json(json: &[u8]) -> anyhow::Result<Tokenizer> {
     Ok(Tokenizer { inner, added, ids })
 }
 
+pub fn from_qwen_json(json: &[u8]) -> anyhow::Result<Tokenizer> {
+    let mut value: Value = serde_json::from_slice(json)?;
+    let added = read_added(&value)?;
+    let ids = added
+        .iter()
+        .map(|token| (token.content.clone(), token.id))
+        .collect();
+    value["added_tokens"] = Value::Array(Vec::new());
+    canonicalize_value(&mut value).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let inner = pipeline_from_json(&serde_json::to_string(&value)?)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(Tokenizer { inner, added, ids })
+}
+
 fn migrate(value: &mut Value) -> anyhow::Result<()> {
     if value.get("laya_migration").and_then(Value::as_u64) == Some(1) {
         return Ok(());

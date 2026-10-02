@@ -1,0 +1,42 @@
+---
+source: src/models/clef.rs
+expression: video_cases
+---
+red_then_blue:
+  input_tokens: 165
+  media_spans:
+    - - 43
+      - 4
+      - true
+    - - 55
+      - 4
+      - true
+  grids:
+    - - 2
+      - 4
+      - 4
+  timestamps:
+    - - 0.25
+      - 1.25
+  choice: blue
+image_then_video:
+  input_tokens: 238
+  media_spans:
+    - - 37
+      - 64
+      - false
+    - - 109
+      - 4
+      - true
+    - - 121
+      - 4
+      - true
+  image_grids:
+    - - 1
+      - 16
+      - 16
+  video_grids:
+    - - 2
+      - 4
+      - 4
+  choice: blue
