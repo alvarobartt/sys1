@@ -1,4 +1,4 @@
-use super::AttentionImplementation;
+use crate::models::AttentionImplementation;
 use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::{
     Embedding, LayerNorm, Linear, Module, VarBuilder, embedding, layer_norm_no_bias, ops::softmax,
@@ -196,14 +196,14 @@ impl Attention {
     }
 }
 
-pub(super) struct AttentionOptions<'a> {
+pub(crate) struct AttentionOptions<'a> {
     pub mask: Option<&'a Tensor>,
     pub implementation: AttentionImplementation,
     pub lengths: &'a [usize],
     pub window: Option<usize>,
 }
 
-pub(super) fn scaled_dot_product_attention(
+pub(crate) fn scaled_dot_product_attention(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,

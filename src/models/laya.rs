@@ -1,6 +1,6 @@
 use super::AttentionImplementation;
 use super::DecisionModel;
-use super::modernbert::{
+use crate::archs::modernbert::{
     AttentionOptions, Config as ModernBertConfig, Encoder as ModernBertEncoder,
 };
 use crate::{
@@ -118,7 +118,7 @@ impl HeadLayer {
                 .contiguous()?;
             candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
         } else {
-            super::modernbert::scaled_dot_product_attention(
+            crate::archs::modernbert::scaled_dot_product_attention(
                 &q,
                 &k,
                 &v,
@@ -132,7 +132,7 @@ impl HeadLayer {
             )?
         };
         #[cfg(not(feature = "metal"))]
-        let attention = super::modernbert::scaled_dot_product_attention(
+        let attention = crate::archs::modernbert::scaled_dot_product_attention(
             &q,
             &k,
             &v,
@@ -279,6 +279,12 @@ impl Laya {
     }
 
     fn prepare(&self, request: DecisionRequest) -> Result<RequestItems, ApiError> {
+        if !request.images.is_empty() {
+            return Err(ApiError::new("images are not supported by this model"));
+        }
+        if !request.videos.is_empty() {
+            return Err(ApiError::new("videos are not supported by this model"));
+        }
         if !matches!(
             request.state,
             Value::String(_) | Value::Array(_) | Value::Object(_)
@@ -647,6 +653,7 @@ fn validate_flash_capability(
     minor: i32,
 ) -> anyhow::Result<()> {
     let supported = match attention {
+        AttentionImplementation::Auto => true,
         AttentionImplementation::Eager => true,
         AttentionImplementation::FlashAttention2 => (8..=9).contains(&major),
         AttentionImplementation::FlashAttention3 => (major, minor) == (9, 0),

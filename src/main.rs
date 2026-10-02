@@ -103,11 +103,11 @@ struct Args {
         help_heading = "Batching options"
     )]
     request_timeout_ms: u64,
-    /// Maximum request body size in bytes.
+    /// Maximum request body size in bytes, including base64 images and videos.
     #[arg(
         long,
         env,
-        default_value_t = 1_048_576,
+        default_value_t = 16_777_216,
         help_heading = "Server options"
     )]
     max_request_bytes: usize,
@@ -130,7 +130,7 @@ struct Args {
         long,
         env,
         value_enum,
-        default_value_t = models::AttentionImplementation::Eager,
+        default_value_t = models::AttentionImplementation::Auto,
         help_heading = "Model options"
     )]
     attention: models::AttentionImplementation,
@@ -160,7 +160,9 @@ impl Args {
             self.max_model_len != Some(0),
             "--max-model-len must be positive"
         );
-        self.attention.validate(self.dtype.resolve())?;
+        if self.dtype != Precision::Auto {
+            self.attention.validate(self.dtype.resolve())?;
+        }
         Ok(())
     }
 }
@@ -181,6 +183,20 @@ impl Precision {
             Self::Bf16 => DType::BF16,
         }
     }
+
+    fn resolve_for(self, architecture: models::Architecture) -> DType {
+        if self == Self::Auto && architecture == models::Architecture::Qwen35 {
+            if cfg!(feature = "cuda") {
+                DType::BF16
+            } else if cfg!(feature = "metal") {
+                DType::F16
+            } else {
+                DType::F32
+            }
+        } else {
+            self.resolve()
+        }
+    }
 }
 
 #[tokio::main]
@@ -195,13 +211,11 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     args.validate()?;
     sys1::validate_backend()?;
-    let dtype = args.dtype.resolve();
     info!(
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),
         backend = backend(),
         ?args,
-        ?dtype,
         "sys1 starting"
     );
     let address = SocketAddr::new(args.host, args.port);
@@ -215,7 +229,6 @@ async fn main() -> anyhow::Result<()> {
             (path, name, architecture)
         }
         None => {
-            let architecture = models::Architecture::from_model_id(&args.model_id)?;
             let started = Instant::now();
             info!(model_id = %args.model_id, revision = %args.revision, "resolving model snapshot");
             let path = sys1::hub::download(&args.model_id, &args.revision).await?;
@@ -225,9 +238,19 @@ async fn main() -> anyhow::Result<()> {
                 elapsed_ms = started.elapsed().as_millis(),
                 "model snapshot ready"
             );
+            let architecture = models::Architecture::from_path(&path)?;
             (path, args.model_id, architecture)
         }
     };
+    let dtype = args.dtype.resolve_for(architecture);
+    let attention = if architecture == models::Architecture::Laya
+        && args.attention == models::AttentionImplementation::Auto
+    {
+        models::AttentionImplementation::Eager
+    } else {
+        args.attention
+    };
+    attention.validate(dtype)?;
     let served_model_name = args.served_model_name.unwrap_or(source_name);
     let started = Instant::now();
     info!(
@@ -241,7 +264,7 @@ async fn main() -> anyhow::Result<()> {
         architecture,
         dtype,
         args.max_model_len,
-        args.attention,
+        attention,
     )
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     info!(
@@ -331,10 +354,10 @@ mod tests {
         assert_eq!(args.max_questions_per_request, 64);
         assert_eq!(args.max_queue_size, 256);
         assert_eq!(args.request_timeout_ms, 30_000);
-        assert_eq!(args.max_request_bytes, 1_048_576);
+        assert_eq!(args.max_request_bytes, 16_777_216);
         assert_eq!(args.max_model_len, None);
         assert_eq!(args.dtype, Precision::Auto);
-        assert_eq!(args.attention, models::AttentionImplementation::Eager);
+        assert_eq!(args.attention, models::AttentionImplementation::Auto);
     }
 
     #[test]

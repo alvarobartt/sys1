@@ -1,5 +1,5 @@
+mod clef;
 mod laya;
-mod modernbert;
 
 use crate::schema::{ApiError, DecisionRequest, DecisionResponse};
 
@@ -9,21 +9,14 @@ use clap::ValueEnum;
 use serde::Deserialize;
 use std::{fs, path::Path};
 
+pub use clef::Clef;
 pub use laya::Laya;
-
-pub const LAYA_MODEL_ID: &str = "convaiinnovations/laya";
-pub const LAYA_TYPED_DECISIONS_MODEL_ID: &str = "convaiinnovations/laya-typed-decisions";
-pub const LAYA_MULTILINGUAL_MODEL_ID: &str = "convaiinnovations/laya-multilingual";
-
-pub const LAYA_MODEL_IDS: &[&str] = &[
-    LAYA_MODEL_ID,
-    LAYA_TYPED_DECISIONS_MODEL_ID,
-    LAYA_MULTILINGUAL_MODEL_ID,
-];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum AttentionImplementation {
     #[default]
+    Auto,
+    #[value(name = "eager")]
     Eager,
     #[value(name = "flash-attn-2")]
     FlashAttention2,
@@ -34,6 +27,7 @@ pub enum AttentionImplementation {
 impl AttentionImplementation {
     pub fn cli_name(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Eager => "eager",
             Self::FlashAttention2 => "flash-attn-2",
             Self::FlashAttention3 => "flash-attn-3",
@@ -43,6 +37,7 @@ impl AttentionImplementation {
     pub fn validate(self, dtype: DType) -> anyhow::Result<()> {
         let name = self.cli_name();
         let enabled = match self {
+            Self::Auto => return Ok(()),
             Self::Eager => return Ok(()),
             Self::FlashAttention2 => cfg!(feature = "flash-attn-2"),
             Self::FlashAttention3 => cfg!(feature = "flash-attn-3"),
@@ -62,20 +57,10 @@ impl AttentionImplementation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Architecture {
     Laya,
+    Qwen35,
 }
 
 impl Architecture {
-    pub fn from_model_id(model_id: &str) -> anyhow::Result<Self> {
-        if LAYA_MODEL_IDS.contains(&model_id) {
-            Ok(Self::Laya)
-        } else {
-            bail!(
-                "unsupported model id {model_id:?}; supported models: {}",
-                LAYA_MODEL_IDS.join(", ")
-            )
-        }
-    }
-
     pub fn from_path(path: &Path) -> anyhow::Result<Self> {
         let root_config = path.join("config.json");
         let encoder_config = path.join("encoder/config.json");
@@ -90,6 +75,9 @@ impl Architecture {
         )
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
         let laya_config_path = path.join("rl_agent_config.json");
+        if config.model_type == "qwen3_5" {
+            return Ok(Self::Qwen35);
+        }
         if config.model_type == "modernbert" && laya_config_path.is_file() {
             let laya_config: LayaIdentity = serde_json::from_slice(
                 &fs::read(&laya_config_path)
@@ -122,10 +110,19 @@ struct LayaIdentity {
 }
 
 pub enum Model {
-    Laya(Laya),
+    Laya(Box<Laya>),
+    Clef(Box<Clef>),
 }
 
 pub trait DecisionModel: Send + Sync {
+    fn supports_images(&self) -> bool {
+        false
+    }
+
+    fn supports_videos(&self) -> bool {
+        false
+    }
+
     fn predict_batch(
         &self,
         requests: Vec<DecisionRequest>,
@@ -133,12 +130,21 @@ pub trait DecisionModel: Send + Sync {
 }
 
 impl DecisionModel for Model {
+    fn supports_images(&self) -> bool {
+        matches!(self, Self::Clef(_))
+    }
+
+    fn supports_videos(&self) -> bool {
+        matches!(self, Self::Clef(_))
+    }
+
     fn predict_batch(
         &self,
         requests: Vec<DecisionRequest>,
     ) -> Vec<Result<DecisionResponse, ApiError>> {
         match self {
             Self::Laya(model) => model.predict_batch(requests),
+            Self::Clef(model) => model.predict_batch(requests),
         }
     }
 }
@@ -151,7 +157,12 @@ pub fn load(
     attention: AttentionImplementation,
 ) -> anyhow::Result<Model> {
     match architecture {
-        Architecture::Laya => Laya::load(path, dtype, max_model_len, attention).map(Model::Laya),
+        Architecture::Laya => Laya::load(path, dtype, max_model_len, attention)
+            .map(Box::new)
+            .map(Model::Laya),
+        Architecture::Qwen35 => Clef::load(path, dtype, max_model_len, attention)
+            .map(Box::new)
+            .map(Model::Clef),
     }
 }
 
@@ -160,13 +171,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn routes_the_supported_hub_models() {
-        for model_id in LAYA_MODEL_IDS {
-            assert_eq!(
-                Architecture::from_model_id(model_id).unwrap(),
-                Architecture::Laya
-            );
-        }
-        assert!(Architecture::from_model_id("owner/other").is_err());
+    fn identifies_qwen35_from_config_independent_of_repository_name() {
+        let path = std::env::temp_dir().join(format!("sys1-arch-test-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("config.json"), br#"{"model_type":"qwen3_5"}"#).unwrap();
+        assert_eq!(
+            Architecture::from_path(&path).unwrap(),
+            Architecture::Qwen35
+        );
+        std::fs::remove_file(path.join("config.json")).unwrap();
+        std::fs::remove_dir(path).unwrap();
     }
 }
