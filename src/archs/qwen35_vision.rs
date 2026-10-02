@@ -3,6 +3,8 @@ use crate::models::AttentionImplementation;
 use candle_core::{D, DType, Result, Tensor};
 use candle_nn::{LayerNorm, Linear, VarBuilder, layer_norm, ops::softmax_last_dim};
 
+type PositionData = ([Vec<u32>; 4], [Vec<f32>; 4], Vec<f32>, Vec<usize>);
+
 fn dense(input: usize, output: usize, vb: VarBuilder) -> Result<Linear> {
     Ok(Linear::new(
         vb.get((output, input), "weight")?,
@@ -275,10 +277,7 @@ impl VisionTower {
             .apply(&self.merge_fc2)
     }
 
-    fn positions_for(
-        &self,
-        grids: &[[usize; 3]],
-    ) -> Result<([Vec<u32>; 4], [Vec<f32>; 4], Vec<f32>, Vec<usize>)> {
+    fn positions_for(&self, grids: &[[usize; 3]]) -> Result<PositionData> {
         let side = (self.config.num_position_embeddings as f64).sqrt() as usize;
         if side * side != self.config.num_position_embeddings {
             candle_core::bail!("vision position grid must be square")
@@ -843,8 +842,7 @@ pub mod video {
                 .or_else(|| stream.r_frame_rate.as_deref().and_then(frame_rate))
                 .context("video frame rate is unavailable")?;
             let sample_count = ((total_frames as f64 / fps * 2.) as usize)
-                .max(4)
-                .min(768)
+                .clamp(4, 768)
                 .min(total_frames);
             let indices: Vec<_> = (0..sample_count)
                 .map(|index| {

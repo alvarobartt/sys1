@@ -151,7 +151,7 @@ impl FullAttention {
     ) -> Result<Self> {
         let rotary_dim =
             (config.head_dim as f64 * config.rope_parameters.partial_rotary_factor) as usize;
-        if rotary_dim % 2 != 0 {
+        if !rotary_dim.is_multiple_of(2) {
             candle_core::bail!("Qwen3.5 rotary dimension must be even")
         }
         if config.rope_parameters.mrope_section.iter().sum::<usize>() != rotary_dim / 2 {

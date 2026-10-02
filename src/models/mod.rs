@@ -110,8 +110,8 @@ struct LayaIdentity {
 }
 
 pub enum Model {
-    Laya(Laya),
-    Clef(Clef),
+    Laya(Box<Laya>),
+    Clef(Box<Clef>),
 }
 
 pub trait DecisionModel: Send + Sync {
@@ -157,8 +157,12 @@ pub fn load(
     attention: AttentionImplementation,
 ) -> anyhow::Result<Model> {
     match architecture {
-        Architecture::Laya => Laya::load(path, dtype, max_model_len, attention).map(Model::Laya),
-        Architecture::Qwen35 => Clef::load(path, dtype, max_model_len, attention).map(Model::Clef),
+        Architecture::Laya => Laya::load(path, dtype, max_model_len, attention)
+            .map(Box::new)
+            .map(Model::Laya),
+        Architecture::Qwen35 => Clef::load(path, dtype, max_model_len, attention)
+            .map(Box::new)
+            .map(Model::Clef),
     }
 }
 

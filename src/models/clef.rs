@@ -400,8 +400,8 @@ impl Clef {
             for (grid, timestamps) in videos.grids.iter().zip(&videos.timestamps) {
                 let &[t, h, w] = grid;
                 let count = h * w / self.vision_config.spatial_merge_size.pow(2);
-                for frame in 0..t {
-                    media_text.push_str(&format!("<{:.1} seconds>", timestamps[frame]));
+                for timestamp in &timestamps[..t] {
+                    media_text.push_str(&format!("<{timestamp:.1} seconds>"));
                     media_text.push_str("<|vision_start|>");
                     for _ in 0..count {
                         media_text.push_str("<|video_pad|>");
