@@ -7,7 +7,6 @@
 #   "tokenizers>=0.22,<2",
 # ]
 # ///
-"""End-to-end HTTP benchmarks for a running sys1 server."""
 
 from __future__ import annotations
 
@@ -32,7 +31,6 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 from huggingface_hub import HfApi, hf_hub_download
 from tokenizers import Tokenizer
-
 
 VERSION = "0.1.0"
 DATASET_API = "https://datasets-server.huggingface.co/rows"
