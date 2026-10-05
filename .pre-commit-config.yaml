@@ -1,0 +1,12 @@
+repos:
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+      - id: fmt
+        pass_filenames: false
+        always_run: true
+
+      - id: clippy
+        args: [--fix, --allow-dirty, --allow-staged, --locked, --no-default-features, --features, cpu, --all-targets, --, -D, warnings]
+        pass_filenames: false
+        always_run: true
