@@ -306,11 +306,9 @@ impl Laya {
                 .ok_or_else(|| ApiError::new(format!("question {id:?} has invalid type")))?;
             let instructions = object
                 .get("instructions")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    ApiError::new(format!("question {id:?} requires string instructions"))
-                })?
-                .to_owned();
+                .filter(|value| !value.is_null())
+                .map(render_value)
+                .unwrap_or_else(|| id.clone());
             let criteria = object.get("criteria").cloned().unwrap_or(Value::Null);
             let (labels, options) = render_options(kind, &criteria, &id)?;
             let question = Question {
@@ -516,10 +514,10 @@ impl Laya {
                 .unwrap_or(self.config.temperature[item.question.kind])
                 .clamp(0.5, 5.0);
             let probabilities = probability(&values, temperature);
-            let confidence = round4(confidence(&probabilities));
             let answer = match item.question.kind {
                 0 => {
                     let index = argmax(&probabilities);
+                    let confidence = round4(choice_confidence(&probabilities));
                     let values = item
                         .question
                         .labels
@@ -540,6 +538,7 @@ impl Laya {
                     })
                 }
                 1 => {
+                    let confidence = round4(score_confidence(&probabilities));
                     let score = probabilities
                         .iter()
                         .enumerate()
@@ -569,8 +568,7 @@ impl Laya {
                 }
                 _ => json!({
                     "type": "noul",
-                    "noul": round4(probabilities[1]),
-                    "confidence": round4(probabilities[1].max(1.0 - probabilities[1]))
+                    "noul": round4(probabilities[1])
                 }),
             };
             answers.insert(item.question.id, answer);
@@ -749,9 +747,9 @@ fn render_options(
             let criteria = criteria.as_array().ok_or_else(|| {
                 ApiError::new(format!("score question {id:?} requires array criteria"))
             })?;
-            if !(2..=10).contains(&criteria.len()) {
+            if !(1..=10).contains(&criteria.len()) {
                 return Err(ApiError::new(format!(
-                    "score question {id:?} requires 2 to 10 criteria"
+                    "score question {id:?} requires 1 to 10 criteria"
                 )));
             }
             Ok((
@@ -868,22 +866,39 @@ fn probability(logits: &[f32], temperature: f32) -> Vec<f32> {
     values
 }
 
-fn confidence(probabilities: &[f32]) -> f32 {
+fn choice_confidence(probabilities: &[f32]) -> f32 {
     if probabilities.len() < 2 {
         return 1.0;
     }
-    let entropy: f32 = probabilities
+    let n = probabilities.len() as f32;
+    let top = probabilities.iter().copied().fold(0.0, f32::max);
+    ((top - 1.0 / n) / (1.0 - 1.0 / n)).clamp(0.0, 1.0)
+}
+
+fn score_confidence(probabilities: &[f32]) -> f32 {
+    if probabilities.len() < 2 {
+        return 1.0;
+    }
+    let n = probabilities.len();
+    let mode = argmax(probabilities);
+    let spread: f32 = probabilities
         .iter()
-        .map(|value| -value * value.max(1e-12).ln())
+        .enumerate()
+        .map(|(index, value)| value * index.abs_diff(mode) as f32)
         .sum();
-    (1.0 - entropy / (probabilities.len() as f32).ln()).clamp(0.0, 1.0)
+    let center = (n - 1) as f32 / 2.0;
+    let even_spread: f32 = (0..n)
+        .map(|index| (index as f32 - center).abs())
+        .sum::<f32>()
+        / n as f32;
+    (1.0 - spread / even_spread).clamp(0.0, 1.0)
 }
 
 fn argmax(values: &[f32]) -> usize {
     values
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .max_by(|(left, a), (right, b)| a.total_cmp(b).then_with(|| right.cmp(left)))
         .map(|(index, _)| index)
         .unwrap_or(0)
 }
@@ -895,6 +910,17 @@ fn round4(value: f32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confidence_matches_typesafe_formulas() {
+        assert!((choice_confidence(&[0.6, 0.3, 0.1]) - 0.4).abs() < 1e-6);
+        assert!((choice_confidence(&[0.5, 0.5]) - 0.0).abs() < 1e-6);
+        assert_eq!(choice_confidence(&[1.0]), 1.0);
+        assert!((score_confidence(&[0.0, 0.5, 0.5]) - 0.25).abs() < 1e-6);
+        assert_eq!(score_confidence(&[0.5, 0.0, 0.5]), 0.0);
+        assert!((score_confidence(&[0.0, 0.57, 0.43]) - 0.355).abs() < 1e-6);
+        assert_eq!(argmax(&[0.5, 0.5]), 0);
+    }
 
     #[tokio::test]
     async fn fp32_logits_and_probabilities() -> anyhow::Result<()> {
