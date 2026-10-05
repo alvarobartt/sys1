@@ -1,17 +1,18 @@
 use crate::{
     batching::Batcher,
-    schema::{ApiError, DecisionRequest},
+    schema::{ApiError, DecisionRequest, DecisionResponse, HTTPValidationError, SystemOneRequest},
 };
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Request, State, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::Serialize;
+use serde_json::Value;
 use std::time::Instant;
 use tracing::Instrument;
 use utoipa::{OpenApi, ToSchema};
@@ -27,11 +28,14 @@ use utoipa_swagger_ui::SwaggerUi;
     paths(health, metrics, models, decide, systemone),
     components(schemas(
         HealthResponse,
-        ModelsResponse,
-        Model,
+        ModelMetadataList,
+        ModelMetadata,
         DecisionRequest,
+        crate::schema::SystemOneRequest,
         crate::schema::DecisionResponse,
         crate::schema::Usage,
+        crate::schema::ValidationError,
+        HTTPValidationError,
         ApiError
     )),
     tags((name = "sys1", description = "System One decision API"))
@@ -44,15 +48,15 @@ struct HealthResponse {
 }
 
 #[derive(Serialize, ToSchema)]
-struct ModelsResponse {
-    data: Vec<Model>,
+struct ModelMetadataList {
+    models: Vec<ModelMetadata>,
 }
 
 #[derive(Serialize, ToSchema)]
-struct Model {
-    id: String,
-    object: &'static str,
-    owned_by: &'static str,
+struct ModelMetadata {
+    name: String,
+    description: &'static str,
+    release_date: &'static str,
 }
 
 pub fn router(batcher: Batcher, max_request_bytes: usize) -> Router {
@@ -139,16 +143,23 @@ async fn metrics(State(batcher): State<Batcher>) -> Result<Response, StatusCode>
     get,
     path = "/v1/models",
     tag = "sys1",
-    responses((status = OK, description = "Available models", body = ModelsResponse))
+    responses((status = OK, description = "Available models and aliases", body = ModelMetadataList))
 )]
-async fn models(State(batcher): State<Batcher>) -> Json<ModelsResponse> {
-    Json(ModelsResponse {
-        data: vec![Model {
-            id: batcher.served_model_name().to_owned(),
-            object: "model",
-            owned_by: "sys1",
-        }],
-    })
+async fn models(State(batcher): State<Batcher>) -> Json<ModelMetadataList> {
+    let served = batcher.served_model_name();
+    let mut models = vec![ModelMetadata {
+        name: served.to_owned(),
+        description: "Self-hosted Laya decision model served by sys1.",
+        release_date: "2026-09-18",
+    }];
+    if served != "jev-latest" {
+        models.push(ModelMetadata {
+            name: "jev-latest".to_owned(),
+            description: "TypeSafe SDK compatibility alias for the model served by this instance.",
+            release_date: "2026-09-18",
+        });
+    }
+    Json(ModelMetadataList { models })
 }
 
 /// Make a decision.
@@ -174,17 +185,86 @@ async fn decide(
     post,
     path = "/v1/systemone",
     tag = "sys1",
-    request_body = DecisionRequest,
+    request_body = crate::schema::SystemOneRequest,
     responses(
         (status = OK, description = "Decision generated", body = crate::schema::DecisionResponse),
-        (status = BAD_REQUEST, description = "Invalid request", body = ApiError)
+        (status = BAD_REQUEST, description = "Unknown model", body = ApiError),
+        (status = UNPROCESSABLE_ENTITY, description = "Validation error", body = HTTPValidationError)
     )
 )]
 async fn systemone(
     State(batcher): State<Batcher>,
-    Json(request): Json<DecisionRequest>,
-) -> Result<Json<crate::schema::DecisionResponse>, ApiError> {
-    batcher.predict(request).await.map(Json)
+    headers: HeaderMap,
+    payload: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let Json(value) = match payload {
+        Ok(value) => value,
+        Err(error) => {
+            return validation_response(HTTPValidationError::single(
+                vec!["body".into()],
+                error.body_text(),
+                "json_invalid",
+            ));
+        }
+    };
+    let request = match SystemOneRequest::try_from(value) {
+        Ok(request) => request,
+        Err(error) => return validation_response(error),
+    };
+    let request = DecisionRequest::from(request);
+    if sdk_uses_default_alias(
+        &headers,
+        request.model.as_deref(),
+        batcher.served_model_name(),
+    ) {
+        tracing::warn!(
+            alias = "jev-latest",
+            served_model = batcher.served_model_name(),
+            "TypeSafe SDK used its default model alias; routing to the served model"
+        );
+    }
+    match batcher.predict(request).await {
+        Ok(response) => Json(typesafe_schema_response(response)).into_response(),
+        Err(error)
+            if error.status() == StatusCode::BAD_REQUEST.as_u16() && !error.is_unknown_model() =>
+        {
+            validation_response(HTTPValidationError::single(
+                vec!["body".into()],
+                error.error,
+                "value_error",
+            ))
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+fn typesafe_schema_response(mut response: DecisionResponse) -> DecisionResponse {
+    for answer in response.answers.values_mut() {
+        let Some(fields) = answer.as_object_mut() else {
+            continue;
+        };
+        let allowed: &[&str] = match fields.get("type").and_then(Value::as_str) {
+            Some("choice") => &["type", "choice", "probabilities", "confidence"],
+            Some("score") => &["type", "score", "probabilities", "legend", "confidence"],
+            Some("noul") => &["type", "noul"],
+            _ => continue,
+        };
+        fields.retain(|name, _| allowed.contains(&name.as_str()));
+    }
+    response
+}
+
+fn sdk_uses_default_alias(headers: &HeaderMap, requested: Option<&str>, served: &str) -> bool {
+    requested == Some("jev-latest")
+        && served != "jev-latest"
+        && headers
+            .get("x-typesafe-sdk")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("typesafe-sdk/"))
+}
+
+fn validation_response(error: HTTPValidationError) -> Response {
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(error)).into_response()
 }
 
 impl IntoResponse for ApiError {
@@ -207,7 +287,6 @@ mod tests {
         body::{Body, to_bytes},
         http::Request,
     };
-    use serde_json::Map;
     use std::{sync::Arc, time::Duration};
     use tower::ServiceExt;
 
@@ -223,7 +302,31 @@ mod tests {
                 .map(|_| {
                     Ok(DecisionResponse {
                         model: String::new(),
-                        answers: Map::new(),
+                        answers: serde_json::from_value(serde_json::json!({
+                            "route": {
+                                "type": "choice",
+                                "choice": "billing",
+                                "probabilities": {"billing": 0.6, "bug": 0.3, "account": 0.1},
+                                "confidence": 0.1829,
+                                "answer_confidence": 0.6,
+                                "action": {"act_probability": 0.8}
+                            },
+                            "urgency": {
+                                "type": "score",
+                                "score": 1.5,
+                                "probabilities": {"0": 0.0, "1": 0.5, "2": 0.5},
+                                "legend": {"0": "low", "1": "medium", "2": "high"},
+                                "confidence": 0.3691,
+                                "answer_confidence": 0.5
+                            },
+                            "escalate": {
+                                "type": "noul",
+                                "noul": 0.7,
+                                "confidence": 0.7,
+                                "answer_confidence": 0.7
+                            }
+                        }))
+                        .unwrap(),
                         usage: Usage {
                             input_tokens: 0,
                             output_tokens: 0,
@@ -267,6 +370,10 @@ mod tests {
         ] {
             assert!(paths.contains_key(path), "missing OpenAPI path {path}");
         }
+
+        let state = &json["components"]["schemas"]["SystemOneRequest"]["properties"]["state"];
+        assert!(state.is_object());
+        assert!(state.get("type").is_none());
     }
 
     #[tokio::test]
@@ -278,6 +385,217 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["content-type"], "application/json");
+    }
+
+    #[tokio::test]
+    async fn lists_sdk_compatible_models_and_accepts_default_alias() {
+        let app = test_router();
+        let response = app
+            .clone()
+            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+        let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let models = listing["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["name"], "test-model");
+        assert_eq!(models[1]["name"], "jev-latest");
+        for model in models {
+            assert!(model["description"].as_str().is_some_and(|s| !s.is_empty()));
+            assert_eq!(model["release_date"], "2026-09-18");
+        }
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/systemone")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"jev-latest","state":"test","questions":{"q0":{"type":"noul"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+        let decision: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decision["model"], "test-model");
+    }
+
+    #[tokio::test]
+    async fn systemone_defaults_missing_null_and_empty_models_to_served_model() {
+        let app = test_router();
+        for model in [
+            None,
+            Some("null"),
+            Some("\"\""),
+            Some("\"jev-latest\""),
+            Some("\"test-model\""),
+        ] {
+            let model_field = model.map_or(String::new(), |value| format!("\"model\":{value},"));
+            let body = format!(
+                "{{{model_field}\"state\":\"test\",\"questions\":{{\"q\":{{\"type\":\"noul\"}}}}}}"
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/v1/systemone")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "model: {model:?}");
+            let bytes = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["model"], "test-model");
+        }
+    }
+
+    #[tokio::test]
+    async fn systemone_keeps_native_confidence_with_typesafe_response_shape() {
+        let app = test_router();
+        let mut responses = Vec::new();
+        for path in ["/v1/decide", "/v1/systemone"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"state":"test","questions":{"route":{"type":"choice","criteria":{"billing":null,"bug":null,"account":null}},"urgency":{"type":"score","criteria":["low","medium","high"]},"escalate":{"type":"noul"}}}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+            responses.push(serde_json::from_slice::<Value>(&bytes).unwrap());
+        }
+
+        let native = &responses[0]["answers"];
+        let typesafe = &responses[1]["answers"];
+        assert_eq!(native["route"]["confidence"], 0.1829);
+        assert_eq!(native["route"]["answer_confidence"], 0.6);
+        assert!(native["route"].get("action").is_some());
+        assert_eq!(native["urgency"]["confidence"], 0.3691);
+        assert_eq!(native["escalate"]["confidence"], 0.7);
+        assert_eq!(
+            typesafe["route"]["confidence"],
+            native["route"]["confidence"]
+        );
+        assert_eq!(
+            typesafe["urgency"]["confidence"],
+            native["urgency"]["confidence"]
+        );
+        assert!(typesafe["escalate"].get("confidence").is_none());
+        for key in ["route", "urgency", "escalate"] {
+            assert!(typesafe[key].get("answer_confidence").is_none());
+        }
+        assert!(typesafe["route"].get("action").is_none());
+        assert_eq!(
+            typesafe["route"]["probabilities"],
+            native["route"]["probabilities"]
+        );
+        assert_eq!(
+            typesafe["urgency"]["probabilities"],
+            native["urgency"]["probabilities"]
+        );
+        assert_eq!(typesafe["escalate"]["noul"], native["escalate"]["noul"]);
+    }
+
+    #[test]
+    fn identifies_sdk_default_alias_for_warning() {
+        let mut headers = HeaderMap::new();
+        assert!(!sdk_uses_default_alias(
+            &headers,
+            Some("jev-latest"),
+            "test-model"
+        ));
+        headers.insert("x-typesafe-sdk", "typesafe-sdk/0.7.2".parse().unwrap());
+        assert!(sdk_uses_default_alias(
+            &headers,
+            Some("jev-latest"),
+            "test-model"
+        ));
+        assert!(!sdk_uses_default_alias(&headers, None, "test-model"));
+        assert!(!sdk_uses_default_alias(&headers, Some(""), "test-model"));
+        assert!(!sdk_uses_default_alias(
+            &headers,
+            Some("test-model"),
+            "test-model"
+        ));
+        assert!(!sdk_uses_default_alias(
+            &headers,
+            Some("jev-latest"),
+            "jev-latest"
+        ));
+    }
+
+    #[tokio::test]
+    async fn systemone_rejects_invalid_requests_with_typesafe_validation_shape() {
+        let app = test_router();
+        for (body, location, kind) in [
+            (
+                r#"{"model":12,"state":"test","questions":{"q":{"type":"noul"}}}"#,
+                "model",
+                "value_error",
+            ),
+            (
+                r#"{"model":"test-model","state":"test","questions":{"q":{"type":"score"}}}"#,
+                "criteria",
+                "missing",
+            ),
+            (
+                r#"{"model":"test-model","state":"test","questions":{"q":{"type":"other"}}}"#,
+                "type",
+                "value_error",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/v1/systemone")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let bytes = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let issue = &body["detail"][0];
+            assert_eq!(issue["loc"].as_array().unwrap().last().unwrap(), location);
+            assert_eq!(issue["type"], kind);
+            assert!(issue["msg"].as_str().is_some_and(|value| !value.is_empty()));
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_model_returns_bad_request() {
+        let app = test_router();
+        let body = r#"{"model":"wrong-model","state":"test","questions":{"q":{"type":"noul"}}}"#;
+        for path in ["/v1/systemone", "/v1/decide"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let bytes = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+            let error: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error["error"], "unknown model: wrong-model");
+        }
     }
 
     #[tokio::test]

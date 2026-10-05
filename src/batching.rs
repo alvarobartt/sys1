@@ -219,7 +219,7 @@ impl Batcher {
     ) -> Result<DecisionResponse, ApiError> {
         if !matches_model(request.model.as_deref(), &self.served_model_name) {
             let model = request.model.as_deref().unwrap();
-            return Err(ApiError::new(format!("unknown model: {model}")));
+            return Err(ApiError::unknown_model(model));
         }
         if request.questions.is_empty() {
             return Err(ApiError::new("questions must not be empty"));
@@ -292,7 +292,7 @@ impl Batcher {
 }
 
 fn matches_model(requested: Option<&str>, served: &str) -> bool {
-    requested.is_none_or(|model| model.is_empty() || model == served)
+    requested.is_none_or(|model| model.is_empty() || model == served || model == "jev-latest")
 }
 
 #[cfg(test)]
@@ -447,6 +447,7 @@ mod tests {
         assert!(matches_model(None, served));
         assert!(matches_model(Some(""), served));
         assert!(matches_model(Some(served), served));
+        assert!(matches_model(Some("jev-latest"), served));
         assert!(!matches_model(Some("other/model"), served));
     }
 
