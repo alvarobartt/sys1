@@ -89,6 +89,39 @@ struct Encoded {
     criteria: Vec<Value>,
 }
 
+fn validate_declared_dtypes(
+    declared: Option<&str>,
+    text_dtype: Option<&str>,
+    vision_dtype: Option<&str>,
+    requested: DType,
+) -> anyhow::Result<()> {
+    fn parse(value: &str) -> anyhow::Result<DType> {
+        match value {
+            "float32" | "f32" => Ok(DType::F32),
+            "float16" | "f16" => Ok(DType::F16),
+            "bfloat16" | "bf16" => Ok(DType::BF16),
+            _ => anyhow::bail!("unsupported Clef checkpoint dtype {value:?} in config.json"),
+        }
+    }
+
+    let declared = declared.context("Clef config.json is missing dtype")?;
+    let source = parse(declared)?;
+    for (section, value) in [("text_config", text_dtype), ("vision_config", vision_dtype)] {
+        if let Some(value) = value {
+            anyhow::ensure!(
+                parse(value)? == source,
+                "Clef {section}.dtype {value:?} differs from config.json dtype {declared:?}"
+            );
+        }
+    }
+    anyhow::ensure!(
+        requested != DType::F16 || source == DType::F16,
+        "unsafe Clef dtype conversion from {declared} to f16: FP16 has a narrower exponent range; use --dtype bf16 or --dtype f32"
+    );
+    tracing::info!(checkpoint_dtype = declared, inference_dtype = ?requested, "Clef dtype validated");
+    Ok(())
+}
+
 pub struct Clef {
     tokenizer: tokenizer::Tokenizer,
     decoder: text::Decoder,
@@ -111,6 +144,12 @@ impl Clef {
         attention: AttentionImplementation,
     ) -> anyhow::Result<Self> {
         let config = text::Config::load(&path.join("config.json"))?;
+        validate_declared_dtypes(
+            config.dtype.as_deref(),
+            config.text_config.dtype.as_deref(),
+            config.vision_config.dtype.as_deref(),
+            dtype,
+        )?;
         let head_config = clef_head::Config::load(&path.join("joint_head_config.json"))?;
         vision::images::validate_config(
             &path.join("processor_config.json"),
@@ -788,6 +827,42 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn checkpoint_dtype_rejects_unsafe_fp16_conversion() {
+        for source in ["bfloat16", "float32"] {
+            let error =
+                validate_declared_dtypes(Some(source), Some(source), Some(source), DType::F16)
+                    .unwrap_err();
+            assert!(error.to_string().contains("unsafe Clef dtype conversion"));
+        }
+        for requested in [DType::BF16, DType::F32] {
+            validate_declared_dtypes(
+                Some("bfloat16"),
+                Some("bfloat16"),
+                Some("bfloat16"),
+                requested,
+            )
+            .unwrap();
+        }
+        validate_declared_dtypes(
+            Some("float16"),
+            Some("float16"),
+            Some("float16"),
+            DType::F16,
+        )
+        .unwrap();
+        assert!(validate_declared_dtypes(None, None, None, DType::F16).is_err());
+        assert!(
+            validate_declared_dtypes(
+                Some("bfloat16"),
+                Some("float16"),
+                Some("bfloat16"),
+                DType::BF16,
+            )
+            .is_err()
+        );
     }
 
     #[test]
