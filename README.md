@@ -37,6 +37,8 @@ Then run it with any of the supported models (more coming soon!).
 - [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya) for English text, guardrails, email triage
 - [`convaiinnovations/laya-multilingual`](https://huggingface.co/convaiinnovations/laya-multilingual) for 100+ languages, ~2.2x faster
 - [`convaiinnovations/laya-typed-decisions`](https://huggingface.co/convaiinnovations/laya-typed-decisions) for typed-decisions workflows
+- [`Cloudflare/clef`](https://huggingface.co/Cloudflare/clef) for text, image, and video decisions
+- [`Cloudflare/clef-flash`](https://huggingface.co/Cloudflare/clef-flash) for text, image, and video decisions (smaller and faster)
 
 ```bash
 sys1 --model-id convaiinnovations/laya --dtype auto
@@ -85,7 +87,7 @@ Or, install the [TypeSafe AI SDK for Python](https://github.com/typesafe-ai/type
 ```python
 from typesafe_sdk import Choice, TypeSafeClient
 
-client = TypeSafeClient(base_url="http://localhost:3000", api_key="")
+client = TypeSafeClient(base_url="http://localhost:3000", api_key="-")
 
 response = client.system_one(
     model="convaiinnovations/laya",
@@ -105,3 +107,4 @@ print(response.choices["route"].choice)
 - [TypeSafe AI API](https://api.typesafe.ai)
 - [TypeSafe AI Python SDK](https://github.com/typesafe-ai/typesafe-sdk-python)
 - [Laya: Multilingual, non-autoregressive System 1 decision engine](https://github.com/NandhaKishorM/laya)
+- [Introducing Clef: our open-source decision models, and new RL fine-tuning platform](https://blog.cloudflare.com/clef-decision-models/)
