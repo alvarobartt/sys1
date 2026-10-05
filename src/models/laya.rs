@@ -517,7 +517,8 @@ impl Laya {
             let answer = match item.question.kind {
                 0 => {
                     let index = argmax(&probabilities);
-                    let confidence = round4(choice_confidence(&probabilities));
+                    let confidence = round4(confidence_from_probs(&probabilities));
+                    let answer_confidence = round4(probabilities[index]);
                     let values = item
                         .question
                         .labels
@@ -534,11 +535,13 @@ impl Laya {
                         "type": "choice",
                         "choice": item.question.labels[index],
                         "probabilities": values,
-                        "confidence": confidence
+                        "confidence": confidence,
+                        "answer_confidence": answer_confidence
                     })
                 }
                 1 => {
-                    let confidence = round4(score_confidence(&probabilities));
+                    let confidence = round4(confidence_from_probs(&probabilities));
+                    let answer_confidence = round4(probabilities[argmax(&probabilities)]);
                     let score = probabilities
                         .iter()
                         .enumerate()
@@ -563,12 +566,15 @@ impl Laya {
                         "score": round4(score),
                         "probabilities": probabilities,
                         "legend": legend,
-                        "confidence": confidence
+                        "confidence": confidence,
+                        "answer_confidence": answer_confidence
                     })
                 }
                 _ => json!({
                     "type": "noul",
-                    "noul": round4(probabilities[1])
+                    "noul": round4(probabilities[1]),
+                    "confidence": round4(probabilities[0].max(probabilities[1])),
+                    "answer_confidence": round4(probabilities[0].max(probabilities[1]))
                 }),
             };
             answers.insert(item.question.id, answer);
@@ -866,32 +872,15 @@ fn probability(logits: &[f32], temperature: f32) -> Vec<f32> {
     values
 }
 
-fn choice_confidence(probabilities: &[f32]) -> f32 {
+fn confidence_from_probs(probabilities: &[f32]) -> f32 {
     if probabilities.len() < 2 {
         return 1.0;
     }
-    let n = probabilities.len() as f32;
-    let top = probabilities.iter().copied().fold(0.0, f32::max);
-    ((top - 1.0 / n) / (1.0 - 1.0 / n)).clamp(0.0, 1.0)
-}
-
-fn score_confidence(probabilities: &[f32]) -> f32 {
-    if probabilities.len() < 2 {
-        return 1.0;
-    }
-    let n = probabilities.len();
-    let mode = argmax(probabilities);
-    let spread: f32 = probabilities
+    let entropy: f32 = probabilities
         .iter()
-        .enumerate()
-        .map(|(index, value)| value * index.abs_diff(mode) as f32)
+        .map(|value| -value * value.max(1e-12).ln())
         .sum();
-    let center = (n - 1) as f32 / 2.0;
-    let even_spread: f32 = (0..n)
-        .map(|index| (index as f32 - center).abs())
-        .sum::<f32>()
-        / n as f32;
-    (1.0 - spread / even_spread).clamp(0.0, 1.0)
+    (1.0 - entropy / (probabilities.len() as f32).ln()).clamp(0.0, 1.0)
 }
 
 fn argmax(values: &[f32]) -> usize {
@@ -912,13 +901,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn confidence_matches_typesafe_formulas() {
-        assert!((choice_confidence(&[0.6, 0.3, 0.1]) - 0.4).abs() < 1e-6);
-        assert!((choice_confidence(&[0.5, 0.5]) - 0.0).abs() < 1e-6);
-        assert_eq!(choice_confidence(&[1.0]), 1.0);
-        assert!((score_confidence(&[0.0, 0.5, 0.5]) - 0.25).abs() < 1e-6);
-        assert_eq!(score_confidence(&[0.5, 0.0, 0.5]), 0.0);
-        assert!((score_confidence(&[0.0, 0.57, 0.43]) - 0.355).abs() < 1e-6);
+    fn confidence_matches_laya_formulas() {
+        let probabilities: [f32; 3] = [0.6, 0.3, 0.1];
+        let entropy = -probabilities
+            .iter()
+            .map(|value| value * value.ln())
+            .sum::<f32>();
+        assert!(
+            (confidence_from_probs(&probabilities) - (1.0 - entropy / 3.0_f32.ln())).abs() < 1e-6
+        );
+        assert_eq!(confidence_from_probs(&[0.5, 0.5]), 0.0);
+        assert_eq!(confidence_from_probs(&[1.0]), 1.0);
         assert_eq!(argmax(&[0.5, 0.5]), 0);
     }
 

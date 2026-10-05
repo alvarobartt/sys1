@@ -1,12 +1,12 @@
 use crate::{
     batching::Batcher,
-    schema::{ApiError, DecisionRequest, HTTPValidationError, SystemOneRequest},
+    schema::{ApiError, DecisionRequest, DecisionResponse, HTTPValidationError, SystemOneRequest},
 };
 
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Request, State, rejection::JsonRejection},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -193,6 +193,7 @@ async fn decide(
 )]
 async fn systemone(
     State(batcher): State<Batcher>,
+    headers: HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<crate::schema::DecisionResponse>, Response> {
     let Json(value) = payload.map_err(|error| {
@@ -204,17 +205,58 @@ async fn systemone(
     })?;
     let request = SystemOneRequest::try_from(value).map_err(validation_response)?;
     let request = DecisionRequest::from(request);
-    batcher.predict(request).await.map(Json).map_err(|error| {
-        if error.status() == StatusCode::BAD_REQUEST.as_u16() {
-            validation_response(HTTPValidationError::single(
-                vec!["body".into()],
-                error.error,
-                "value_error",
-            ))
-        } else {
-            error.into_response()
-        }
-    })
+    if sdk_uses_default_alias(
+        &headers,
+        request.model.as_deref(),
+        batcher.served_model_name(),
+    ) {
+        tracing::warn!(
+            alias = "jev-latest",
+            served_model = batcher.served_model_name(),
+            "TypeSafe SDK used its default model alias; routing to the served model"
+        );
+    }
+    batcher
+        .predict(request)
+        .await
+        .map(typesafe_schema_response)
+        .map(Json)
+        .map_err(|error| {
+            if error.status() == StatusCode::BAD_REQUEST.as_u16() {
+                validation_response(HTTPValidationError::single(
+                    vec!["body".into()],
+                    error.error,
+                    "value_error",
+                ))
+            } else {
+                error.into_response()
+            }
+        })
+}
+
+fn typesafe_schema_response(mut response: DecisionResponse) -> DecisionResponse {
+    for answer in response.answers.values_mut() {
+        let Some(fields) = answer.as_object_mut() else {
+            continue;
+        };
+        let allowed: &[&str] = match fields.get("type").and_then(Value::as_str) {
+            Some("choice") => &["type", "choice", "probabilities", "confidence"],
+            Some("score") => &["type", "score", "probabilities", "legend", "confidence"],
+            Some("noul") => &["type", "noul"],
+            _ => continue,
+        };
+        fields.retain(|name, _| allowed.contains(&name.as_str()));
+    }
+    response
+}
+
+fn sdk_uses_default_alias(headers: &HeaderMap, requested: Option<&str>, served: &str) -> bool {
+    requested == Some("jev-latest")
+        && served != "jev-latest"
+        && headers
+            .get("x-typesafe-sdk")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("typesafe-sdk/"))
 }
 
 fn validation_response(error: HTTPValidationError) -> Response {
@@ -241,7 +283,6 @@ mod tests {
         body::{Body, to_bytes},
         http::Request,
     };
-    use serde_json::Map;
     use std::{sync::Arc, time::Duration};
     use tower::ServiceExt;
 
@@ -257,7 +298,31 @@ mod tests {
                 .map(|_| {
                     Ok(DecisionResponse {
                         model: String::new(),
-                        answers: Map::new(),
+                        answers: serde_json::from_value(serde_json::json!({
+                            "route": {
+                                "type": "choice",
+                                "choice": "billing",
+                                "probabilities": {"billing": 0.6, "bug": 0.3, "account": 0.1},
+                                "confidence": 0.1829,
+                                "answer_confidence": 0.6,
+                                "action": {"act_probability": 0.8}
+                            },
+                            "urgency": {
+                                "type": "score",
+                                "score": 1.5,
+                                "probabilities": {"0": 0.0, "1": 0.5, "2": 0.5},
+                                "legend": {"0": "low", "1": "medium", "2": "high"},
+                                "confidence": 0.3691,
+                                "answer_confidence": 0.5
+                            },
+                            "escalate": {
+                                "type": "noul",
+                                "noul": 0.7,
+                                "confidence": 0.7,
+                                "answer_confidence": 0.7
+                            }
+                        }))
+                        .unwrap(),
                         usage: Usage {
                             input_tokens: 0,
                             output_tokens: 0,
@@ -352,13 +417,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn systemone_defaults_missing_null_and_empty_models_to_served_model() {
+        let app = test_router();
+        for model in [
+            None,
+            Some("null"),
+            Some("\"\""),
+            Some("\"jev-latest\""),
+            Some("\"test-model\""),
+        ] {
+            let model_field = model.map_or(String::new(), |value| format!("\"model\":{value},"));
+            let body = format!(
+                "{{{model_field}\"state\":\"test\",\"questions\":{{\"q\":{{\"type\":\"noul\"}}}}}}"
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/v1/systemone")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "model: {model:?}");
+            let bytes = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["model"], "test-model");
+        }
+    }
+
+    #[tokio::test]
+    async fn systemone_keeps_native_confidence_with_typesafe_response_shape() {
+        let app = test_router();
+        let mut responses = Vec::new();
+        for path in ["/v1/decide", "/v1/systemone"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"state":"test","questions":{"route":{"type":"choice","criteria":{"billing":null,"bug":null,"account":null}},"urgency":{"type":"score","criteria":["low","medium","high"]},"escalate":{"type":"noul"}}}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+            responses.push(serde_json::from_slice::<Value>(&bytes).unwrap());
+        }
+
+        let native = &responses[0]["answers"];
+        let typesafe = &responses[1]["answers"];
+        assert_eq!(native["route"]["confidence"], 0.1829);
+        assert_eq!(native["route"]["answer_confidence"], 0.6);
+        assert!(native["route"].get("action").is_some());
+        assert_eq!(native["urgency"]["confidence"], 0.3691);
+        assert_eq!(native["escalate"]["confidence"], 0.7);
+        assert_eq!(
+            typesafe["route"]["confidence"],
+            native["route"]["confidence"]
+        );
+        assert_eq!(
+            typesafe["urgency"]["confidence"],
+            native["urgency"]["confidence"]
+        );
+        assert!(typesafe["escalate"].get("confidence").is_none());
+        for key in ["route", "urgency", "escalate"] {
+            assert!(typesafe[key].get("answer_confidence").is_none());
+        }
+        assert!(typesafe["route"].get("action").is_none());
+        assert_eq!(
+            typesafe["route"]["probabilities"],
+            native["route"]["probabilities"]
+        );
+        assert_eq!(
+            typesafe["urgency"]["probabilities"],
+            native["urgency"]["probabilities"]
+        );
+        assert_eq!(typesafe["escalate"]["noul"], native["escalate"]["noul"]);
+    }
+
+    #[test]
+    fn identifies_sdk_default_alias_for_warning() {
+        let mut headers = HeaderMap::new();
+        assert!(!sdk_uses_default_alias(
+            &headers,
+            Some("jev-latest"),
+            "test-model"
+        ));
+        headers.insert("x-typesafe-sdk", "typesafe-sdk/0.7.2".parse().unwrap());
+        assert!(sdk_uses_default_alias(
+            &headers,
+            Some("jev-latest"),
+            "test-model"
+        ));
+        assert!(!sdk_uses_default_alias(&headers, None, "test-model"));
+        assert!(!sdk_uses_default_alias(&headers, Some(""), "test-model"));
+        assert!(!sdk_uses_default_alias(
+            &headers,
+            Some("test-model"),
+            "test-model"
+        ));
+        assert!(!sdk_uses_default_alias(
+            &headers,
+            Some("jev-latest"),
+            "jev-latest"
+        ));
+    }
+
+    #[tokio::test]
     async fn systemone_rejects_invalid_requests_with_typesafe_validation_shape() {
         let app = test_router();
         for (body, location, kind) in [
             (
-                r#"{"state":"test","questions":{"q":{"type":"noul"}}}"#,
+                r#"{"model":12,"state":"test","questions":{"q":{"type":"noul"}}}"#,
                 "model",
-                "missing",
+                "value_error",
             ),
             (
                 r#"{"model":"test-model","state":"test","questions":{"q":{"type":"score"}}}"#,

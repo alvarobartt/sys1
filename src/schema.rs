@@ -13,7 +13,7 @@ pub struct DecisionRequest {
 
 #[derive(ToSchema)]
 pub struct SystemOneRequest {
-    pub model: String,
+    pub model: Option<String>,
     #[schema(value_type = Object)]
     pub state: Value,
     #[schema(value_type = Object)]
@@ -70,12 +70,16 @@ impl TryFrom<Value> for SystemOneRequest {
                 )
             })
         };
-        let model = required("model")?.as_str().ok_or_else(|| {
-            invalid(
-                vec!["body".into(), "model".into()],
-                "Input should be a string",
-            )
-        })?;
+        let model = match body.get("model") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(model)) => Some(model.clone()),
+            Some(_) => {
+                return Err(invalid(
+                    vec!["body".into(), "model".into()],
+                    "Input should be a string or null",
+                ));
+            }
+        };
         let state = required("state")?;
         if !content(state, false) {
             return Err(invalid(
@@ -199,7 +203,7 @@ impl TryFrom<Value> for SystemOneRequest {
             }
         }
         Ok(Self {
-            model: model.to_owned(),
+            model,
             state: state.clone(),
             questions: questions.clone(),
         })
@@ -209,7 +213,7 @@ impl TryFrom<Value> for SystemOneRequest {
 impl From<SystemOneRequest> for DecisionRequest {
     fn from(request: SystemOneRequest) -> Self {
         Self {
-            model: Some(request.model),
+            model: request.model,
             state: request.state,
             questions: request.questions,
         }
