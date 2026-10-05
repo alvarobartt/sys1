@@ -240,11 +240,22 @@ pub struct ApiError {
     #[serde(skip)]
     #[schema(ignore)]
     status: u16,
+    #[serde(skip)]
+    #[schema(ignore)]
+    unknown_model: bool,
 }
 
 impl ApiError {
     pub fn new(message: impl Into<String>) -> Self {
         Self::with_status(message, 400)
+    }
+
+    pub fn unknown_model(model: &str) -> Self {
+        Self {
+            error: format!("unknown model: {model}"),
+            status: 400,
+            unknown_model: true,
+        }
     }
 
     pub fn unavailable(message: impl Into<String>) -> Self {
@@ -263,10 +274,15 @@ impl ApiError {
         self.status
     }
 
+    pub fn is_unknown_model(&self) -> bool {
+        self.unknown_model
+    }
+
     fn with_status(message: impl Into<String>, status: u16) -> Self {
         Self {
             error: message.into(),
             status,
+            unknown_model: false,
         }
     }
 }

@@ -188,6 +188,7 @@ async fn decide(
     request_body = crate::schema::SystemOneRequest,
     responses(
         (status = OK, description = "Decision generated", body = crate::schema::DecisionResponse),
+        (status = BAD_REQUEST, description = "Unknown model", body = ApiError),
         (status = UNPROCESSABLE_ENTITY, description = "Validation error", body = HTTPValidationError)
     )
 )]
@@ -222,7 +223,7 @@ async fn systemone(
         .map(typesafe_schema_response)
         .map(Json)
         .map_err(|error| {
-            if error.status() == StatusCode::BAD_REQUEST.as_u16() {
+            if error.status() == StatusCode::BAD_REQUEST.as_u16() && !error.is_unknown_model() {
                 validation_response(HTTPValidationError::single(
                     vec!["body".into()],
                     error.error,
@@ -565,6 +566,28 @@ mod tests {
             assert_eq!(issue["loc"].as_array().unwrap().last().unwrap(), location);
             assert_eq!(issue["type"], kind);
             assert!(issue["msg"].as_str().is_some_and(|value| !value.is_empty()));
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_model_returns_bad_request() {
+        let app = test_router();
+        let body = r#"{"model":"wrong-model","state":"test","questions":{"q":{"type":"noul"}}}"#;
+        for path in ["/v1/systemone", "/v1/decide"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let bytes = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+            let error: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error["error"], "unknown model: wrong-model");
         }
     }
 
