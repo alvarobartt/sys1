@@ -828,7 +828,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "downloads the 19 GB public Clef-Flash model"]
     fn public_clef_flash_answers_image_and_video_requests() {
         let path = tokio::runtime::Runtime::new()
             .unwrap()
