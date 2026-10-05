@@ -80,6 +80,26 @@ curl http://localhost:3000/v1/systemone \
     }'
 ```
 
+Or, install the [TypeSafe AI SDK for Python](https://github.com/typesafe-ai/typesafe-sdk-python), or the [TypeSafe AI SDK for Javascript / Typescript](https://github.com/typesafe-ai/typesafe-sdk-js).
+
+```python
+from typesafe_sdk import Choice, TypeSafeClient
+
+client = TypeSafeClient(base_url="http://localhost:3000", api_key="")
+
+response = client.system_one(
+    model="convaiinnovations/laya",
+    state={"message": "I was charged twice for invoice 4411."},
+    questions={
+        "route": Choice(
+            instructions="Where should this ticket go?",
+            criteria={"billing": None, "bug": None, "account": None},
+        ),
+    },
+)
+print(response.choices["route"].choice)
+```
+
 ## References
 
 - [TypeSafe AI API](https://api.typesafe.ai)
