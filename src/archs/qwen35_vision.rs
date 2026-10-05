@@ -350,6 +350,7 @@ mod tests {
     #[test]
     fn vision_tower_merges_one_image_grid_on_cpu() {
         let config = VisionConfig {
+            dtype: None,
             depth: 1,
             hidden_size: 8,
             intermediate_size: 16,
@@ -562,6 +563,7 @@ pub mod images {
                 STANDARD.encode(ppm)
             );
             let config = VisionConfig {
+                dtype: None,
                 depth: 1,
                 hidden_size: 72,
                 intermediate_size: 128,
@@ -606,6 +608,7 @@ pub mod images {
                 )
             };
             let config = VisionConfig {
+                dtype: None,
                 depth: 1,
                 hidden_size: 72,
                 intermediate_size: 128,
@@ -647,6 +650,7 @@ pub mod images {
                 STANDARD.encode(ppm)
             );
             let config = VisionConfig {
+                dtype: None,
                 depth: 1,
                 hidden_size: 72,
                 intermediate_size: 128,
@@ -878,8 +882,8 @@ pub mod video {
                 path,
                 "-vf".into(),
                 filter,
-                "-fps_mode".into(),
-                "passthrough".into(),
+                "-vsync".into(),
+                "0".into(),
                 "-frames:v".into(),
                 sample_count.to_string(),
                 "-f".into(),
@@ -987,6 +991,7 @@ pub mod video {
         fn four_frame_video_has_two_temporal_patch_groups() {
             let video = synthetic_test_video();
             let config = VisionConfig {
+                dtype: None,
                 depth: 1,
                 hidden_size: 72,
                 intermediate_size: 128,

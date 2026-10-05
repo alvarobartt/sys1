@@ -211,10 +211,17 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     args.validate()?;
     sys1::validate_backend()?;
+    let backend = if cfg!(feature = "cuda") {
+        "cuda"
+    } else if cfg!(feature = "metal") {
+        "metal"
+    } else {
+        "cpu"
+    };
     info!(
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),
-        backend = backend(),
+        backend,
         ?args,
         "sys1 starting"
     );
@@ -323,16 +330,6 @@ async fn shutdown() {
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
     info!("shutdown requested");
-}
-
-fn backend() -> &'static str {
-    if cfg!(feature = "cuda") {
-        "cuda"
-    } else if cfg!(feature = "metal") {
-        "metal"
-    } else {
-        "cpu"
-    }
 }
 
 #[cfg(test)]

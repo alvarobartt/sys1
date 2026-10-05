@@ -9,6 +9,7 @@ use std::{fs, path::Path};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
+    pub dtype: Option<String>,
     pub text_config: TextConfig,
     pub vision_config: VisionConfig,
     pub image_token_id: u32,
@@ -17,6 +18,7 @@ pub struct Config {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct TextConfig {
+    pub dtype: Option<String>,
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -43,6 +45,7 @@ pub struct RopeConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct VisionConfig {
+    pub dtype: Option<String>,
     pub depth: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,

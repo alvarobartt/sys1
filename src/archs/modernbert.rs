@@ -44,14 +44,6 @@ impl Config {
     pub fn max_position_embeddings(&self) -> usize {
         self.max_position_embeddings
     }
-
-    fn global_rope_theta(&self) -> f64 {
-        self.rope_parameters["full_attention"].rope_theta
-    }
-
-    fn local_rope_theta(&self) -> f64 {
-        self.rope_parameters["sliding_attention"].rope_theta
-    }
 }
 
 struct RotaryEmbedding {
@@ -534,13 +526,13 @@ impl Encoder {
         let global_rotary = Arc::new(RotaryEmbedding::new(
             vb.dtype(),
             config,
-            config.global_rope_theta(),
+            config.rope_parameters["full_attention"].rope_theta,
             vb.device(),
         )?);
         let local_rotary = Arc::new(RotaryEmbedding::new(
             vb.dtype(),
             config,
-            config.local_rope_theta(),
+            config.rope_parameters["sliding_attention"].rope_theta,
             vb.device(),
         )?);
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
