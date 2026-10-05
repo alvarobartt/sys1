@@ -292,7 +292,7 @@ impl Batcher {
 }
 
 fn matches_model(requested: Option<&str>, served: &str) -> bool {
-    requested.is_none_or(|model| model.is_empty() || model == served)
+    requested.is_none_or(|model| model.is_empty() || model == served || model == "jev-latest")
 }
 
 #[cfg(test)]
@@ -447,6 +447,7 @@ mod tests {
         assert!(matches_model(None, served));
         assert!(matches_model(Some(""), served));
         assert!(matches_model(Some(served), served));
+        assert!(matches_model(Some("jev-latest"), served));
         assert!(!matches_model(Some("other/model"), served));
     }
 

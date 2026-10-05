@@ -27,8 +27,8 @@ use utoipa_swagger_ui::SwaggerUi;
     paths(health, metrics, models, decide, systemone),
     components(schemas(
         HealthResponse,
-        ModelsResponse,
-        Model,
+        ModelMetadataList,
+        ModelMetadata,
         DecisionRequest,
         crate::schema::DecisionResponse,
         crate::schema::Usage,
@@ -44,15 +44,15 @@ struct HealthResponse {
 }
 
 #[derive(Serialize, ToSchema)]
-struct ModelsResponse {
-    data: Vec<Model>,
+struct ModelMetadataList {
+    models: Vec<ModelMetadata>,
 }
 
 #[derive(Serialize, ToSchema)]
-struct Model {
-    id: String,
-    object: &'static str,
-    owned_by: &'static str,
+struct ModelMetadata {
+    name: String,
+    description: &'static str,
+    release_date: &'static str,
 }
 
 pub fn router(batcher: Batcher, max_request_bytes: usize) -> Router {
@@ -139,16 +139,23 @@ async fn metrics(State(batcher): State<Batcher>) -> Result<Response, StatusCode>
     get,
     path = "/v1/models",
     tag = "sys1",
-    responses((status = OK, description = "Available models", body = ModelsResponse))
+    responses((status = OK, description = "Available models and aliases", body = ModelMetadataList))
 )]
-async fn models(State(batcher): State<Batcher>) -> Json<ModelsResponse> {
-    Json(ModelsResponse {
-        data: vec![Model {
-            id: batcher.served_model_name().to_owned(),
-            object: "model",
-            owned_by: "sys1",
-        }],
-    })
+async fn models(State(batcher): State<Batcher>) -> Json<ModelMetadataList> {
+    let served = batcher.served_model_name();
+    let mut models = vec![ModelMetadata {
+        name: served.to_owned(),
+        description: "Self-hosted Laya decision model served by sys1.",
+        release_date: "2026-09-18",
+    }];
+    if served != "jev-latest" {
+        models.push(ModelMetadata {
+            name: "jev-latest".to_owned(),
+            description: "TypeSafe SDK compatibility alias for the model served by this instance.",
+            release_date: "2026-09-18",
+        });
+    }
+    Json(ModelMetadataList { models })
 }
 
 /// Make a decision.
@@ -278,6 +285,43 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["content-type"], "application/json");
+    }
+
+    #[tokio::test]
+    async fn lists_sdk_compatible_models_and_accepts_default_alias() {
+        let app = test_router();
+        let response = app
+            .clone()
+            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+        let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let models = listing["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["name"], "test-model");
+        assert_eq!(models[1]["name"], "jev-latest");
+        for model in models {
+            assert!(model["description"].as_str().is_some_and(|s| !s.is_empty()));
+            assert_eq!(model["release_date"], "2026-09-18");
+        }
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/systemone")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"jev-latest","state":"test","questions":{"q0":{"type":"noul"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+        let decision: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decision["model"], "test-model");
     }
 
     #[tokio::test]
