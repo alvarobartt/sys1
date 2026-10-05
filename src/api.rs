@@ -1,17 +1,18 @@
 use crate::{
     batching::Batcher,
-    schema::{ApiError, DecisionRequest},
+    schema::{ApiError, DecisionRequest, HTTPValidationError, SystemOneRequest},
 };
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{DefaultBodyLimit, Request, State, rejection::JsonRejection},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::Serialize;
+use serde_json::Value;
 use std::time::Instant;
 use tracing::Instrument;
 use utoipa::{OpenApi, ToSchema};
@@ -30,8 +31,11 @@ use utoipa_swagger_ui::SwaggerUi;
         ModelMetadataList,
         ModelMetadata,
         DecisionRequest,
+        crate::schema::SystemOneRequest,
         crate::schema::DecisionResponse,
         crate::schema::Usage,
+        crate::schema::ValidationError,
+        HTTPValidationError,
         ApiError
     )),
     tags((name = "sys1", description = "System One decision API"))
@@ -181,17 +185,40 @@ async fn decide(
     post,
     path = "/v1/systemone",
     tag = "sys1",
-    request_body = DecisionRequest,
+    request_body = crate::schema::SystemOneRequest,
     responses(
         (status = OK, description = "Decision generated", body = crate::schema::DecisionResponse),
-        (status = BAD_REQUEST, description = "Invalid request", body = ApiError)
+        (status = UNPROCESSABLE_ENTITY, description = "Validation error", body = HTTPValidationError)
     )
 )]
 async fn systemone(
     State(batcher): State<Batcher>,
-    Json(request): Json<DecisionRequest>,
-) -> Result<Json<crate::schema::DecisionResponse>, ApiError> {
-    batcher.predict(request).await.map(Json)
+    payload: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<crate::schema::DecisionResponse>, Response> {
+    let Json(value) = payload.map_err(|error| {
+        validation_response(HTTPValidationError::single(
+            vec!["body".into()],
+            error.body_text(),
+            "json_invalid",
+        ))
+    })?;
+    let request = SystemOneRequest::try_from(value).map_err(validation_response)?;
+    let request = DecisionRequest::from(request);
+    batcher.predict(request).await.map(Json).map_err(|error| {
+        if error.status() == StatusCode::BAD_REQUEST.as_u16() {
+            validation_response(HTTPValidationError::single(
+                vec!["body".into()],
+                error.error,
+                "value_error",
+            ))
+        } else {
+            error.into_response()
+        }
+    })
+}
+
+fn validation_response(error: HTTPValidationError) -> Response {
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(error)).into_response()
 }
 
 impl IntoResponse for ApiError {
@@ -322,6 +349,46 @@ mod tests {
         let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
         let decision: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(decision["model"], "test-model");
+    }
+
+    #[tokio::test]
+    async fn systemone_rejects_invalid_requests_with_typesafe_validation_shape() {
+        let app = test_router();
+        for (body, location, kind) in [
+            (
+                r#"{"state":"test","questions":{"q":{"type":"noul"}}}"#,
+                "model",
+                "missing",
+            ),
+            (
+                r#"{"model":"test-model","state":"test","questions":{"q":{"type":"score"}}}"#,
+                "criteria",
+                "missing",
+            ),
+            (
+                r#"{"model":"test-model","state":"test","questions":{"q":{"type":"other"}}}"#,
+                "type",
+                "value_error",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/v1/systemone")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let bytes = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let issue = &body["detail"][0];
+            assert_eq!(issue["loc"].as_array().unwrap().last().unwrap(), location);
+            assert_eq!(issue["type"], kind);
+            assert!(issue["msg"].as_str().is_some_and(|value| !value.is_empty()));
+        }
     }
 
     #[tokio::test]
