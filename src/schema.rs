@@ -122,32 +122,30 @@ impl TryFrom<Value> for SystemOneRequest {
                     "Input should be 'noul', 'choice', or 'score'",
                 ));
             }
-            if let Some(instructions) = object.get("instructions") {
-                if !content(instructions, true) {
-                    return Err(invalid(
-                        [path.clone(), vec!["instructions".into()]].concat(),
-                        "Input should be a string, object, array, or null",
-                    ));
-                }
+            if let Some(instructions) = object.get("instructions")
+                && !content(instructions, true)
+            {
+                return Err(invalid(
+                    [path.clone(), vec!["instructions".into()]].concat(),
+                    "Input should be a string, object, array, or null",
+                ));
             }
             let criteria = object.get("criteria");
             let criteria_path = [path, vec!["criteria".into()]].concat();
             match kind {
                 "noul" => {
-                    if let Some(criteria) = criteria {
-                        if !criteria.is_null() {
-                            let object = criteria.as_object().ok_or_else(|| {
-                                invalid(criteria_path.clone(), "Input should be an object or null")
-                            })?;
-                            for (name, value) in object {
-                                if matches!(name.as_str(), "true" | "false")
-                                    && !content(value, true)
-                                {
-                                    return Err(invalid(
-                                        [criteria_path.clone(), vec![name.clone()]].concat(),
-                                        "Input should be a string, object, array, or null",
-                                    ));
-                                }
+                    if let Some(criteria) = criteria
+                        && !criteria.is_null()
+                    {
+                        let object = criteria.as_object().ok_or_else(|| {
+                            invalid(criteria_path.clone(), "Input should be an object or null")
+                        })?;
+                        for (name, value) in object {
+                            if matches!(name.as_str(), "true" | "false") && !content(value, true) {
+                                return Err(invalid(
+                                    [criteria_path.clone(), vec![name.clone()]].concat(),
+                                    "Input should be a string, object, array, or null",
+                                ));
                             }
                         }
                     }

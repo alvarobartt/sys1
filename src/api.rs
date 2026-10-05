@@ -196,15 +196,21 @@ async fn systemone(
     State(batcher): State<Batcher>,
     headers: HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
-) -> Result<Json<crate::schema::DecisionResponse>, Response> {
-    let Json(value) = payload.map_err(|error| {
-        validation_response(HTTPValidationError::single(
-            vec!["body".into()],
-            error.body_text(),
-            "json_invalid",
-        ))
-    })?;
-    let request = SystemOneRequest::try_from(value).map_err(validation_response)?;
+) -> Response {
+    let Json(value) = match payload {
+        Ok(value) => value,
+        Err(error) => {
+            return validation_response(HTTPValidationError::single(
+                vec!["body".into()],
+                error.body_text(),
+                "json_invalid",
+            ));
+        }
+    };
+    let request = match SystemOneRequest::try_from(value) {
+        Ok(request) => request,
+        Err(error) => return validation_response(error),
+    };
     let request = DecisionRequest::from(request);
     if sdk_uses_default_alias(
         &headers,
@@ -217,22 +223,19 @@ async fn systemone(
             "TypeSafe SDK used its default model alias; routing to the served model"
         );
     }
-    batcher
-        .predict(request)
-        .await
-        .map(typesafe_schema_response)
-        .map(Json)
-        .map_err(|error| {
-            if error.status() == StatusCode::BAD_REQUEST.as_u16() && !error.is_unknown_model() {
-                validation_response(HTTPValidationError::single(
-                    vec!["body".into()],
-                    error.error,
-                    "value_error",
-                ))
-            } else {
-                error.into_response()
-            }
-        })
+    match batcher.predict(request).await {
+        Ok(response) => Json(typesafe_schema_response(response)).into_response(),
+        Err(error)
+            if error.status() == StatusCode::BAD_REQUEST.as_u16() && !error.is_unknown_model() =>
+        {
+            validation_response(HTTPValidationError::single(
+                vec!["body".into()],
+                error.error,
+                "value_error",
+            ))
+        }
+        Err(error) => error.into_response(),
+    }
 }
 
 fn typesafe_schema_response(mut response: DecisionResponse) -> DecisionResponse {
