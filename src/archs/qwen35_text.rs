@@ -487,7 +487,7 @@ fn chunked_delta_rule(
         let ki = k.narrow(2, start, count)?;
         let vi = v.narrow(2, start, count)?;
         let bi = beta.narrow(2, start, count)?.unsqueeze(3)?;
-        let gi = g.narrow(2, start, count)?.cumsum(2)?;
+        let gi = g.narrow(2, start, count)?.contiguous()?.cumsum(2)?;
         let lower = Tensor::tril2(count, DType::F32, q.device())?;
         let identity = Tensor::eye(count, DType::F32, q.device())?;
         let strictly_lower = (&lower - &identity)?;
@@ -698,6 +698,30 @@ mod tests {
     #[test]
     fn chunked_delta_rule_stays_finite_with_large_negative_gates() {
         let device = candle_core::Device::Cpu;
+        let q = Tensor::ones((1, 1, 64, 4), DType::F32, &device).unwrap();
+        let k = Tensor::ones((1, 1, 64, 4), DType::F32, &device).unwrap();
+        let v = Tensor::ones((1, 1, 64, 3), DType::F32, &device).unwrap();
+        let g = Tensor::new(-8f32, &device)
+            .unwrap()
+            .broadcast_as((1, 1, 64))
+            .unwrap();
+        let beta = Tensor::new(0.5f32, &device)
+            .unwrap()
+            .broadcast_as((1, 1, 64))
+            .unwrap();
+        let output = chunked_delta_rule(&q, &k, &v, &g, &beta)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(output.iter().all(|value| value.is_finite()));
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn chunked_delta_rule_runs_with_broadcast_gates_on_metal() {
+        let device = candle_core::Device::new_metal(0).unwrap();
         let q = Tensor::ones((1, 1, 64, 4), DType::F32, &device).unwrap();
         let k = Tensor::ones((1, 1, 64, 4), DType::F32, &device).unwrap();
         let v = Tensor::ones((1, 1, 64, 3), DType::F32, &device).unwrap();
