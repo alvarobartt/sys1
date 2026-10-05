@@ -14,7 +14,6 @@ pub struct DecisionRequest {
 #[derive(ToSchema)]
 pub struct SystemOneRequest {
     pub model: Option<String>,
-    #[schema(value_type = Object)]
     pub state: Value,
     #[schema(value_type = Object)]
     pub questions: Map<String, Value>,

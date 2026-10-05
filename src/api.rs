@@ -367,6 +367,10 @@ mod tests {
         ] {
             assert!(paths.contains_key(path), "missing OpenAPI path {path}");
         }
+
+        let state = &json["components"]["schemas"]["SystemOneRequest"]["properties"]["state"];
+        assert!(state.is_object());
+        assert!(state.get("type").is_none());
     }
 
     #[tokio::test]
