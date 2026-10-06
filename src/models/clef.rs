@@ -24,7 +24,7 @@ fn cuda_capability(_device: &Device) -> anyhow::Result<Option<(i32, i32)>> {
             cuda.cuda_stream()
                 .context()
                 .compute_capability()
-                .context("failed to query CUDA compute capability")?,
+                .context("Failed to query CUDA compute capability")?,
         ));
     }
     Ok(None)
@@ -67,13 +67,13 @@ fn validate_flash_device(
     };
     anyhow::ensure!(
         capability.is_some(),
-        "{} requires a CUDA device",
+        "Attention {} requires a CUDA device",
         attention.cli_name()
     );
     let (major, minor) = capability.unwrap();
     anyhow::ensure!(
         supported,
-        "{} does not support CUDA compute capability {major}.{minor}",
+        "Attention {} does not support CUDA compute capability {major}.{minor}",
         attention.cli_name()
     );
     Ok(())
@@ -100,7 +100,7 @@ fn validate_declared_dtypes(
             "float32" | "f32" => Ok(DType::F32),
             "float16" | "f16" => Ok(DType::F16),
             "bfloat16" | "bf16" => Ok(DType::BF16),
-            _ => anyhow::bail!("unsupported Clef checkpoint dtype {value:?} in config.json"),
+            _ => anyhow::bail!("Unsupported Clef checkpoint dtype {value:?} in config.json"),
         }
     }
 
@@ -116,7 +116,7 @@ fn validate_declared_dtypes(
     }
     anyhow::ensure!(
         requested != DType::F16 || source == DType::F16,
-        "unsafe Clef dtype conversion from {declared} to f16: FP16 has a narrower exponent range; use --dtype bf16 or --dtype f32"
+        "Unsafe Clef dtype conversion from {declared} to f16: FP16 has a narrower exponent range; use --dtype bf16 or --dtype f32"
     );
     tracing::info!(checkpoint_dtype = declared, inference_dtype = ?requested, "Clef dtype validated");
     Ok(())
@@ -179,7 +179,7 @@ impl Clef {
         let max_length = max_model_len.unwrap_or(16384);
         anyhow::ensure!(
             max_length > 0 && max_length <= 262144,
-            "invalid Qwen3.5 model length"
+            "Invalid Qwen3.5 model length"
         );
         let tokenizer = tokenizer::from_qwen_json(&fs::read(path.join("tokenizer.json"))?)
             .context("Qwen tokenizer")?;
@@ -195,7 +195,7 @@ impl Clef {
             })
             .collect();
         shards.sort();
-        anyhow::ensure!(!shards.is_empty(), "no Qwen3.5 model safetensors found");
+        anyhow::ensure!(!shards.is_empty(), "No Qwen3.5 model safetensors found");
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&shards, dtype, &device)? };
         let decoder = text::Decoder::load(
             &config.text_config,
@@ -795,7 +795,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_clef_flash_release_matches_loader_contract() -> anyhow::Result<()> {
+    #[ignore = "Skip tests for `Cloudflare/clef-flash` by default"]
+    async fn clef_flash_release_matches_loader_contract() -> anyhow::Result<()> {
         let path = clef_flash_snapshot(false).await?;
         assert_eq!(
             crate::models::Architecture::from_path(&path)?,
@@ -835,7 +836,7 @@ mod tests {
             let error =
                 validate_declared_dtypes(Some(source), Some(source), Some(source), DType::F16)
                     .unwrap_err();
-            assert!(error.to_string().contains("unsafe Clef dtype conversion"));
+            assert!(error.to_string().contains("Unsafe Clef dtype conversion"));
         }
         for requested in [DType::BF16, DType::F32] {
             validate_declared_dtypes(
@@ -903,7 +904,8 @@ mod tests {
     }
 
     #[test]
-    fn public_clef_flash_answers_image_and_video_requests() {
+    #[ignore = "Skip tests for `Cloudflare/clef-flash` by default"]
+    fn clef_flash_answers_image_and_video_requests() {
         let path = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(clef_flash_snapshot(true))
@@ -1450,7 +1452,10 @@ mod clef_head {
                     false,
                 )?,
                 #[allow(unreachable_patterns)]
-                other => candle_core::bail!("{} support is not compiled in", other.cli_name()),
+                other => candle_core::bail!(
+                    "Support for attention {} is not compiled in",
+                    other.cli_name()
+                ),
             };
             attended
                 .reshape((batch, q_len, self.width))?

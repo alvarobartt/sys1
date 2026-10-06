@@ -484,6 +484,9 @@ fn chunked_delta_rule(
     let value_dim = v.dim(D::Minus1)?;
     let mut state = Tensor::zeros((batch, heads, key_dim, value_dim), DType::F32, q.device())?;
     let mut outputs = Vec::with_capacity(length.div_ceil(32));
+    let full_lower = Tensor::tril2(32, DType::F32, q.device())?;
+    let full_identity = Tensor::eye(32, DType::F32, q.device())?;
+    let full_strictly_lower = (&full_lower - &full_identity)?;
     for start in (0..length).step_by(32) {
         let count = (length - start).min(32);
         let qi = q.narrow(2, start, count)?;
@@ -491,9 +494,18 @@ fn chunked_delta_rule(
         let vi = v.narrow(2, start, count)?;
         let bi = beta.narrow(2, start, count)?.unsqueeze(3)?;
         let gi = g.narrow(2, start, count)?.contiguous()?.cumsum(2)?;
-        let lower = Tensor::tril2(count, DType::F32, q.device())?;
-        let identity = Tensor::eye(count, DType::F32, q.device())?;
-        let strictly_lower = (&lower - &identity)?;
+        let (lower, identity, strictly_lower) = if count == 32 {
+            (
+                full_lower.clone(),
+                full_identity.clone(),
+                full_strictly_lower.clone(),
+            )
+        } else {
+            let lower = Tensor::tril2(count, DType::F32, q.device())?;
+            let identity = Tensor::eye(count, DType::F32, q.device())?;
+            let strictly_lower = (&lower - &identity)?;
+            (lower, identity, strictly_lower)
+        };
         let decay = gi
             .unsqueeze(3)?
             .broadcast_sub(&gi.unsqueeze(2)?)?
@@ -502,6 +514,7 @@ fn chunked_delta_rule(
             .broadcast_mul(&lower)?;
         let key_beta = ki.broadcast_mul(&bi)?;
         let value_beta = vi.broadcast_mul(&bi)?;
+        let gi_exp = gi.exp()?;
         let l = contiguous_matmul(&key_beta, &ki.transpose(D::Minus2, D::Minus1)?)?
             .broadcast_mul(&decay)?
             .broadcast_mul(&strictly_lower)?
@@ -516,11 +529,11 @@ fn chunked_delta_rule(
         }
         let value = contiguous_matmul(&inverse, &value_beta)?;
         let key_cumdecay =
-            contiguous_matmul(&inverse, &key_beta.broadcast_mul(&gi.exp()?.unsqueeze(3)?)?)?;
+            contiguous_matmul(&inverse, &key_beta.broadcast_mul(&gi_exp.unsqueeze(3)?)?)?;
         let value_new = (&value - contiguous_matmul(&key_cumdecay, &state)?)?;
         let attn =
             contiguous_matmul(&qi, &ki.transpose(D::Minus2, D::Minus1)?)?.broadcast_mul(&decay)?;
-        let intermediate = contiguous_matmul(&qi.broadcast_mul(&gi.exp()?.unsqueeze(3)?)?, &state)?;
+        let intermediate = contiguous_matmul(&qi.broadcast_mul(&gi_exp.unsqueeze(3)?)?, &state)?;
         outputs.push((intermediate + contiguous_matmul(&attn, &value_new)?)?);
         let last = gi.narrow(2, count - 1, 1)?;
         let updated = contiguous_matmul(
