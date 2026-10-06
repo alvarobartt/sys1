@@ -7,6 +7,22 @@ use candle_nn::{
 use serde::Deserialize;
 use std::{fs, path::Path};
 
+#[cfg(feature = "cuda")]
+use candle_core::{
+    CudaStorage, Storage,
+    backend::BackendStorage,
+    cuda_backend::{
+        WrapErr,
+        cudarc::driver::{LaunchConfig, PushKernelArg},
+    },
+    op::BackpropOp,
+};
+#[cfg(feature = "cuda")]
+use half::bf16;
+
+#[cfg(feature = "cuda")]
+const CUDA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/qwen35.ptx"));
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     pub dtype: Option<String>,
@@ -404,7 +420,7 @@ impl LinearAttention {
         let projected = x.apply(&self.qkv)?;
         #[cfg(feature = "cuda")]
         let mixed = if x.device().is_cuda() && matches!(x.dtype(), DType::BF16 | DType::F32) {
-            super::qwen35_conv_cuda::forward(&projected, &self.conv)?
+            cuda_conv_silu(&projected, &self.conv)?
         } else {
             causal_conv_silu(&projected, &self.conv, self.kernel)?
         };
@@ -488,6 +504,144 @@ fn causal_conv_silu(projected: &Tensor, conv: &Tensor, kernel: usize) -> Result<
     mixed.silu()
 }
 
+#[cfg(feature = "cuda")]
+fn cuda_conv_silu(input: &Tensor, weights: &Tensor) -> Result<Tensor> {
+    let (batch, length, channels) = input.dims3()?;
+    let (weight_channels, groups, kernel) = weights.dims3()?;
+    if weight_channels != channels || groups != 1 || kernel == 0 || input.dtype() != weights.dtype()
+    {
+        candle_core::bail!("Unsupported Qwen3.5 CUDA convolution shape or dtype")
+    }
+    let input = input.contiguous()?;
+    let weights = weights.contiguous()?;
+    let (input_storage, input_layout) = input.storage_and_layout();
+    let (weight_storage, weight_layout) = weights.storage_and_layout();
+    let (Storage::Cuda(input_storage), Storage::Cuda(weight_storage)) =
+        (&*input_storage, &*weight_storage)
+    else {
+        candle_core::bail!("Qwen3.5 convolution requires CUDA storage")
+    };
+    let (input_start, input_end) = input_layout.contiguous_offsets().ok_or_else(|| {
+        candle_core::Error::Msg("Qwen3.5 convolution input is not contiguous".into())
+    })?;
+    let (weight_start, weight_end) = weight_layout.contiguous_offsets().ok_or_else(|| {
+        candle_core::Error::Msg("Qwen3.5 convolution weights are not contiguous".into())
+    })?;
+    let device = input_storage.device().clone();
+    let count = batch * length * channels;
+    let config = LaunchConfig {
+        grid_dim: (count.div_ceil(256) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let count_arg = count as i32;
+    let length_arg = length as i32;
+    let channels_arg = channels as i32;
+    let kernel_arg = kernel as i32;
+    let output = match input.dtype() {
+        DType::BF16 => {
+            let source = input_storage
+                .as_cuda_slice::<bf16>()?
+                .slice(input_start..input_end);
+            let filters = weight_storage
+                .as_cuda_slice::<bf16>()?
+                .slice(weight_start..weight_end);
+            let output = unsafe { device.alloc::<bf16>(count)? };
+            let function =
+                device.get_or_load_custom_func("qwen35_conv_bf16", "qwen35", CUDA_PTX)?;
+            let mut launch = function.builder();
+            launch.arg(&source);
+            launch.arg(&filters);
+            launch.arg(&output);
+            launch.arg(&count_arg);
+            launch.arg(&length_arg);
+            launch.arg(&channels_arg);
+            launch.arg(&kernel_arg);
+            unsafe { launch.launch(config) }.w()?;
+            Storage::Cuda(CudaStorage::wrap_cuda_slice(output, device))
+        }
+        DType::F32 => {
+            let source = input_storage
+                .as_cuda_slice::<f32>()?
+                .slice(input_start..input_end);
+            let filters = weight_storage
+                .as_cuda_slice::<f32>()?
+                .slice(weight_start..weight_end);
+            let output = unsafe { device.alloc::<f32>(count)? };
+            let function = device.get_or_load_custom_func("qwen35_conv_f32", "qwen35", CUDA_PTX)?;
+            let mut launch = function.builder();
+            launch.arg(&source);
+            launch.arg(&filters);
+            launch.arg(&output);
+            launch.arg(&count_arg);
+            launch.arg(&length_arg);
+            launch.arg(&channels_arg);
+            launch.arg(&kernel_arg);
+            unsafe { launch.launch(config) }.w()?;
+            Storage::Cuda(CudaStorage::wrap_cuda_slice(output, device))
+        }
+        dtype => candle_core::bail!("Unsupported Qwen3.5 CUDA convolution dtype: {dtype:?}"),
+    };
+    Ok(Tensor::from_storage(
+        output,
+        (batch, length, channels),
+        BackpropOp::none(),
+        false,
+    ))
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_delta_rule(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+) -> Result<Tensor> {
+    let (batch, heads, length, key_dim) = q.dims4()?;
+    let value_dim = v.dim(D::Minus1)?;
+    if key_dim != 128
+        || k.dims() != q.dims()
+        || v.dims() != [batch, heads, length, value_dim]
+        || g.dims() != [batch, heads, length]
+        || beta.dims() != [batch, heads, length]
+    {
+        candle_core::bail!("Unsupported Qwen3.5 CUDA delta-rule shape")
+    }
+    let input = Tensor::cat(&[q, k, v, &g.unsqueeze(3)?, &beta.unsqueeze(3)?], 3)?.contiguous()?;
+    let (storage, layout) = input.storage_and_layout();
+    let Storage::Cuda(storage) = &*storage else {
+        candle_core::bail!("Qwen3.5 delta rule requires CUDA storage")
+    };
+    let (start, end) = layout
+        .contiguous_offsets()
+        .ok_or_else(|| candle_core::Error::Msg("Qwen3.5 delta input is not contiguous".into()))?;
+    let source = storage.as_cuda_slice::<f32>()?.slice(start..end);
+    let device = storage.device().clone();
+    let output = unsafe { device.alloc::<f32>(batch * heads * length * value_dim)? };
+    let function = device.get_or_load_custom_func("qwen35_delta_f32", "qwen35_delta", CUDA_PTX)?;
+    let config = LaunchConfig {
+        grid_dim: ((batch * heads) as u32, value_dim.div_ceil(4) as u32, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut launch = function.builder();
+    launch.arg(&source);
+    launch.arg(&output);
+    let length = length as i32;
+    let value_dim = value_dim as i32;
+    launch.arg(&length);
+    launch.arg(&value_dim);
+    unsafe { launch.launch(config) }.w()?;
+    let output = Tensor::from_storage(
+        Storage::Cuda(CudaStorage::wrap_cuda_slice(output, device)),
+        (batch, heads, length as usize, value_dim as usize),
+        BackpropOp::none(),
+        false,
+    );
+    output.transpose(1, 2)
+}
+
 fn chunked_delta_rule(
     q: &Tensor,
     k: &Tensor,
@@ -499,7 +653,7 @@ fn chunked_delta_rule(
     let value_dim = v.dim(D::Minus1)?;
     #[cfg(feature = "cuda")]
     if q.device().is_cuda() && key_dim == 128 {
-        return super::qwen35_delta_cuda::forward(q, k, v, g, beta);
+        return cuda_delta_rule(q, k, v, g, beta);
     }
     let mut state = Tensor::zeros((batch, heads, key_dim, value_dim), DType::F32, q.device())?;
     let mut outputs = Vec::with_capacity(length.div_ceil(32));
@@ -713,7 +867,7 @@ mod tests {
                 .unwrap()
                 .to_vec1::<f32>()
                 .unwrap();
-            let actual = super::super::qwen35_conv_cuda::forward(
+            let actual = cuda_conv_silu(
                 &projected.to_device(&cuda).unwrap(),
                 &weights.to_device(&cuda).unwrap(),
             )
@@ -787,7 +941,7 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         let cuda = candle_core::Device::new_cuda(0).unwrap();
-        let actual = super::super::qwen35_delta_cuda::forward(
+        let actual = cuda_delta_rule(
             &q.to_device(&cuda).unwrap(),
             &k.to_device(&cuda).unwrap(),
             &v.to_device(&cuda).unwrap(),
