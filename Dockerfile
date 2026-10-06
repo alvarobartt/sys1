@@ -77,12 +77,14 @@ RUN --mount=type=cache,id=sys1-sccache,target=/root/.cache/sccache,sharing=locke
     cargo build --release --locked --no-default-features --features cpu --bin sys1; \
     sccache --show-stats
 
-FROM debian:bookworm-slim AS runtime
+FROM ubuntu:24.04 AS runtime
+
+ARG FFMPEG_VERSION=7:6.1.1-3ubuntu5
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates ffmpeg \
+        ca-certificates "ffmpeg=${FFMPEG_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --system --uid 10001 --create-home sys1

@@ -40,6 +40,8 @@ Then run it with any of the supported models (more coming soon!).
 - [`Cloudflare/clef`](https://huggingface.co/Cloudflare/clef) for text, image, and video decisions
 - [`Cloudflare/clef-flash`](https://huggingface.co/Cloudflare/clef-flash) for text, image, and video decisions (smaller and faster)
 
+The CPU and CUDA container images pin FFmpeg 6.1.1; Metal CI uses Homebrew's FFmpeg 6.1 series for video decoding.
+
 ```bash
 sys1 --model-id convaiinnovations/laya --dtype auto
 ```
