@@ -10,10 +10,11 @@ fn main() {
         let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("qwen35.ptx");
         let status = Command::new(nvcc)
             .args(["-ptx", "-arch=compute_75", "src/kernels/qwen35.cu", "-o"])
-            .arg(output)
+            .arg(&output)
             .status()
             .expect("Failed to run nvcc for Qwen3.5 CUDA kernels");
         assert!(status.success(), "Failed to compile Qwen3.5 CUDA kernels");
+        println!("cargo:rustc-env=SYS1_KERNEL_PTX_PATH={}", output.display());
     }
 
     let flash_attention_2 = env::var_os("CARGO_FEATURE_FLASH_ATTN_2").is_some();

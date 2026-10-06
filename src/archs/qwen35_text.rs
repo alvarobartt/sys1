@@ -21,7 +21,7 @@ use candle_core::{
 use half::bf16;
 
 #[cfg(feature = "cuda")]
-const CUDA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/qwen35.ptx"));
+const CUDA_PTX: &str = include_str!(env!("SYS1_KERNEL_PTX_PATH"));
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
