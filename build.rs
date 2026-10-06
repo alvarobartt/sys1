@@ -1,7 +1,20 @@
-use std::env;
+use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
+    if env::var_os("CARGO_FEATURE_CUDA").is_some() {
+        println!("cargo:rerun-if-changed=src/kernels/qwen35.cu");
+        let nvcc = env::var_os("CUDA_ROOT")
+            .map(|root| PathBuf::from(root).join("bin/nvcc"))
+            .unwrap_or_else(|| PathBuf::from("nvcc"));
+        let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("qwen35.ptx");
+        let status = Command::new(nvcc)
+            .args(["-ptx", "-arch=compute_75", "src/kernels/qwen35.cu", "-o"])
+            .arg(output)
+            .status()
+            .expect("Failed to run nvcc for Qwen3.5 CUDA kernels");
+        assert!(status.success(), "Failed to compile Qwen3.5 CUDA kernels");
+    }
 
     let flash_attention_2 = env::var_os("CARGO_FEATURE_FLASH_ATTN_2").is_some();
     let flash_attention_3 = env::var_os("CARGO_FEATURE_FLASH_ATTN_3").is_some();

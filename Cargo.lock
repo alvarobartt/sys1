@@ -4097,6 +4097,7 @@ dependencies = [
  "candle-flash-attn-v3",
  "candle-nn",
  "clap",
+ "half",
  "hf-hub",
  "insta",
  "prometheus",

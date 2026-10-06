@@ -402,19 +402,14 @@ impl LinearAttention {
         let key_width = self.key_heads * self.key_dim;
         let value_width = self.value_heads * self.value_dim;
         let projected = x.apply(&self.qkv)?;
-        let channels = key_width * 2 + value_width;
-        let padded = projected.pad_with_zeros(1, self.kernel - 1, 0)?;
-        let weights = self.conv.reshape((channels, self.kernel))?;
-        let mut mixed = Tensor::zeros((batch, length, channels), x.dtype(), x.device())?;
-        for tap in 0..self.kernel {
-            let source = padded.narrow(1, tap, length)?;
-            let weight = weights
-                .narrow(1, tap, 1)?
-                .squeeze(1)?
-                .reshape((1, 1, channels))?;
-            mixed = (mixed + source.broadcast_mul(&weight)?)?;
-        }
-        let mixed = mixed.silu()?;
+        #[cfg(feature = "cuda")]
+        let mixed = if x.device().is_cuda() && matches!(x.dtype(), DType::BF16 | DType::F32) {
+            super::qwen35_conv_cuda::forward(&projected, &self.conv)?
+        } else {
+            causal_conv_silu(&projected, &self.conv, self.kernel)?
+        };
+        #[cfg(not(feature = "cuda"))]
+        let mixed = causal_conv_silu(&projected, &self.conv, self.kernel)?;
         let q = mixed.narrow(D::Minus1, 0, key_width)?.reshape((
             batch,
             length,
@@ -473,6 +468,26 @@ impl LinearAttention {
     }
 }
 
+fn causal_conv_silu(projected: &Tensor, conv: &Tensor, kernel: usize) -> Result<Tensor> {
+    let (batch, length, channels) = projected.dims3()?;
+    let padded = projected.pad_with_zeros(1, kernel - 1, 0)?;
+    let weights = conv.reshape((channels, kernel))?;
+    let mut mixed = Tensor::zeros(
+        (batch, length, channels),
+        projected.dtype(),
+        projected.device(),
+    )?;
+    for tap in 0..kernel {
+        let source = padded.narrow(1, tap, length)?;
+        let weight = weights
+            .narrow(1, tap, 1)?
+            .squeeze(1)?
+            .reshape((1, 1, channels))?;
+        mixed = (mixed + source.broadcast_mul(&weight)?)?;
+    }
+    mixed.silu()
+}
+
 fn chunked_delta_rule(
     q: &Tensor,
     k: &Tensor,
@@ -482,6 +497,10 @@ fn chunked_delta_rule(
 ) -> Result<Tensor> {
     let (batch, heads, length, key_dim) = q.dims4()?;
     let value_dim = v.dim(D::Minus1)?;
+    #[cfg(feature = "cuda")]
+    if q.device().is_cuda() && key_dim == 128 {
+        return super::qwen35_delta_cuda::forward(q, k, v, g, beta);
+    }
     let mut state = Tensor::zeros((batch, heads, key_dim, value_dim), DType::F32, q.device())?;
     let mut outputs = Vec::with_capacity(length.div_ceil(32));
     let full_lower = Tensor::tril2(32, DType::F32, q.device())?;
@@ -660,6 +679,133 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn conv_cuda_matches_candle_across_batches_and_padding() {
+        let (batch, length, channels, kernel) = (2, 7, 31, 4);
+        let cpu = candle_core::Device::Cpu;
+        let projected = Tensor::from_vec(
+            (0..batch * length * channels)
+                .map(|index| ((index * 17 % 41) as f32 - 20.) * 0.04)
+                .collect::<Vec<_>>(),
+            (batch, length, channels),
+            &cpu,
+        )
+        .unwrap();
+        let weights = Tensor::from_vec(
+            (0..channels * kernel)
+                .map(|index| ((index * 11 % 23) as f32 - 11.) * 0.02)
+                .collect::<Vec<_>>(),
+            (channels, 1, kernel),
+            &cpu,
+        )
+        .unwrap();
+        let cuda = candle_core::Device::new_cuda(0).unwrap();
+        for dtype in [DType::BF16, DType::F32] {
+            let projected = projected.to_dtype(dtype).unwrap();
+            let weights = weights.to_dtype(dtype).unwrap();
+            let expected = causal_conv_silu(&projected, &weights, kernel)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let actual = super::super::qwen35_conv_cuda::forward(
+                &projected.to_device(&cuda).unwrap(),
+                &weights.to_device(&cuda).unwrap(),
+            )
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+            let max_error = expected
+                .iter()
+                .zip(actual)
+                .map(|(expected, actual)| (expected - actual).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max_error < 0.001,
+                "{dtype:?} convolution error: {max_error}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn delta_cuda_matches_chunked_reference() {
+        let batch = 2;
+        let heads = 2;
+        let length = 290;
+        let key_dim = 128;
+        let value_dim = 16;
+        let values = |width: usize, factor: f32| {
+            (0..batch * heads * length * width)
+                .map(|index| ((index * 13 % 29) as f32 - 14.) * factor)
+                .collect::<Vec<_>>()
+        };
+        let cpu = candle_core::Device::Cpu;
+        let q = Tensor::from_vec(
+            values(key_dim, 0.001),
+            (batch, heads, length, key_dim),
+            &cpu,
+        )
+        .unwrap();
+        let k = Tensor::from_vec(
+            values(key_dim, 0.006),
+            (batch, heads, length, key_dim),
+            &cpu,
+        )
+        .unwrap();
+        let v = Tensor::from_vec(
+            values(value_dim, 0.008),
+            (batch, heads, length, value_dim),
+            &cpu,
+        )
+        .unwrap();
+        let g = Tensor::from_vec(
+            vec![-0.002f32; batch * heads * length],
+            (batch, heads, length),
+            &cpu,
+        )
+        .unwrap();
+        let beta = Tensor::from_vec(
+            vec![0.5f32; batch * heads * length],
+            (batch, heads, length),
+            &cpu,
+        )
+        .unwrap();
+        let reference = chunked_delta_rule(&q, &k, &v, &g, &beta)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cuda = candle_core::Device::new_cuda(0).unwrap();
+        let actual = super::super::qwen35_delta_cuda::forward(
+            &q.to_device(&cuda).unwrap(),
+            &k.to_device(&cuda).unwrap(),
+            &v.to_device(&cuda).unwrap(),
+            &g.to_device(&cuda).unwrap(),
+            &beta.to_device(&cuda).unwrap(),
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+        let max_error = reference
+            .iter()
+            .zip(actual)
+            .map(|(expected, actual)| (expected - actual).abs())
+            .fold(0f32, f32::max);
+        assert!(max_error < 1e-4, "Max delta-rule error: {max_error}");
+    }
 
     #[test]
     fn chunked_delta_rule_matches_scalar_recurrence_across_chunk_boundary() {
