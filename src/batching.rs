@@ -7,7 +7,6 @@ use crate::{
 use serde_json::{Map, json};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error};
 
 struct Job {
     request: DecisionRequest,
@@ -109,7 +108,7 @@ impl Batcher {
                 let batch_guard = (metric_batch_size > 0).then(|| {
                     worker_metrics.batch_started(metric_batch_size, metric_question_count)
                 });
-                debug!(batch_size, question_count, "inference batch started");
+                tracing::debug!(batch_size, question_count, "Inference batch started");
                 let (requests, deliveries): (Vec<_>, Vec<_>) = jobs
                     .into_iter()
                     .map(|job| (job.request, (job.response, job.kind)))
@@ -118,7 +117,7 @@ impl Batcher {
                 let responses = tokio::task::spawn_blocking(move || model.predict_batch(requests))
                     .await
                     .unwrap_or_else(|error| {
-                        error!(%error, "inference worker failed");
+                        tracing::error!(%error, "Inference worker failed");
                         (0..batch_size)
                             .map(|_| Err(ApiError::internal(error.to_string())))
                             .collect()
@@ -135,11 +134,11 @@ impl Batcher {
                         .count();
                 worker_metrics.model_requests_failed(failures);
                 drop(batch_guard);
-                debug!(
+                tracing::debug!(
                     batch_size,
                     failures,
                     elapsed_ms = started.elapsed().as_millis(),
-                    "inference batch completed"
+                    "Inference batch completed"
                 );
                 let response_count = responses.len();
                 let mut responses = responses.into_iter();
@@ -152,9 +151,10 @@ impl Batcher {
                     let _ = channel.send(response);
                 }
                 if response_count != batch_size {
-                    error!(
+                    tracing::error!(
                         batch_size,
-                        response_count, "inference response count mismatch"
+                        response_count,
+                        "Inference response count mismatch"
                     );
                 }
             }

@@ -14,9 +14,18 @@ use axum::{
 use serde::Serialize;
 use serde_json::Value;
 use std::time::Instant;
-use tracing::Instrument;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
+
+pub const PUBLIC_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/health"),
+    ("GET", "/metrics"),
+    ("GET", "/v1/models"),
+    ("POST", "/v1/systemone"),
+    ("POST", "/v1/decide"),
+    ("GET", "/docs/"),
+    ("GET", "/openapi.json"),
+];
 
 #[derive(OpenApi)]
 #[openapi(
@@ -75,23 +84,18 @@ pub fn router(batcher: Batcher, max_request_bytes: usize) -> Router {
 async fn trace_request(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
-    let span = tracing::info_span!("request", %method, %path);
-    async move {
-        let started = Instant::now();
-        let response = next.run(request).await;
-        let status = response.status();
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        if status.is_server_error() {
-            tracing::error!(status = status.as_u16(), elapsed_ms, "request completed");
-        } else if status.is_client_error() {
-            tracing::warn!(status = status.as_u16(), elapsed_ms, "request completed");
-        } else {
-            tracing::debug!(status = status.as_u16(), elapsed_ms, "request completed");
-        }
-        response
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let status = response.status().as_u16();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if response.status().is_server_error() {
+        tracing::error!(%method, %path, status, elapsed_ms, "Request completed");
+    } else if response.status().is_client_error() {
+        tracing::warn!(%method, %path, status, elapsed_ms, "Request completed");
+    } else {
+        tracing::info!(%method, %path, status, elapsed_ms, "Request completed");
     }
-    .instrument(span)
-    .await
+    response
 }
 
 /// Check whether the service is running.
@@ -128,7 +132,7 @@ async fn health(State(batcher): State<Batcher>) -> (StatusCode, Json<HealthRespo
 )]
 async fn metrics(State(batcher): State<Batcher>) -> Result<Response, StatusCode> {
     let metrics = batcher.encode_metrics().map_err(|error| {
-        tracing::error!(%error, "failed to encode Prometheus metrics");
+        tracing::error!(%error, "Failed to encode Prometheus metrics");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     Ok((
@@ -361,14 +365,16 @@ mod tests {
         let json = serde_json::to_value(document).unwrap();
         let paths = json["paths"].as_object().unwrap();
 
-        for path in [
-            "/health",
-            "/metrics",
-            "/v1/models",
-            "/v1/decide",
-            "/v1/systemone",
-        ] {
-            assert!(paths.contains_key(path), "missing OpenAPI path {path}");
+        for &(method, path) in PUBLIC_ROUTES {
+            if matches!(path, "/docs/" | "/openapi.json") {
+                continue;
+            }
+            assert!(
+                paths[path]
+                    .get(method.to_ascii_lowercase().as_str())
+                    .is_some(),
+                "missing OpenAPI route [{method}] {path}"
+            );
         }
 
         let state = &json["components"]["schemas"]["SystemOneRequest"]["properties"]["state"];
