@@ -3,7 +3,8 @@ use hf_hub::{
     HFClient,
     progress::{DownloadEvent, FileStatus, ProgressEvent, ProgressHandler},
 };
-use std::{collections::HashMap, path::PathBuf, sync::Mutex};
+use indicatif::{ProgressBar, ProgressStyle};
+use std::{collections::HashMap, path::PathBuf, sync::Mutex, time::Duration};
 use tracing::info;
 
 const MODEL_FILES: &[&str] = &[
@@ -13,8 +14,11 @@ const MODEL_FILES: &[&str] = &[
     "tokenizer/tokenizer.json",
 ];
 
-#[derive(Default)]
-struct DownloadProgress(Mutex<DownloadState>);
+struct DownloadProgress {
+    bar: ProgressBar,
+    interactive: bool,
+    state: Mutex<DownloadState>,
+}
 
 #[derive(Default)]
 struct DownloadState {
@@ -22,8 +26,7 @@ struct DownloadState {
     total_bytes: u64,
     files: HashMap<String, (u64, bool)>,
     aggregate_bytes: u64,
-    last_percent: u64,
-    last_files: usize,
+    logged_quarter: u64,
     started: bool,
 }
 
@@ -32,9 +35,20 @@ impl ProgressHandler for DownloadProgress {
         let ProgressEvent::Download(event) = event else {
             return;
         };
-        let update = {
-            let mut state = self.0.lock().unwrap();
-            let first = match event {
+        let (
+            started,
+            complete,
+            downloaded,
+            total_bytes,
+            completed_files,
+            total_files,
+            percent,
+            log,
+        ) = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            let started = match event {
                 DownloadEvent::Start {
                     total_files,
                     total_bytes,
@@ -59,57 +73,67 @@ impl ProgressHandler for DownloadProgress {
                     false
                 }
                 DownloadEvent::Complete => false,
+                // Snapshot downloads also emit Start for individual files.
                 DownloadEvent::Start { .. } => return,
             };
+            let complete = matches!(event, DownloadEvent::Complete);
             let completed_files = state.files.values().filter(|(_, done)| *done).count();
             let file_bytes = state
                 .files
                 .values()
                 .fold(0u64, |sum, (bytes, _)| sum.saturating_add(*bytes));
+            // Xet batch totals and per-file updates overlap, so do not add them.
             let downloaded = file_bytes.max(state.aggregate_bytes).min(state.total_bytes);
-            let complete = matches!(event, DownloadEvent::Complete);
-            let percent = if complete {
-                100
-            } else if state.total_bytes > 0 {
-                ((downloaded as u128 * 100 / state.total_bytes as u128) as u64).min(99)
-            } else if state.total_files > 0 {
-                (completed_files as u64 * 100 / state.total_files as u64).min(99)
+            let percent = if state.total_bytes > 0 {
+                (downloaded as u128 * 100 / state.total_bytes as u128) as u64
             } else {
                 0
-            }
-            .max(state.last_percent);
-            if state.total_bytes == 0 && !complete {
-                None
-            } else if first
-                || complete
-                || percent / 5 > state.last_percent / 5
-                || completed_files > state.last_files
-            {
-                state.last_percent = percent;
-                state.last_files = completed_files;
-                Some((
-                    percent,
-                    downloaded,
-                    state.total_bytes,
-                    completed_files,
-                    state.total_files,
-                ))
-            } else {
-                None
-            }
-        };
-        if let Some((percent, downloaded, total_bytes, completed_files, total_files)) = update {
-            if total_bytes == 0 {
-                info!(files = completed_files, "model snapshot cached");
-                return;
-            }
-            let filled = (percent / 5) as usize;
-            let bar = format!("[{}{}]", "=".repeat(filled), " ".repeat(20 - filled));
-            info!(
-                progress = %bar,
+            };
+            let quarter = percent / 25;
+            let log = !self.interactive
+                && state.total_bytes > 0
+                && (started || (quarter > state.logged_quarter && !complete));
+            state.logged_quarter = state.logged_quarter.max(quarter);
+            (
+                started,
+                complete,
+                downloaded,
+                state.total_bytes,
+                completed_files,
+                state.total_files,
                 percent,
+                log,
+            )
+        };
+        if complete {
+            if total_bytes == 0 {
+                self.bar.finish_and_clear();
+                info!(files = completed_files, "model snapshot cached");
+            } else {
+                self.bar.set_position(total_bytes);
+            }
+            return;
+        }
+        if total_bytes == 0 {
+            return;
+        }
+        if started && self.interactive {
+            self.bar.set_length(total_bytes);
+            self.bar.set_style(
+                ProgressStyle::with_template(
+                    "{spinner:.cyan} {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({percent}%) {elapsed_precise}",
+                )
+                .expect("Valid model download progress template"),
+            );
+            self.bar.set_message("Downloading model");
+        }
+        if self.interactive {
+            self.bar.set_position(downloaded);
+        } else if log {
+            info!(
                 bytes = downloaded,
                 total_bytes,
+                percent,
                 files = completed_files,
                 total_files,
                 "model download progress"
@@ -126,14 +150,33 @@ pub async fn download(model_id: &str, revision: &str) -> anyhow::Result<PathBuf>
         bail!("model id must use the owner/name format")
     }
 
-    HFClient::new()
-        .context("failed to create Hugging Face client")?
+    let client = HFClient::new().context("failed to create Hugging Face client")?;
+    let bar = ProgressBar::new_spinner();
+    let interactive = !bar.is_hidden();
+    if interactive {
+        bar.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} Resolving model files {elapsed_precise}")
+                .expect("Valid model resolution progress template"),
+        );
+        bar.enable_steady_tick(Duration::from_millis(120));
+    }
+    let result = client
         .model(owner, name)
         .snapshot_download()
         .revision(revision)
         .allow_patterns(MODEL_FILES.iter().map(|path| (*path).to_owned()).collect())
-        .progress(DownloadProgress::default())
+        .progress(DownloadProgress {
+            bar: bar.clone(),
+            interactive,
+            state: Mutex::new(DownloadState::default()),
+        })
         .send()
-        .await
-        .with_context(|| format!("failed to download {model_id} at revision {revision}"))
+        .await;
+    if interactive && result.is_ok() && bar.length().is_some_and(|length| length > 0) {
+        bar.finish_with_message("Model downloaded");
+        eprintln!();
+    } else {
+        bar.finish_and_clear();
+    }
+    result.with_context(|| format!("failed to download {model_id} at revision {revision}"))
 }
