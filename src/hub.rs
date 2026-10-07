@@ -3,7 +3,9 @@ use hf_hub::{
     HFClient,
     progress::{DownloadEvent, FileStatus, ProgressEvent, ProgressHandler},
 };
-use indicatif::{HumanBytes, HumanDuration, MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{
+    HumanBytes, HumanDuration, MultiProgress, ProgressBar, ProgressState, ProgressStyle,
+};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -15,6 +17,35 @@ use tracing::info;
 // Xet reports reconstructed bytes in large batches, so a healthy slow transfer
 // can go several minutes without a new byte count.
 const STALL_TIMEOUT: Duration = Duration::from_secs(600);
+const BAR_WIDTH: usize = 20;
+
+fn arrow_bar(position: u64, total: u64) -> String {
+    if total > 0 && position >= total {
+        return "=".repeat(BAR_WIDTH);
+    }
+    let filled = if total == 0 {
+        0
+    } else {
+        ((position as u128 * BAR_WIDTH as u128 / total as u128) as usize).min(BAR_WIDTH - 1)
+    };
+    let filled = filled.max(1);
+    format!(
+        "{}>{}",
+        "=".repeat(filled),
+        " ".repeat(BAR_WIDTH - filled - 1)
+    )
+}
+
+fn arrow_style(template: &str) -> ProgressStyle {
+    ProgressStyle::with_template(template)
+        .expect("Valid model download progress template")
+        .with_key(
+            "arrow_bar",
+            |state: &ProgressState, out: &mut dyn std::fmt::Write| {
+                let _ = out.write_str(&arrow_bar(state.pos(), state.len().unwrap_or(0)));
+            },
+        )
+}
 
 fn rate_and_eta(bytes_per_sec: f64, remaining: u64) -> String {
     if bytes_per_sec <= 0.0 || !bytes_per_sec.is_finite() {
@@ -234,13 +265,9 @@ impl ProgressHandler for DownloadProgress {
         }
         if started && self.interactive {
             self.bar.set_length(total_bytes);
-            self.bar.set_style(
-                ProgressStyle::with_template(
-                    "{msg}\n[{bar:20}] {bytes}/{total_bytes} ({percent}%) {prefix}",
-                )
-                .expect("Valid model download progress template")
-                .progress_chars("#>-"),
-            );
+            self.bar.set_style(arrow_style(
+                "{msg}\n[{arrow_bar}] {bytes}/{total_bytes} ({percent}%) {prefix}",
+            ));
         }
         if self.interactive {
             let name = if active_count > 1 {
@@ -291,11 +318,7 @@ impl DownloadProgress {
         for (name, bytes, total) in active {
             let bar = bars.entry(name.clone()).or_insert_with(|| {
                 let bar = self.multi.add(ProgressBar::new(total));
-                bar.set_style(
-                    ProgressStyle::with_template("  {msg} [{bar:20}] {bytes}/{total_bytes}")
-                        .expect("Valid per-file download progress template")
-                        .progress_chars("#>-"),
-                );
+                bar.set_style(arrow_style("  {msg} [{arrow_bar}] {bytes}/{total_bytes}"));
                 bar.set_message(name);
                 bar
             });
@@ -376,6 +399,16 @@ pub async fn download(model_id: &str, revision: &str) -> anyhow::Result<PathBuf>
 mod tests {
     use super::*;
     use hf_hub::progress::FileProgress;
+
+    #[test]
+    fn arrow_bar_has_blank_remainder_and_visible_leading_edge() {
+        assert_eq!(arrow_bar(0, 100), format!("=>{}", " ".repeat(18)));
+        assert_eq!(
+            arrow_bar(50, 100),
+            format!("{}>{}", "=".repeat(10), " ".repeat(9))
+        );
+        assert_eq!(arrow_bar(100, 100), "=".repeat(20));
+    }
 
     #[test]
     fn progress_tracks_active_file_and_only_resets_idle_time_when_bytes_advance() {
