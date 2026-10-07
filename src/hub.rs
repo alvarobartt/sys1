@@ -232,7 +232,7 @@ pub async fn download_with_source(
     tracing::info!(
         token_found = token_available,
         workers = DOWNLOAD_WORKERS,
-        "fetching model files"
+        "Fetching model files"
     );
     let bar = ProgressBar::new(0);
     bar.set_style(

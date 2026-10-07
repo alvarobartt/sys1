@@ -195,57 +195,42 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     args.validate()?;
     sys1::validate_backend()?;
-    let startup_started = Instant::now();
     let dtype = args.dtype.resolve();
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        description = env!("CARGO_PKG_DESCRIPTION"),
         backend = backend(),
         ?args,
         ?dtype,
-        "sys1 starting"
+        "Starting sys1"
     );
     let address = SocketAddr::new(args.host, args.port);
-    let (model_path, source_name, architecture, download_ms, source) = match args.model_path {
+    let (model_path, source_name, architecture, source) = match args.model_path {
         Some(path) => {
             if args.served_model_name.is_none() {
-                warn!("--served-model-name is recommended when using --model-path");
+                warn!("Set --served-model-name when using --model-path");
             }
             let name = path.display().to_string();
             let architecture = models::Architecture::from_path(&path)?;
-            (path, name, architecture, None, "path")
+            (path, name, architecture, "path")
         }
         None => {
             let architecture = models::Architecture::from_model_id(&args.model_id)?;
             let started = Instant::now();
-            info!(model_id = %args.model_id, revision = %args.revision, "resolving model snapshot");
             let outcome = sys1::hub::download_with_source(&args.model_id, &args.revision).await?;
             // Includes Hub metadata resolution and cache checks as well as transfer time.
             let download_ms = started.elapsed().as_millis();
-            info!(
-                model_id = %args.model_id,
-                path = %outcome.path.display(),
-                source = outcome.source.as_str(),
-                download_ms,
-                "model snapshot ready"
-            );
+            info!(download_ms, "Model files ready");
             (
                 outcome.path,
                 args.model_id,
                 architecture,
-                Some(download_ms),
                 outcome.source.as_str(),
             )
         }
     };
     let served_model_name = args.served_model_name.unwrap_or(source_name);
     let started = Instant::now();
-    info!(
-        model = %served_model_name,
-        ?architecture,
-        path = %model_path.display(),
-        "loading model"
-    );
+    info!(source, ?architecture, "Loading model");
     let model = models::load(
         &model_path,
         architecture,
@@ -255,11 +240,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
     let model_load_ms = started.elapsed().as_millis();
-    info!(
-        model = %served_model_name,
-        model_load_ms,
-        "model loaded"
-    );
+    info!(model_load_ms, "Model loaded");
     let batcher = Batcher::new(
         Arc::new(model),
         served_model_name.clone(),
@@ -274,34 +255,22 @@ async fn main() -> anyhow::Result<()> {
         },
     );
     let started = Instant::now();
-    info!(model = %served_model_name, "model warmup started");
     batcher
         .warmup()
         .await
         .map_err(|error| anyhow::anyhow!(error.error))
         .context("model warmup failed")?;
     let warmup_ms = started.elapsed().as_millis();
-    info!(
-        model = %served_model_name,
-        warmup_ms,
-        "model warmup completed"
-    );
+    info!(warmup_ms, "Model warmup complete");
     let app = api::router(batcher, args.max_request_bytes);
     let listener = tokio::net::TcpListener::bind(address).await?;
-    info!(
-        %address,
-        model = %served_model_name,
-        source,
-        download_ms = download_ms.unwrap_or(0),
-        model_load_ms,
-        warmup_ms,
-        startup_ms = startup_started.elapsed().as_millis(),
-        "sys1 ready"
-    );
+    let address = listener.local_addr()?;
+    info!("Available routes:\n  {}", api::PUBLIC_ROUTES.join("\n  "));
+    info!(%address, "Server running");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await?;
-    info!("sys1 stopped");
+    info!("Server stopped");
     Ok(())
 }
 
@@ -314,13 +283,13 @@ async fn shutdown() {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
     }
-    info!("shutdown requested");
+    info!("Shutdown requested");
 }
 
 #[cfg(not(unix))]
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
-    info!("shutdown requested");
+    info!("Shutdown requested");
 }
 
 fn backend() -> &'static str {
