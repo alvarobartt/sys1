@@ -209,18 +209,17 @@ impl ProgressHandler for DownloadProgress {
                         .values()
                         .filter(|file| !file.complete && file.bar.is_some())
                         .count();
-                    if active_count == 1 {
-                        if let Some(file) = state
+                    if active_count == 1
+                        && let Some(file) = state
                             .files
                             .values_mut()
                             .find(|file| !file.complete && file.bar.is_some())
-                        {
-                            if file.total == *total_bytes && *bytes_completed > file.bytes {
-                                file.bytes = *bytes_completed;
-                                if let Some(bar) = &file.bar {
-                                    bar.set_position(file.bytes.min(file.total));
-                                }
-                            }
+                        && file.total == *total_bytes
+                        && *bytes_completed > file.bytes
+                    {
+                        file.bytes = *bytes_completed;
+                        if let Some(bar) = &file.bar {
+                            bar.set_position(file.bytes.min(file.total));
                         }
                     }
                 }
@@ -329,11 +328,10 @@ pub async fn download_with_source(
             _ = check.tick() => {
                 if let Ok(state) = state.lock() {
                     for file in state.files.values() {
-                        if !file.complete {
-                            if let Some(bar) = &file.bar {
+                        if !file.complete
+                            && let Some(bar) = &file.bar {
                                 bar.tick();
                             }
-                        }
                     }
                     if let Some(overall) = &state.overall {
                         overall.tick();
