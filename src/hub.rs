@@ -66,6 +66,26 @@ const MODEL_FILES: &[&str] = &[
     "tokenizer/tokenizer.json",
 ];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownloadSource {
+    Cache,
+    HuggingFace,
+}
+
+impl DownloadSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cache => "cache",
+            Self::HuggingFace => "huggingface",
+        }
+    }
+}
+
+pub struct DownloadOutcome {
+    pub path: PathBuf,
+    pub source: DownloadSource,
+}
+
 struct DownloadProgress {
     multi: MultiProgress,
     bar: ProgressBar,
@@ -87,6 +107,7 @@ struct DownloadState {
     last_rate_sample: Instant,
     last_rate_bytes: u64,
     bytes_per_sec: f64,
+    transfer_started: bool,
 }
 
 impl Default for DownloadState {
@@ -104,6 +125,17 @@ impl Default for DownloadState {
             last_rate_sample: Instant::now(),
             last_rate_bytes: 0,
             bytes_per_sec: 0.0,
+            transfer_started: false,
+        }
+    }
+}
+
+impl DownloadState {
+    fn source(&self) -> DownloadSource {
+        if self.transfer_started {
+            DownloadSource::HuggingFace
+        } else {
+            DownloadSource::Cache
         }
     }
 }
@@ -144,6 +176,9 @@ impl ProgressHandler for DownloadProgress {
                 }
                 DownloadEvent::Progress { files } => {
                     for file in files {
+                        if file.status != FileStatus::Complete {
+                            state.transfer_started = true;
+                        }
                         let entry = state.files.entry(file.filename.clone()).or_default();
                         let changed = file.bytes_completed > entry.0
                             || (file.status == FileStatus::Complete && !entry.2);
@@ -164,6 +199,9 @@ impl ProgressHandler for DownloadProgress {
                     bytes_per_sec,
                     ..
                 } => {
+                    if *bytes_completed > 0 {
+                        state.transfer_started = true;
+                    }
                     if *bytes_completed > state.aggregate_bytes {
                         state.last_change = Instant::now();
                     }
@@ -331,6 +369,13 @@ impl DownloadProgress {
 }
 
 pub async fn download(model_id: &str, revision: &str) -> anyhow::Result<PathBuf> {
+    Ok(download_with_source(model_id, revision).await?.path)
+}
+
+pub async fn download_with_source(
+    model_id: &str,
+    revision: &str,
+) -> anyhow::Result<DownloadOutcome> {
     let Some((owner, name)) = model_id.split_once('/') else {
         bail!("model id must use the owner/name format")
     };
@@ -392,7 +437,13 @@ pub async fn download(model_id: &str, revision: &str) -> anyhow::Result<PathBuf>
     } else {
         bar.finish_and_clear();
     }
-    result.with_context(|| format!("failed to download {model_id} at revision {revision}"))
+    let path =
+        result.with_context(|| format!("failed to download {model_id} at revision {revision}"))?;
+    let source = state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("model download progress state poisoned"))?
+        .source();
+    Ok(DownloadOutcome { path, source })
 }
 
 #[cfg(test)]
@@ -408,6 +459,41 @@ mod tests {
             format!("{}>{}", "=".repeat(10), " ".repeat(9))
         );
         assert_eq!(arrow_bar(100, 100), "=".repeat(20));
+    }
+
+    #[test]
+    fn source_distinguishes_cached_files_from_transfers() {
+        let state = Arc::new(Mutex::new(DownloadState::default()));
+        let handler = DownloadProgress {
+            multi: MultiProgress::new(),
+            bar: ProgressBar::hidden(),
+            interactive: false,
+            state: Arc::clone(&state),
+            file_bars: Arc::new(Mutex::new(HashMap::new())),
+        };
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Start {
+            total_files: 2,
+            total_bytes: 100,
+        }));
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: vec![FileProgress {
+                filename: "cached.bin".into(),
+                bytes_completed: 100,
+                total_bytes: 100,
+                status: FileStatus::Complete,
+            }],
+        }));
+        assert_eq!(state.lock().unwrap().source(), DownloadSource::Cache);
+
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: vec![FileProgress {
+                filename: "remote.bin".into(),
+                bytes_completed: 0,
+                total_bytes: 100,
+                status: FileStatus::Started,
+            }],
+        }));
+        assert_eq!(state.lock().unwrap().source(), DownloadSource::HuggingFace);
     }
 
     #[test]

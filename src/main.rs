@@ -206,29 +206,36 @@ async fn main() -> anyhow::Result<()> {
         "sys1 starting"
     );
     let address = SocketAddr::new(args.host, args.port);
-    let (model_path, source_name, architecture, download_ms) = match args.model_path {
+    let (model_path, source_name, architecture, download_ms, source) = match args.model_path {
         Some(path) => {
             if args.served_model_name.is_none() {
                 warn!("--served-model-name is recommended when using --model-path");
             }
             let name = path.display().to_string();
             let architecture = models::Architecture::from_path(&path)?;
-            (path, name, architecture, None)
+            (path, name, architecture, None, "path")
         }
         None => {
             let architecture = models::Architecture::from_model_id(&args.model_id)?;
             let started = Instant::now();
             info!(model_id = %args.model_id, revision = %args.revision, "resolving model snapshot");
-            let path = sys1::hub::download(&args.model_id, &args.revision).await?;
+            let outcome = sys1::hub::download_with_source(&args.model_id, &args.revision).await?;
             // Includes Hub metadata resolution and cache checks as well as transfer time.
             let download_ms = started.elapsed().as_millis();
             info!(
                 model_id = %args.model_id,
-                path = %path.display(),
+                path = %outcome.path.display(),
+                source = outcome.source.as_str(),
                 download_ms,
                 "model snapshot ready"
             );
-            (path, args.model_id, architecture, Some(download_ms))
+            (
+                outcome.path,
+                args.model_id,
+                architecture,
+                Some(download_ms),
+                outcome.source.as_str(),
+            )
         }
     };
     let served_model_name = args.served_model_name.unwrap_or(source_name);
@@ -284,7 +291,7 @@ async fn main() -> anyhow::Result<()> {
     info!(
         %address,
         model = %served_model_name,
-        source = if download_ms.is_some() { "hub" } else { "local" },
+        source,
         download_ms = download_ms.unwrap_or(0),
         model_load_ms,
         warmup_ms,
