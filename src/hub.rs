@@ -3,7 +3,7 @@ use hf_hub::{
     HFClient,
     progress::{DownloadEvent, FileStatus, ProgressEvent, ProgressHandler},
 };
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -42,7 +42,8 @@ pub struct DownloadOutcome {
 }
 
 struct DownloadProgress {
-    bar: ProgressBar,
+    multi: MultiProgress,
+    summary: ProgressBar,
     state: Arc<Mutex<DownloadState>>,
 }
 
@@ -50,6 +51,7 @@ struct DownloadState {
     started: bool,
     total_files: usize,
     total_bytes: u64,
+    overall: Option<ProgressBar>,
     files: HashMap<String, FileState>,
     aggregate_bytes: u64,
     transfer_started: bool,
@@ -59,8 +61,9 @@ struct DownloadState {
 #[derive(Default)]
 struct FileState {
     bytes: u64,
+    total: u64,
     complete: bool,
-    active: bool,
+    bar: Option<ProgressBar>,
 }
 
 impl Default for DownloadState {
@@ -69,6 +72,7 @@ impl Default for DownloadState {
             started: false,
             total_files: 0,
             total_bytes: 0,
+            overall: None,
             files: HashMap::new(),
             aggregate_bytes: 0,
             transfer_started: false,
@@ -86,37 +90,29 @@ impl DownloadState {
         }
     }
 
+    fn completed_files(&self) -> usize {
+        self.files.values().filter(|file| file.complete).count()
+    }
+
     fn downloaded(&self) -> u64 {
         let file_bytes = self
             .files
             .values()
             .fold(0u64, |sum, file| sum.saturating_add(file.bytes));
-        // Xet reports the same transfer through aggregate and per-file events.
+        // Xet's batch total overlaps with per-file updates.
         file_bytes.max(self.aggregate_bytes).min(self.total_bytes)
     }
+}
 
-    fn status(&self) -> String {
-        let completed = self.files.values().filter(|file| file.complete).count();
-        let mut active = self
-            .files
-            .iter()
-            .filter(|(_, file)| file.active && !file.complete)
-            .map(|(name, _)| name.as_str());
-        let file = active.next();
-        let active_count = usize::from(file.is_some()) + active.count();
-        let detail = match (file, active_count) {
-            (Some(name), 1) => format!("; {name}"),
-            (_, count) if count > 1 => format!("; {count} active"),
-            _ => String::new(),
-        };
-        let waiting =
-            if self.transfer_started && self.last_change.elapsed() >= Duration::from_secs(5) {
-                format!(" (idle {}s)", self.last_change.elapsed().as_secs())
-            } else {
-                String::new()
-            };
-        format!("{completed}/{} files{detail}{waiting}", self.total_files)
-    }
+fn file_style(known_total: bool) -> ProgressStyle {
+    let template = if known_total {
+        "Downloading {msg} [{wide_bar}] {bytes}/{total_bytes} {bytes_per_sec}"
+    } else {
+        "Downloading {msg} {bytes} {bytes_per_sec}"
+    };
+    ProgressStyle::with_template(template)
+        .expect("Valid file download template")
+        .progress_chars("=> ")
 }
 
 impl ProgressHandler for DownloadProgress {
@@ -127,6 +123,7 @@ impl ProgressHandler for DownloadProgress {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        let mut changed = false;
         match event {
             DownloadEvent::Start {
                 total_files,
@@ -136,14 +133,22 @@ impl ProgressHandler for DownloadProgress {
                 state.total_files = *total_files;
                 state.total_bytes = *total_bytes;
                 state.last_change = Instant::now();
-                if *total_bytes > 0 {
-                    self.bar.set_length(*total_bytes);
-                    self.bar.set_style(
-                        ProgressStyle::with_template("Downloading [{bar:20}] {percent}% {msg}")
-                            .expect("Valid download progress template")
-                            .progress_chars("=> "),
-                    );
-                }
+                let overall = self
+                    .multi
+                    .insert_before(&self.summary, ProgressBar::new(*total_bytes));
+                overall.set_style(
+                    ProgressStyle::with_template("All files [{wide_bar}] {bytes}/{total_bytes}")
+                        .expect("Valid overall download template")
+                        .progress_chars("=> "),
+                );
+                overall.tick();
+                state.overall = Some(overall);
+                self.summary.set_length(*total_files as u64);
+                self.summary.set_style(
+                    ProgressStyle::with_template("{pos} of {len} files downloaded")
+                        .expect("Valid download summary template"),
+                );
+                self.summary.tick();
             }
             DownloadEvent::Progress { files } => {
                 for file in files {
@@ -151,30 +156,83 @@ impl ProgressHandler for DownloadProgress {
                         state.transfer_started = true;
                     }
                     let entry = state.files.entry(file.filename.clone()).or_default();
-                    entry.active |= file.status != FileStatus::Complete;
-                    entry.complete |= file.status == FileStatus::Complete;
+                    if file.status != FileStatus::Complete && entry.bar.is_none() {
+                        let bar = self
+                            .multi
+                            .insert_before(&self.summary, ProgressBar::new(file.total_bytes));
+                        bar.set_style(file_style(file.total_bytes > 0));
+                        bar.set_message(file.filename.clone());
+                        entry.bar = Some(bar);
+                    }
+                    if file.total_bytes > entry.total {
+                        entry.total = file.total_bytes;
+                        if let Some(bar) = &entry.bar {
+                            bar.set_length(entry.total);
+                            bar.set_style(file_style(true));
+                        }
+                    }
                     if file.bytes_completed > entry.bytes {
                         entry.bytes = file.bytes_completed;
-                        state.last_change = Instant::now();
+                        changed = true;
+                    }
+                    if file.status == FileStatus::Complete && !entry.complete {
+                        entry.complete = true;
+                        changed = true;
+                    }
+                    if let Some(bar) = &entry.bar {
+                        bar.set_position(if entry.total > 0 {
+                            entry.bytes.min(entry.total)
+                        } else {
+                            entry.bytes
+                        });
+                        if entry.complete {
+                            bar.finish();
+                        }
                     }
                 }
             }
             DownloadEvent::AggregateProgress {
-                bytes_completed, ..
+                bytes_completed,
+                total_bytes,
+                ..
             } => {
                 if *bytes_completed > state.aggregate_bytes {
                     state.aggregate_bytes = *bytes_completed;
                     state.transfer_started = true;
-                    state.last_change = Instant::now();
+                    changed = true;
+                    let active_count = state
+                        .files
+                        .values()
+                        .filter(|file| !file.complete && file.bar.is_some())
+                        .count();
+                    if active_count == 1 {
+                        if let Some(file) = state
+                            .files
+                            .values_mut()
+                            .find(|file| !file.complete && file.bar.is_some())
+                        {
+                            if file.total == *total_bytes && *bytes_completed > file.bytes {
+                                file.bytes = *bytes_completed;
+                                if let Some(bar) = &file.bar {
+                                    bar.set_position(file.bytes.min(file.total));
+                                }
+                            }
+                        }
+                    }
                 }
             }
             DownloadEvent::Complete => return,
             // Snapshot downloads may also emit Start for individual files.
             DownloadEvent::Start { .. } => return,
         }
-        if state.total_bytes > 0 {
-            self.bar.set_message(state.status());
-            self.bar.set_position(state.downloaded());
+        if changed {
+            state.last_change = Instant::now();
+        }
+        if state.started {
+            if let Some(overall) = &state.overall {
+                overall.set_position(state.downloaded());
+            }
+            self.summary.set_position(state.completed_files() as u64);
         }
     }
 }
@@ -234,12 +292,13 @@ pub async fn download_with_source(
         workers = DOWNLOAD_WORKERS,
         "Fetching model files"
     );
-    let bar = ProgressBar::new(0);
-    bar.set_style(
+    let multi = MultiProgress::new();
+    let summary = multi.add(ProgressBar::new_spinner());
+    summary.set_style(
         ProgressStyle::with_template("Resolving model files...")
             .expect("Valid model resolution template"),
     );
-    bar.tick();
+    summary.tick();
     let state = Arc::new(Mutex::new(DownloadState::default()));
     let repository = client.model(owner, name);
     let download = repository
@@ -248,7 +307,8 @@ pub async fn download_with_source(
         .allow_patterns(MODEL_FILES.iter().map(|path| (*path).to_owned()).collect())
         .max_workers(DOWNLOAD_WORKERS)
         .progress(DownloadProgress {
-            bar: bar.clone(),
+            multi,
+            summary: summary.clone(),
             state: Arc::clone(&state),
         })
         .send();
@@ -259,10 +319,17 @@ pub async fn download_with_source(
             result = &mut download => break result.context("model download failed"),
             _ = check.tick() => {
                 if let Ok(state) = state.lock() {
-                    if state.started && state.total_bytes > 0 {
-                        bar.set_message(state.status());
-                        bar.tick();
+                    for file in state.files.values() {
+                        if !file.complete {
+                            if let Some(bar) = &file.bar {
+                                bar.tick();
+                            }
+                        }
                     }
+                    if let Some(overall) = &state.overall {
+                        overall.tick();
+                    }
+                    summary.tick();
                     if state.last_change.elapsed() >= STALL_TIMEOUT {
                         break Err(anyhow::anyhow!("model download made no progress for {} seconds; check the network connection and retry", STALL_TIMEOUT.as_secs()));
                     }
@@ -272,11 +339,30 @@ pub async fn download_with_source(
     };
     let path =
         result.with_context(|| format!("failed to download {model_id} at revision {revision}"));
-    if let (true, Some(total)) = (path.is_ok(), bar.length().filter(|length| *length > 0)) {
-        bar.set_position(total);
-        bar.finish();
-    } else {
-        bar.finish_and_clear();
+    if let Ok(state) = state.lock() {
+        for file in state.files.values() {
+            if let Some(bar) = &file.bar {
+                if path.is_ok() {
+                    bar.set_position(file.total.max(file.bytes));
+                    bar.finish();
+                } else {
+                    bar.finish_and_clear();
+                }
+            }
+        }
+        if path.is_ok() && state.transfer_started {
+            if let Some(overall) = &state.overall {
+                overall.set_position(state.total_bytes);
+                overall.finish();
+            }
+            summary.set_position(state.total_files as u64);
+            summary.finish();
+        } else {
+            if let Some(overall) = &state.overall {
+                overall.finish_and_clear();
+            }
+            summary.finish_and_clear();
+        }
     }
     let path = path?;
     let source = state
@@ -345,9 +431,12 @@ mod tests {
 
     fn handler() -> (DownloadProgress, Arc<Mutex<DownloadState>>) {
         let state = Arc::new(Mutex::new(DownloadState::default()));
+        let multi = MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+        let summary = multi.add(ProgressBar::new_spinner());
         (
             DownloadProgress {
-                bar: ProgressBar::hidden(),
+                multi,
+                summary,
                 state: Arc::clone(&state),
             },
             state,
@@ -359,7 +448,7 @@ mod tests {
         let (handler, state) = handler();
         handler.on_progress(&ProgressEvent::Download(DownloadEvent::Start {
             total_files: 2,
-            total_bytes: 100,
+            total_bytes: 200,
         }));
         handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
             files: vec![FileProgress {
@@ -370,6 +459,8 @@ mod tests {
             }],
         }));
         assert_eq!(state.lock().unwrap().source(), DownloadSource::Cache);
+        assert!(state.lock().unwrap().files["cached.bin"].bar.is_none());
+        assert_eq!(handler.summary.position(), 1);
         handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
             files: vec![FileProgress {
                 filename: "remote.bin".into(),
@@ -379,10 +470,27 @@ mod tests {
             }],
         }));
         assert_eq!(state.lock().unwrap().source(), DownloadSource::HuggingFace);
+        assert!(state.lock().unwrap().files["remote.bin"].bar.is_some());
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: vec![FileProgress {
+                filename: "remote.bin".into(),
+                bytes_completed: 100,
+                total_bytes: 100,
+                status: FileStatus::Complete,
+            }],
+        }));
+        assert_eq!(handler.summary.position(), 2);
+        assert!(
+            state.lock().unwrap().files["remote.bin"]
+                .bar
+                .as_ref()
+                .unwrap()
+                .is_finished()
+        );
     }
 
     #[test]
-    fn aggregate_progress_does_not_double_count_file_bytes() {
+    fn aggregate_progress_updates_a_single_matching_file() {
         let (handler, state) = handler();
         handler.on_progress(&ProgressEvent::Download(DownloadEvent::Start {
             total_files: 1,
@@ -402,7 +510,43 @@ mod tests {
             bytes_per_sec: None,
         }));
         let state = state.lock().unwrap();
-        assert_eq!(state.downloaded(), 50);
-        assert_eq!(state.status(), "0/1 files; model.safetensors");
+        assert_eq!(state.files["model.safetensors"].bytes, 50);
+        assert_eq!(
+            state.files["model.safetensors"]
+                .bar
+                .as_ref()
+                .unwrap()
+                .position(),
+            50
+        );
+        assert_eq!(state.overall.as_ref().unwrap().position(), 50);
+        assert_eq!(handler.summary.position(), 0);
+    }
+
+    #[test]
+    fn aggregate_progress_is_not_assigned_to_multiple_files() {
+        let (handler, state) = handler();
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Start {
+            total_files: 2,
+            total_bytes: 200,
+        }));
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: ["a.bin", "b.bin"]
+                .map(|filename| FileProgress {
+                    filename: filename.into(),
+                    bytes_completed: 10,
+                    total_bytes: 100,
+                    status: FileStatus::InProgress,
+                })
+                .to_vec(),
+        }));
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::AggregateProgress {
+            bytes_completed: 50,
+            total_bytes: 100,
+            bytes_per_sec: None,
+        }));
+        let state = state.lock().unwrap();
+        assert_eq!(state.files["a.bin"].bytes, 10);
+        assert_eq!(state.files["b.bin"].bytes, 10);
     }
 }
