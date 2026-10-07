@@ -195,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     args.validate()?;
     sys1::validate_backend()?;
+    let startup_started = Instant::now();
     let dtype = args.dtype.resolve();
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -205,27 +206,29 @@ async fn main() -> anyhow::Result<()> {
         "sys1 starting"
     );
     let address = SocketAddr::new(args.host, args.port);
-    let (model_path, source_name, architecture) = match args.model_path {
+    let (model_path, source_name, architecture, download_ms) = match args.model_path {
         Some(path) => {
             if args.served_model_name.is_none() {
                 warn!("--served-model-name is recommended when using --model-path");
             }
             let name = path.display().to_string();
             let architecture = models::Architecture::from_path(&path)?;
-            (path, name, architecture)
+            (path, name, architecture, None)
         }
         None => {
             let architecture = models::Architecture::from_model_id(&args.model_id)?;
             let started = Instant::now();
             info!(model_id = %args.model_id, revision = %args.revision, "resolving model snapshot");
             let path = sys1::hub::download(&args.model_id, &args.revision).await?;
+            // Includes Hub metadata resolution and cache checks as well as transfer time.
+            let download_ms = started.elapsed().as_millis();
             info!(
                 model_id = %args.model_id,
                 path = %path.display(),
-                elapsed_ms = started.elapsed().as_millis(),
+                download_ms,
                 "model snapshot ready"
             );
-            (path, args.model_id, architecture)
+            (path, args.model_id, architecture, Some(download_ms))
         }
     };
     let served_model_name = args.served_model_name.unwrap_or(source_name);
@@ -244,9 +247,10 @@ async fn main() -> anyhow::Result<()> {
         args.attention,
     )
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
+    let model_load_ms = started.elapsed().as_millis();
     info!(
         model = %served_model_name,
-        elapsed_ms = started.elapsed().as_millis(),
+        model_load_ms,
         "model loaded"
     );
     let batcher = Batcher::new(
@@ -269,14 +273,24 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!(error.error))
         .context("model warmup failed")?;
+    let warmup_ms = started.elapsed().as_millis();
     info!(
         model = %served_model_name,
-        elapsed_ms = started.elapsed().as_millis(),
+        warmup_ms,
         "model warmup completed"
     );
     let app = api::router(batcher, args.max_request_bytes);
     let listener = tokio::net::TcpListener::bind(address).await?;
-    info!(%address, model = %served_model_name, "sys1 ready");
+    info!(
+        %address,
+        model = %served_model_name,
+        source = if download_ms.is_some() { "hub" } else { "local" },
+        download_ms = download_ms.unwrap_or(0),
+        model_load_ms,
+        warmup_ms,
+        startup_ms = startup_started.elapsed().as_millis(),
+        "sys1 ready"
+    );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await?;
