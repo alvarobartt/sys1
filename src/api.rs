@@ -86,7 +86,7 @@ async fn trace_request(request: Request, next: Next) -> Response {
         } else if status.is_client_error() {
             tracing::warn!(status = status.as_u16(), elapsed_ms, "request completed");
         } else {
-            tracing::debug!(status = status.as_u16(), elapsed_ms, "request completed");
+            tracing::info!(status = status.as_u16(), elapsed_ms, "request completed");
         }
         response
     }
