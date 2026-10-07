@@ -4099,6 +4099,7 @@ dependencies = [
  "clap",
  "half",
  "hf-hub",
+ "indicatif",
  "insta",
  "prometheus",
  "reqwest",

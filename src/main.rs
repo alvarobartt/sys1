@@ -12,7 +12,6 @@ use sys1::{
     batching::{Batcher, BatcherConfig},
     models,
 };
-use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -218,35 +217,37 @@ async fn main() -> anyhow::Result<()> {
     } else {
         "cpu"
     };
-    info!(
+    tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),
         backend,
         ?args,
-        "sys1 starting"
+        "Starting sys1"
     );
     let address = SocketAddr::new(args.host, args.port);
-    let (model_path, source_name, architecture) = match args.model_path {
+    let (model_path, source_name, architecture, source) = match args.model_path {
         Some(path) => {
             if args.served_model_name.is_none() {
-                warn!("--served-model-name is recommended when using --model-path");
+                tracing::warn!("Set --served-model-name when using --model-path");
             }
             let name = path.display().to_string();
             let architecture = models::Architecture::from_path(&path)?;
-            (path, name, architecture)
+            (path, name, architecture, "path")
         }
         None => {
             let started = Instant::now();
-            info!(model_id = %args.model_id, revision = %args.revision, "resolving model snapshot");
-            let path = sys1::hub::download(&args.model_id, &args.revision).await?;
-            info!(
-                model_id = %args.model_id,
-                path = %path.display(),
-                elapsed_ms = started.elapsed().as_millis(),
-                "model snapshot ready"
-            );
-            let architecture = models::Architecture::from_path(&path)?;
-            (path, args.model_id, architecture)
+            tracing::info!(model_id = %args.model_id, revision = %args.revision, "Resolving model snapshot");
+            let outcome = sys1::hub::download_with_source(&args.model_id, &args.revision).await?;
+            // Includes Hub metadata resolution and cache checks as well as transfer time.
+            let download_ms = started.elapsed().as_millis();
+            tracing::info!(model_id = %args.model_id, path = %outcome.path.display(), download_ms, source = outcome.source.as_str(), "Model files ready");
+            let architecture = models::Architecture::from_path(&outcome.path)?;
+            (
+                outcome.path,
+                args.model_id,
+                architecture,
+                outcome.source.as_str(),
+            )
         }
     };
     let dtype = args.dtype.resolve_for(architecture);
@@ -260,12 +261,7 @@ async fn main() -> anyhow::Result<()> {
     attention.validate(dtype)?;
     let served_model_name = args.served_model_name.unwrap_or(source_name);
     let started = Instant::now();
-    info!(
-        model = %served_model_name,
-        ?architecture,
-        path = %model_path.display(),
-        "loading model"
-    );
+    tracing::info!(model = %served_model_name, source, ?architecture, ?dtype, ?attention, path = %model_path.display(), "Loading model");
     let model = models::load(
         &model_path,
         architecture,
@@ -274,11 +270,8 @@ async fn main() -> anyhow::Result<()> {
         attention,
     )
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
-    info!(
-        model = %served_model_name,
-        elapsed_ms = started.elapsed().as_millis(),
-        "model loaded"
-    );
+    let model_load_ms = started.elapsed().as_millis();
+    tracing::info!(model_load_ms, "Model loaded");
     let batcher = Batcher::new(
         Arc::new(model),
         served_model_name.clone(),
@@ -293,24 +286,24 @@ async fn main() -> anyhow::Result<()> {
         },
     );
     let started = Instant::now();
-    info!(model = %served_model_name, "model warmup started");
     batcher
         .warmup()
         .await
         .map_err(|error| anyhow::anyhow!(error.error))
         .context("model warmup failed")?;
-    info!(
-        model = %served_model_name,
-        elapsed_ms = started.elapsed().as_millis(),
-        "model warmup completed"
-    );
+    let warmup_ms = started.elapsed().as_millis();
+    tracing::info!(warmup_ms, "Model warmup complete");
     let app = api::router(batcher, args.max_request_bytes);
     let listener = tokio::net::TcpListener::bind(address).await?;
-    info!(%address, model = %served_model_name, "sys1 ready");
+    let address = listener.local_addr()?;
+    for &(method, route) in api::PUBLIC_ROUTES {
+        tracing::info!("[{method}] {route}");
+    }
+    tracing::info!(%address, "Server running");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await?;
-    info!("sys1 stopped");
+    tracing::info!("Server stopped");
     Ok(())
 }
 
@@ -323,13 +316,13 @@ async fn shutdown() {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
     }
-    info!("shutdown requested");
+    tracing::info!("Shutdown requested");
 }
 
 #[cfg(not(unix))]
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
-    info!("shutdown requested");
+    tracing::info!("Shutdown requested");
 }
 
 #[cfg(test)]
