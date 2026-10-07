@@ -17,14 +17,14 @@ use std::time::Instant;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-pub const PUBLIC_ROUTES: &[&str] = &[
-    "GET  /health",
-    "GET  /metrics",
-    "GET  /v1/models",
-    "POST /v1/systemone",
-    "POST /v1/decide",
-    "GET  /docs/",
-    "GET  /openapi.json",
+pub const PUBLIC_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/health"),
+    ("GET", "/metrics"),
+    ("GET", "/v1/models"),
+    ("POST", "/v1/systemone"),
+    ("POST", "/v1/decide"),
+    ("GET", "/docs/"),
+    ("GET", "/openapi.json"),
 ];
 
 #[derive(OpenApi)]
@@ -132,7 +132,7 @@ async fn health(State(batcher): State<Batcher>) -> (StatusCode, Json<HealthRespo
 )]
 async fn metrics(State(batcher): State<Batcher>) -> Result<Response, StatusCode> {
     let metrics = batcher.encode_metrics().map_err(|error| {
-        tracing::error!(%error, "failed to encode Prometheus metrics");
+        tracing::error!(%error, "Failed to encode Prometheus metrics");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     Ok((
@@ -365,9 +365,7 @@ mod tests {
         let json = serde_json::to_value(document).unwrap();
         let paths = json["paths"].as_object().unwrap();
 
-        for route in PUBLIC_ROUTES {
-            let (method, path) = route.split_once(' ').unwrap();
-            let path = path.trim();
+        for &(method, path) in PUBLIC_ROUTES {
             if matches!(path, "/docs/" | "/openapi.json") {
                 continue;
             }
@@ -375,7 +373,7 @@ mod tests {
                 paths[path]
                     .get(method.to_ascii_lowercase().as_str())
                     .is_some(),
-                "missing OpenAPI route {route}"
+                "missing OpenAPI route [{method}] {path}"
             );
         }
 

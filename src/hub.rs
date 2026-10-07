@@ -124,6 +124,7 @@ impl ProgressHandler for DownloadProgress {
             return;
         };
         let mut changed = false;
+        let mut completed_downloads = Vec::new();
         match event {
             DownloadEvent::Start {
                 total_files,
@@ -178,6 +179,9 @@ impl ProgressHandler for DownloadProgress {
                     if file.status == FileStatus::Complete && !entry.complete {
                         entry.complete = true;
                         changed = true;
+                        if entry.bar.is_some() {
+                            completed_downloads.push(file.filename.clone());
+                        }
                     }
                     if let Some(bar) = &entry.bar {
                         bar.set_position(if entry.total > 0 {
@@ -233,6 +237,11 @@ impl ProgressHandler for DownloadProgress {
                 overall.set_position(state.downloaded());
             }
             self.summary.set_position(state.completed_files() as u64);
+        }
+        drop(state);
+        for filename in completed_downloads {
+            self.multi
+                .suspend(|| tracing::info!(file = %filename, "File downloaded"));
         }
     }
 }
@@ -307,7 +316,7 @@ pub async fn download_with_source(
         .allow_patterns(MODEL_FILES.iter().map(|path| (*path).to_owned()).collect())
         .max_workers(DOWNLOAD_WORKERS)
         .progress(DownloadProgress {
-            multi,
+            multi: multi.clone(),
             summary: summary.clone(),
             state: Arc::clone(&state),
         })
@@ -339,9 +348,13 @@ pub async fn download_with_source(
     };
     let path =
         result.with_context(|| format!("failed to download {model_id} at revision {revision}"));
+    let mut incomplete_files = Vec::new();
     if let Ok(state) = state.lock() {
-        for file in state.files.values() {
+        for (filename, file) in &state.files {
             if let Some(bar) = &file.bar {
+                if !file.complete {
+                    incomplete_files.push(filename.clone());
+                }
                 if path.is_ok() {
                     bar.set_position(file.total.max(file.bytes));
                     bar.finish();
@@ -363,6 +376,16 @@ pub async fn download_with_source(
             }
             summary.finish_and_clear();
         }
+    }
+    for filename in incomplete_files {
+        if path.is_ok() {
+            multi.suspend(|| tracing::info!(file = %filename, "File downloaded"));
+        } else {
+            multi.suspend(|| tracing::error!(file = %filename, "File download failed"));
+        }
+    }
+    if let Err(error) = &path {
+        multi.suspend(|| tracing::error!(%error, "Model download failed"));
     }
     let path = path?;
     let source = state
