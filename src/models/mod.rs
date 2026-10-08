@@ -78,16 +78,25 @@ impl Architecture {
         if config.model_type == "qwen3_5" {
             return Ok(Self::Qwen35);
         }
-        if config.model_type == "modernbert" && laya_config_path.is_file() {
+        if matches!(config.model_type.as_str(), "laya" | "modernbert") && laya_config_path.is_file()
+        {
+            let encoder_config_path = path.join("encoder/config.json");
+            let encoder_config: ModelConfig =
+                serde_json::from_slice(&fs::read(&encoder_config_path).with_context(|| {
+                    format!("failed to read {}", encoder_config_path.display())
+                })?)
+                .with_context(|| format!("failed to parse {}", encoder_config_path.display()))?;
             let laya_config: LayaIdentity = serde_json::from_slice(
                 &fs::read(&laya_config_path)
                     .with_context(|| format!("failed to read {}", laya_config_path.display()))?,
             )
             .with_context(|| format!("failed to parse {}", laya_config_path.display()))?;
-            if matches!(
-                laya_config.model_name.as_str(),
-                "rl-agent" | "laya-typed-decisions"
-            ) {
+            if encoder_config.model_type == "modernbert"
+                && matches!(
+                    laya_config.model_name.as_str(),
+                    "rl-agent" | "laya-typed-decisions"
+                )
+            {
                 return Ok(Self::Laya);
             }
         }
@@ -181,5 +190,26 @@ mod tests {
         );
         std::fs::remove_file(path.join("config.json")).unwrap();
         std::fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
+    fn identifies_laya_with_root_hub_config() {
+        let path = std::env::temp_dir().join(format!("sys1-laya-arch-test-{}", std::process::id()));
+        std::fs::create_dir_all(path.join("encoder")).unwrap();
+        std::fs::write(path.join("config.json"), br#"{"model_type":"laya"}"#).unwrap();
+        std::fs::write(
+            path.join("encoder/config.json"),
+            br#"{"model_type":"modernbert"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("rl_agent_config.json"),
+            br#"{"model_name":"rl-agent"}"#,
+        )
+        .unwrap();
+        assert_eq!(Architecture::from_path(&path).unwrap(), Architecture::Laya);
+        std::fs::remove_file(path.join("config.json")).unwrap();
+        assert_eq!(Architecture::from_path(&path).unwrap(), Architecture::Laya);
+        std::fs::remove_dir_all(path).unwrap();
     }
 }
