@@ -18,11 +18,14 @@
 - Dynamic, token-based batching
 - SDPA on CPU, Metal, and CUDA
 - Flash Attention on Ampere, Ada Lovelace, and Hopper
-- Blazing fast inference for Laya
+- Blazing fast inference for ModernBERT and Qwen3.5
+- Multimodal decisions from text, images, and video when supported by the model
 
 ## Get started
 
-Install it with support for CPU, Metal or CUDA.
+Rust and Cargo 1.98.1, mandatory. `ffmpeg` 6.1.1 or higher (and `ffmprobe`), optional, for models with support for vision.
+
+If you run on CUDA you also need `nvcc`. And if you run on Metal, you also need `xcode` and `xcodebuild -downloadComponent MetalToolchain`.
 
 ```bash
 cargo install sys1 --features cpu
@@ -38,9 +41,7 @@ Then run it with any of the supported models (more coming soon!).
 - [`convaiinnovations/laya-multilingual`](https://huggingface.co/convaiinnovations/laya-multilingual) for 100+ languages, ~2.2x faster
 - [`convaiinnovations/laya-typed-decisions`](https://huggingface.co/convaiinnovations/laya-typed-decisions) for typed-decisions workflows
 - [`Cloudflare/clef`](https://huggingface.co/Cloudflare/clef) for text, image, and video decisions
-- [`Cloudflare/clef-flash`](https://huggingface.co/Cloudflare/clef-flash) for text, image, and video decisions (smaller and faster)
-
-The CPU and CUDA container images pin FFmpeg 6.1.1; Metal CI uses Homebrew's FFmpeg 6.1 series for video decoding.
+- [`Cloudflare/clef-flash`](https://huggingface.co/Cloudflare/clef-flash) for text, image, and video decisions (smaller and faster than the 27B variant)
 
 ```bash
 sys1 --model-id convaiinnovations/laya --dtype auto
