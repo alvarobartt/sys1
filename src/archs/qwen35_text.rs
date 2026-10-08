@@ -334,15 +334,6 @@ impl FullAttention {
                 scale,
                 true,
             )?,
-            #[cfg(feature = "flash-attn-3")]
-            AttentionImplementation::FlashAttention3 => candle_flash_attn_v3::flash_attn(
-                &q.contiguous()?,
-                &k.contiguous()?,
-                &v.contiguous()?,
-                scale,
-                true,
-                false,
-            )?,
             #[allow(unreachable_patterns)]
             other => candle_core::bail!("{} support is not compiled in", other.cli_name()),
         };

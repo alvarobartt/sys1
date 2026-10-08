@@ -139,13 +139,8 @@ impl Args {
         {
             return requested;
         }
-        if matches!(dtype, DType::F16 | DType::BF16) {
-            if cfg!(feature = "flash-attn-2") {
-                return models::AttentionImplementation::FlashAttention2;
-            }
-            if cfg!(feature = "flash-attn-3") {
-                return models::AttentionImplementation::FlashAttention3;
-            }
+        if matches!(dtype, DType::F16 | DType::BF16) && cfg!(feature = "flash-attn-2") {
+            return models::AttentionImplementation::FlashAttention2;
         }
         models::AttentionImplementation::Eager
     }
@@ -480,8 +475,6 @@ mod tests {
         );
         let low_precision = if cfg!(feature = "flash-attn-2") {
             models::AttentionImplementation::FlashAttention2
-        } else if cfg!(feature = "flash-attn-3") {
-            models::AttentionImplementation::FlashAttention3
         } else {
             models::AttentionImplementation::Eager
         };
@@ -541,7 +534,7 @@ mod tests {
 
     #[test]
     fn rejects_flash_attention_with_f32() {
-        let args = Args::try_parse_from(["sys1", "--attention", "flash-attn-3", "--dtype", "f32"])
+        let args = Args::try_parse_from(["sys1", "--attention", "flash-attn-2", "--dtype", "f32"])
             .unwrap();
         assert!(args.validate().is_err());
     }

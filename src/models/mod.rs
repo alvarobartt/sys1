@@ -21,8 +21,6 @@ pub enum AttentionImplementation {
     Eager,
     #[value(name = "flash-attn-2")]
     FlashAttention2,
-    #[value(name = "flash-attn-3")]
-    FlashAttention3,
 }
 
 impl AttentionImplementation {
@@ -31,7 +29,6 @@ impl AttentionImplementation {
             Self::Auto => "auto",
             Self::Eager => "eager",
             Self::FlashAttention2 => "flash-attn-2",
-            Self::FlashAttention3 => "flash-attn-3",
         }
     }
 
@@ -41,7 +38,6 @@ impl AttentionImplementation {
             Self::Auto => return Ok(()),
             Self::Eager => return Ok(()),
             Self::FlashAttention2 => cfg!(feature = "flash-attn-2"),
-            Self::FlashAttention3 => cfg!(feature = "flash-attn-3"),
         };
         anyhow::ensure!(
             enabled,

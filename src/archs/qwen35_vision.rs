@@ -116,7 +116,7 @@ impl Block {
                 }
                 Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 0)?
             }
-            #[cfg(any(feature = "flash-attn-2", feature = "flash-attn-3"))]
+            #[cfg(feature = "flash-attn-2")]
             implementation => {
                 let mut cumulative = Vec::with_capacity(lengths.len() + 1);
                 cumulative.push(0u32);
@@ -140,28 +140,13 @@ impl Block {
                             false,
                         )?
                     }
-                    #[cfg(feature = "flash-attn-3")]
-                    AttentionImplementation::FlashAttention3 => {
-                        candle_flash_attn_v3::flash_attn_varlen(
-                            &q.contiguous()?,
-                            &k.contiguous()?,
-                            &v.contiguous()?,
-                            &cumulative,
-                            &cumulative,
-                            max_length,
-                            max_length,
-                            scale,
-                            false,
-                            false,
-                        )?
-                    }
                     _ => candle_core::bail!(
                         "{} support is not compiled in",
                         implementation.cli_name()
                     ),
                 }
             }
-            #[cfg(not(any(feature = "flash-attn-2", feature = "flash-attn-3")))]
+            #[cfg(not(feature = "flash-attn-2"))]
             other => candle_core::bail!("{} support is not compiled in", other.cli_name()),
         };
         attention

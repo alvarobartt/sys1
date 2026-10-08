@@ -32,7 +32,6 @@ cargo install sys1 --features cpu
 # cargo install sys1 --no-default-features --features metal
 # cargo install sys1 --no-default-features --features cuda
 # cargo install sys1 --no-default-features --features cuda,flash-attn-2 # Ampere, Ada Lovelace, or Hopper
-# cargo install sys1 --no-default-features --features cuda,flash-attn-3 # Hopper
 ```
 
 Then run it with any of the supported models (more coming soon!).
