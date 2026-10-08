@@ -41,10 +41,6 @@ fn select_attention(
     if !matches!(dtype, DType::F16 | DType::BF16) {
         return AttentionImplementation::Eager;
     }
-    #[cfg(feature = "flash-attn-3")]
-    if capability == Some((9, 0)) {
-        return AttentionImplementation::FlashAttention3;
-    }
     #[cfg(feature = "flash-attn-2")]
     if capability.is_some_and(|(major, _)| (8..=9).contains(&major)) {
         return AttentionImplementation::FlashAttention2;
@@ -62,7 +58,6 @@ fn validate_flash_device(
         AttentionImplementation::FlashAttention2 => {
             capability.is_some_and(|(major, _)| (8..=9).contains(&major))
         }
-        AttentionImplementation::FlashAttention3 => capability == Some((9, 0)),
         AttentionImplementation::Auto => false,
     };
     anyhow::ensure!(
@@ -885,20 +880,6 @@ mod tests {
                 AttentionImplementation::Eager
             );
         }
-        #[cfg(feature = "flash-attn-3")]
-        {
-            assert_eq!(
-                select_attention(AttentionImplementation::Auto, DType::BF16, Some((9, 0))),
-                AttentionImplementation::FlashAttention3
-            );
-            assert_eq!(
-                select_attention(AttentionImplementation::Auto, DType::BF16, Some((8, 9))),
-                AttentionImplementation::Eager
-            );
-        }
-        assert!(
-            validate_flash_device(AttentionImplementation::FlashAttention3, Some((8, 9))).is_err()
-        );
     }
 
     #[test]
@@ -1439,15 +1420,6 @@ mod clef_head {
                     &k.contiguous()?,
                     &v.contiguous()?,
                     scale,
-                    false,
-                )?,
-                #[cfg(feature = "flash-attn-3")]
-                AttentionImplementation::FlashAttention3 => candle_flash_attn_v3::flash_attn(
-                    &q.contiguous()?,
-                    &k.contiguous()?,
-                    &v.contiguous()?,
-                    scale,
-                    false,
                     false,
                 )?,
                 #[allow(unreachable_patterns)]

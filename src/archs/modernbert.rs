@@ -324,7 +324,7 @@ fn attention_softmax(scores: &Tensor) -> Result<Tensor> {
     }
 }
 
-#[cfg(any(feature = "flash-attn-2", feature = "flash-attn-3"))]
+#[cfg(feature = "flash-attn-2")]
 fn flash_attention(
     q: &Tensor,
     k: &Tensor,
@@ -350,10 +350,6 @@ fn flash_attention(
             #[cfg(feature = "flash-attn-2")]
             AttentionImplementation::FlashAttention2 => {
                 candle_flash_attn::flash_attn_windowed(&q, &k, &v, scale, window, window)?
-            }
-            #[cfg(feature = "flash-attn-3")]
-            AttentionImplementation::FlashAttention3 => {
-                candle_flash_attn_v3::flash_attn_windowed(&q, &k, &v, scale, window, window, false)?
             }
             _ => candle_core::bail!("{} support is not compiled in", implementation.cli_name()),
         }
@@ -395,22 +391,6 @@ fn flash_attention(
                     window,
                 )?
             }
-            #[cfg(feature = "flash-attn-3")]
-            AttentionImplementation::FlashAttention3 => {
-                candle_flash_attn_v3::flash_attn_varlen_windowed(
-                    &packed_q,
-                    &packed_k,
-                    &packed_v,
-                    &cumulative,
-                    &cumulative,
-                    max_length,
-                    max_length,
-                    scale,
-                    window,
-                    window,
-                    false,
-                )?
-            }
             _ => candle_core::bail!("{} support is not compiled in", implementation.cli_name()),
         };
         Tensor::zeros(
@@ -424,7 +404,7 @@ fn flash_attention(
     attention.transpose(1, 2)
 }
 
-#[cfg(not(any(feature = "flash-attn-2", feature = "flash-attn-3")))]
+#[cfg(not(feature = "flash-attn-2"))]
 fn flash_attention(
     _q: &Tensor,
     _k: &Tensor,
