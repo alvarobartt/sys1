@@ -65,6 +65,13 @@ jobs:
             build_args: CUDA_COMPUTE_CAPS=90
             platform: linux/amd64
             runner: ubuntu-latest
+          - name: hopper
+            file: Dockerfile.cuda
+            staging_suffix: -hopper-arm64
+            cache_scope: cuda-hopper-arm64
+            build_args: CUDA_COMPUTE_CAPS=90
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
           - name: blackwell
             file: Dockerfile.cuda
             staging_suffix: -blackwell-amd64
@@ -76,7 +83,7 @@ jobs:
             file: Dockerfile.cuda
             staging_suffix: -blackwell-arm64
             cache_scope: cuda-blackwell-arm64
-            build_args: CUDA_COMPUTE_CAPS=121
+            build_args: CUDA_COMPUTE_CAPS=100;103;121
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -105,6 +112,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      - name: Short SHA
+        id: short_sha
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+        run: echo "value=${SOURCE_SHA:0:7}" >> "$GITHUB_OUTPUT"
       - name: Docker metadata
         id: metadata
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -112,7 +124,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           flavor: latest=false
           tags: |
-            type=raw,value=${{ inputs.source_sha || github.sha }}${{ matrix.staging_suffix }}
+            type=raw,value=${{ steps.short_sha.outputs.value }}${{ matrix.staging_suffix }}
       - name: Build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:

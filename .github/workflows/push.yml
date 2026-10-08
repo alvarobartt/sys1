@@ -46,8 +46,12 @@ jobs:
             expected_platforms: linux/amd64
           - name: hopper
             suffix: -hopper
-            source_suffixes: -hopper-amd64
-            expected_platforms: linux/amd64
+            source_suffixes: |-
+              -hopper-amd64
+              -hopper-arm64
+            expected_platforms: |-
+              linux/amd64
+              linux/arm64
           - name: blackwell
             suffix: -blackwell
             source_suffixes: |-
@@ -64,6 +68,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      - name: Short SHA
+        id: short_sha
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: echo "value=${SOURCE_SHA:0:7}" >> "$GITHUB_OUTPUT"
       - name: Docker metadata
         id: metadata
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -71,15 +80,15 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           flavor: latest=false
           tags: |
-            type=raw,value=${{ inputs.source_sha }}${{ matrix.suffix }}
-            type=raw,value=${{ inputs.source_sha }},enable=${{ matrix.name == 'cpu' }}
+            type=raw,value=${{ steps.short_sha.outputs.value }}${{ matrix.suffix }}
+            type=raw,value=${{ steps.short_sha.outputs.value }},enable=${{ matrix.name == 'cpu' }}
             type=raw,value=main${{ matrix.suffix }},enable=${{ inputs.publish_main }}
             type=raw,value=main,enable=${{ inputs.publish_main && matrix.name == 'cpu' }}
       - name: Push
         env:
           DESTINATION_TAGS: ${{ steps.metadata.outputs.tags }}
           EXPECTED_PLATFORMS: ${{ matrix.expected_platforms }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_SHA: ${{ steps.short_sha.outputs.value }}
           SOURCE_SUFFIXES: ${{ matrix.source_suffixes }}
         shell: bash
         run: |
@@ -146,6 +155,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      - name: Short SHA
+        id: short_sha
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: echo "value=${SOURCE_SHA:0:7}" >> "$GITHUB_OUTPUT"
       - name: Docker metadata
         id: metadata
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -160,7 +174,7 @@ jobs:
       - name: Push
         env:
           DESTINATION_TAGS: ${{ steps.metadata.outputs.tags }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_SHA: ${{ steps.short_sha.outputs.value }}
         shell: bash
         run: |
           set -euo pipefail
