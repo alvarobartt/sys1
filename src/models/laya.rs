@@ -176,7 +176,6 @@ pub struct Laya {
     cls_id: u32,
     sep_id: u32,
     mask_id: u32,
-    metal_amp: Option<Box<Laya>>,
 }
 
 impl Laya {
@@ -187,26 +186,8 @@ impl Laya {
         attention: AttentionImplementation,
     ) -> anyhow::Result<Self> {
         let device = device::load()?;
-        if dtype.is_none() && device.is_metal() {
-            let mut model =
-                Self::build_variant(path, DType::F32, DType::F32, max_model_len, attention)?;
-            model.metal_amp = Some(Box::new(Self::build_variant(
-                path,
-                DType::F32,
-                DType::F16,
-                max_model_len,
-                attention,
-            )?));
-            tracing::info!("Laya Metal autocast configured");
-            return Ok(model);
-        }
-        let (model_dtype, compute_dtype) = match dtype {
-            Some(dtype) => execution_dtypes(dtype, device.is_cuda()),
-            None => (
-                DType::F32,
-                super::model_default_dtype(path, super::Architecture::Laya)?,
-            ),
-        };
+        let dtype = super::dtype::resolve(path, super::Architecture::Laya, dtype)?;
+        let (model_dtype, compute_dtype) = execution_dtypes(dtype, device.is_cuda());
         Self::build_variant(path, model_dtype, compute_dtype, max_model_len, attention)
     }
 
@@ -298,7 +279,6 @@ impl Laya {
             cls_id,
             sep_id,
             mask_id,
-            metal_amp: None,
         })
     }
 
@@ -420,11 +400,6 @@ impl Laya {
     fn forward(&self, prepared: &[RequestItems]) -> anyhow::Result<Vec<Vec<f32>>> {
         let items: Vec<_> = prepared.iter().flat_map(|request| &request.items).collect();
         let (unique, indices) = deduplicate(&items);
-        if unique.len() >= 5
-            && let Some(amp) = &self.metal_amp
-        {
-            return amp.forward(prepared);
-        }
         let batch = unique.len();
         let length = unique.iter().map(|item| item.ids.len()).max().unwrap_or(0);
         let mut ids = vec![self.pad_id; batch * length];
