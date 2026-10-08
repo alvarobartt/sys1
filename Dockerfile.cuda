@@ -50,6 +50,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 
 COPY --from=planner /app/recipe.json recipe.json
+COPY src/kernels ./src/kernels
 
 ARG CUDA_COMPUTE_CAPS
 ARG SCCACHE_GHA_ENABLED=off
