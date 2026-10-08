@@ -1,36 +1,52 @@
-use std::{env, path::PathBuf, process::Command};
+use std::{env, fs, path::PathBuf, process::Command};
+
+fn kernel_sources(extension: &str) -> Vec<PathBuf> {
+    let directory = PathBuf::from("src/kernels");
+    println!("cargo:rerun-if-changed={}", directory.display());
+    let mut sources: Vec<_> = fs::read_dir(&directory)
+        .expect("failed to read kernel directory")
+        .map(|entry| entry.expect("failed to read kernel entry").path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == extension))
+        .collect();
+    sources.sort();
+    assert!(!sources.is_empty(), "no .{extension} kernels found");
+    for source in &sources {
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
+    sources
+}
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
     if env::var_os("CARGO_FEATURE_METAL").is_some()
         && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
     {
-        println!("cargo:rerun-if-changed=src/kernels/qwen35.metal");
+        let sources = kernel_sources("metal");
         let output_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-        let air = output_dir.join("qwen35.air");
-        let library = output_dir.join("qwen35.metallib");
-        let metal = Command::new("xcrun")
-            .args([
-                "--toolchain",
-                "Metal",
-                "metal",
-                "-std=metal3.0",
-                "-c",
-                "src/kernels/qwen35.metal",
-                "-o",
-            ])
-            .arg(&air)
-            .status()
-            .expect("Failed to run the Metal compiler for Qwen3.5 kernels");
-        assert!(metal.success(), "Failed to compile Qwen3.5 Metal kernels");
+        let library = output_dir.join("kernels.metallib");
+        let mut air_files = Vec::with_capacity(sources.len());
+        for source in sources {
+            let air = output_dir
+                .join(source.file_stem().unwrap())
+                .with_extension("air");
+            let metal = Command::new("xcrun")
+                .args(["--toolchain", "Metal", "metal", "-std=metal3.0", "-c"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&air)
+                .status()
+                .expect("failed to run the Metal compiler");
+            assert!(metal.success(), "failed to compile {}", source.display());
+            air_files.push(air);
+        }
         let link = Command::new("xcrun")
             .args(["--toolchain", "Metal", "metallib"])
-            .arg(&air)
+            .args(&air_files)
             .arg("-o")
             .arg(&library)
             .status()
-            .expect("Failed to run metallib for Qwen3.5 kernels");
-        assert!(link.success(), "Failed to link Qwen3.5 Metal kernels");
+            .expect("failed to run metallib");
+        assert!(link.success(), "failed to link Metal kernels");
         println!(
             "cargo:rustc-env=SYS1_KERNEL_METALLIB_PATH={}",
             library.display()
@@ -56,15 +72,25 @@ fn main() {
             }
         }
 
-        println!("cargo:rerun-if-changed=src/kernels/cuda.cu");
-        let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("cuda.ptx");
+        let sources = kernel_sources("cu");
+        let output_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+        let unit = output_dir.join("kernels.cu");
+        let includes = sources
+            .iter()
+            .map(|path| {
+                format!(
+                    "#include \"{}\"\n",
+                    path.file_name().unwrap().to_str().unwrap()
+                )
+            })
+            .collect::<String>();
+        fs::write(&unit, includes).expect("failed to generate CUDA translation unit");
+        let output = output_dir.join("cuda.ptx");
         let status = Command::new("nvcc")
-            .args([
-                "-ptx",
-                &format!("-arch=compute_{capability}"),
-                "src/kernels/cuda.cu",
-                "-o",
-            ])
+            .args(["-ptx", &format!("-arch=compute_{capability}"), "-I"])
+            .arg("src/kernels")
+            .arg(&unit)
+            .arg("-o")
             .arg(&output)
             .status()
             .expect("failed to run nvcc for CUDA kernels");
