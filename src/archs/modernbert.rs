@@ -476,7 +476,7 @@ impl Module for Mlp {
 }
 
 #[cfg(feature = "cuda")]
-const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/sys1.ptx"));
+const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/cuda.ptx"));
 
 #[cfg(feature = "cuda")]
 struct Geglu;

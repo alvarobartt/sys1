@@ -56,15 +56,13 @@ fn main() {
             }
         }
 
-        println!("cargo:rerun-if-changed=src/kernels/sys1.cu");
-        println!("cargo:rerun-if-changed=src/kernels/modernbert.cu");
-        println!("cargo:rerun-if-changed=src/kernels/qwen35.cu");
-        let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("sys1.ptx");
+        println!("cargo:rerun-if-changed=src/kernels/cuda.cu");
+        let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("cuda.ptx");
         let status = Command::new("nvcc")
             .args([
                 "-ptx",
                 &format!("-arch=compute_{capability}"),
-                "src/kernels/sys1.cu",
+                "src/kernels/cuda.cu",
                 "-o",
             ])
             .arg(&output)
