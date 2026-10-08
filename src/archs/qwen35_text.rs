@@ -96,10 +96,8 @@ struct RmsNorm {
 
 impl RmsNorm {
     fn load(width: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        Ok(Self {
-            weight: vb.get(width, "weight")?,
-            eps,
-        })
+        let weight = vb.get(width, "weight")?;
+        Ok(Self { weight, eps })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -107,9 +105,8 @@ impl RmsNorm {
         let x = x.to_dtype(DType::F32)?;
         let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
         let scale = (variance + self.eps)?.sqrt()?.recip()?;
-        let weight = (&self.weight.to_dtype(DType::F32)? + 1.)?;
         x.broadcast_mul(&scale)?
-            .broadcast_mul(&weight)?
+            .broadcast_mul(&(&self.weight.to_dtype(DType::F32)? + 1.)?)?
             .to_dtype(dtype)
     }
 }
@@ -279,7 +276,8 @@ impl FullAttention {
             .reshape((batch, length, self.kv_heads, self.head_dim))?;
         let scale = (self.head_dim as f32).powf(-0.5);
         #[cfg(feature = "metal")]
-        if x.device().is_metal() {
+        // BF16 Metal SDPA produced non-finite values for Clef's 256-wide heads.
+        if x.device().is_metal() && x.dtype() != DType::BF16 {
             let attention = candle_nn::ops::sdpa(
                 &q.transpose(1, 2)?.contiguous()?,
                 &k.transpose(1, 2)?.contiguous()?,
@@ -424,7 +422,15 @@ impl LinearAttention {
         } else {
             causal_conv_silu(&projected, &self.conv, self.kernel)?
         };
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(feature = "metal")]
+        let mixed = if x.device().is_metal()
+            && matches!(x.dtype(), DType::BF16 | DType::F16 | DType::F32)
+        {
+            crate::kernels::metal::conv_silu(&projected, &self.conv)?
+        } else {
+            causal_conv_silu(&projected, &self.conv, self.kernel)?
+        };
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
         let mixed = causal_conv_silu(&projected, &self.conv, self.kernel)?;
         let q = mixed.narrow(D::Minus1, 0, key_width)?.reshape((
             batch,
@@ -447,8 +453,12 @@ impl LinearAttention {
                 .broadcast_as((batch, length, self.key_heads, repeat, self.key_dim))?
                 .reshape((batch, length, self.value_heads, self.key_dim))
         };
-        let q = expand(q)?;
-        let k = expand(k)?;
+        #[cfg(feature = "metal")]
+        let grouped_qk = x.device().is_metal() && self.key_dim == 128 && self.value_dim == 128;
+        #[cfg(not(feature = "metal"))]
+        let grouped_qk = false;
+        let q = if grouped_qk { q } else { expand(q)? };
+        let k = if grouped_qk { k } else { expand(k)? };
         let l2 = |xs: Tensor| -> Result<Tensor> {
             let denom = (xs.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?;
             xs.broadcast_div(&denom)
@@ -467,15 +477,47 @@ impl LinearAttention {
         let v = v.transpose(1, 2)?;
         let beta = beta.transpose(1, 2)?;
         let g = g.transpose(1, 2)?;
+        #[cfg(feature = "metal")]
+        let output = if grouped_qk {
+            let packed = crate::kernels::metal::pack_delta_f32(&q, &k, &v, &g, &beta)?;
+            crate::kernels::metal::delta_rule_packed(&packed, self.value_dim)?
+        } else {
+            chunked_delta_rule(&q, &k, &v, &g, &beta)?
+        };
+        #[cfg(not(feature = "metal"))]
         let output = chunked_delta_rule(&q, &k, &v, &g, &beta)?;
-        let variance = output.sqr()?.mean_keepdim(D::Minus1)?;
-        let output = output.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let output = output.broadcast_mul(&self.norm.to_dtype(DType::F32)?)?;
+        self.finish_delta(x, output, batch, length, value_width)
+    }
+
+    fn finish_delta(
+        &self,
+        x: &Tensor,
+        output: Tensor,
+        batch: usize,
+        length: usize,
+        value_width: usize,
+    ) -> Result<Tensor> {
         let gate = x
             .apply(&self.z)?
-            .reshape((batch, length, self.value_heads, self.value_dim))?
-            .to_dtype(DType::F32)?
-            .silu()?;
+            .reshape((batch, length, self.value_heads, self.value_dim))?;
+        let variance = output.sqr()?.mean_keepdim(D::Minus1)?;
+        #[cfg(feature = "metal")]
+        if x.device().is_metal() && x.dtype() == DType::BF16 && self.value_dim == 128 {
+            let denominator = (variance + self.eps)?.sqrt()?;
+            let gate_silu = gate.to_dtype(DType::F32)?.silu()?;
+            let norm = self.norm.to_dtype(DType::F32)?;
+            return crate::kernels::metal::post_finalize_bf16(
+                &output,
+                &denominator,
+                &gate_silu,
+                &norm,
+            )?
+            .reshape((batch, length, value_width))?
+            .apply(&self.output);
+        }
+        let output = output.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        let output = output.broadcast_mul(&self.norm.to_dtype(DType::F32)?)?;
+        let gate = gate.to_dtype(DType::F32)?.silu()?;
         output
             .broadcast_mul(&gate)?
             .to_dtype(x.dtype())?
@@ -649,12 +691,28 @@ fn chunked_delta_rule(
     g: &Tensor,
     beta: &Tensor,
 ) -> Result<Tensor> {
-    let (batch, heads, length, key_dim) = q.dims4()?;
-    let value_dim = v.dim(D::Minus1)?;
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    let key_dim = q.dim(D::Minus1)?;
     #[cfg(feature = "cuda")]
     if q.device().is_cuda() && key_dim == 128 {
         return cuda_delta_rule(q, k, v, g, beta);
     }
+    #[cfg(feature = "metal")]
+    if q.device().is_metal() && key_dim == 128 {
+        return crate::kernels::metal::delta_rule(q, k, v, g, beta);
+    }
+    chunked_delta_rule_fallback(q, k, v, g, beta)
+}
+
+fn chunked_delta_rule_fallback(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+) -> Result<Tensor> {
+    let (batch, heads, length, key_dim) = q.dims4()?;
+    let value_dim = v.dim(D::Minus1)?;
     let mut state = Tensor::zeros((batch, heads, key_dim, value_dim), DType::F32, q.device())?;
     let mut outputs = Vec::with_capacity(length.div_ceil(32));
     let full_lower = Tensor::tril2(32, DType::F32, q.device())?;

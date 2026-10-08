@@ -113,16 +113,9 @@ struct Args {
     /// Maximum model context length; uses the model configuration when omitted.
     #[arg(long, env, help_heading = "Model options")]
     max_model_len: Option<usize>,
-    /// Floating-point precision used for inference.
-    #[arg(
-        short = 'd',
-        long,
-        env,
-        value_enum,
-        default_value_t = Precision::Auto,
-        help_heading = "Model options"
-    )]
-    dtype: Precision,
+    /// Floating-point precision; omitted or auto uses the model's inference policy.
+    #[arg(short = 'd', long, env, value_enum, help_heading = "Model options")]
+    dtype: Option<Precision>,
     /// Attention implementation used for inference.
     #[arg(
         short = 'a',
@@ -159,8 +152,8 @@ impl Args {
             self.max_model_len != Some(0),
             "--max-model-len must be positive"
         );
-        if self.dtype != Precision::Auto {
-            self.attention.validate(self.dtype.resolve())?;
+        if let Some(dtype) = self.dtype.filter(|dtype| *dtype != Precision::Auto) {
+            self.attention.validate(dtype.resolve_explicit())?;
         }
         Ok(())
     }
@@ -175,25 +168,12 @@ enum Precision {
 }
 
 impl Precision {
-    fn resolve(self) -> DType {
+    fn resolve_explicit(self) -> DType {
         match self {
-            Self::Auto | Self::F32 => DType::F32,
+            Self::Auto => unreachable!("auto is resolved from model files"),
+            Self::F32 => DType::F32,
             Self::F16 => DType::F16,
             Self::Bf16 => DType::BF16,
-        }
-    }
-
-    fn resolve_for(self, architecture: models::Architecture) -> DType {
-        if self == Self::Auto && architecture == models::Architecture::Qwen35 {
-            if cfg!(feature = "cuda") {
-                DType::BF16
-            } else if cfg!(feature = "metal") {
-                DType::F16
-            } else {
-                DType::F32
-            }
-        } else {
-            self.resolve()
         }
     }
 }
@@ -250,7 +230,14 @@ async fn main() -> anyhow::Result<()> {
             )
         }
     };
-    let dtype = args.dtype.resolve_for(architecture);
+    let requested_dtype = args
+        .dtype
+        .filter(|dtype| *dtype != Precision::Auto)
+        .map(Precision::resolve_explicit);
+    let dtype = match requested_dtype {
+        Some(dtype) => dtype,
+        None => models::model_default_dtype(&model_path, architecture)?,
+    };
     let attention = if architecture == models::Architecture::Laya
         && args.attention == models::AttentionImplementation::Auto
     {
@@ -265,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
     let model = models::load(
         &model_path,
         architecture,
-        dtype,
+        requested_dtype,
         args.max_model_len,
         attention,
     )
@@ -346,7 +333,7 @@ mod tests {
         assert_eq!(args.request_timeout_ms, 30_000);
         assert_eq!(args.max_request_bytes, 16_777_216);
         assert_eq!(args.max_model_len, None);
-        assert_eq!(args.dtype, Precision::Auto);
+        assert_eq!(args.dtype, None);
         assert_eq!(args.attention, models::AttentionImplementation::Auto);
     }
 
@@ -388,7 +375,7 @@ mod tests {
         assert_eq!(args.port, 8080);
         assert_eq!(args.max_batch_size, 4);
         assert_eq!(args.request_timeout_ms, 100);
-        assert_eq!(args.dtype, Precision::F16);
+        assert_eq!(args.dtype, Some(Precision::F16));
         assert_eq!(args.attention, models::AttentionImplementation::Eager);
     }
 
@@ -443,14 +430,14 @@ mod tests {
     }
 
     #[test]
-    fn resolves_requested_and_backend_default_dtypes() {
-        assert_eq!(Precision::F32.resolve(), DType::F32);
-        assert_eq!(Precision::F16.resolve(), DType::F16);
-        assert_eq!(Precision::Bf16.resolve(), DType::BF16);
-        assert_eq!(Precision::Auto.resolve(), DType::F32);
-
+    fn resolves_explicit_dtypes() {
+        assert_eq!(Precision::F32.resolve_explicit(), DType::F32);
+        assert_eq!(Precision::F16.resolve_explicit(), DType::F16);
+        assert_eq!(Precision::Bf16.resolve_explicit(), DType::BF16);
         let args = Args::try_parse_from(["sys1", "--dtype", "bf16"]).unwrap();
-        assert_eq!(args.dtype, Precision::Bf16);
+        assert_eq!(args.dtype, Some(Precision::Bf16));
+        let args = Args::try_parse_from(["sys1", "--dtype", "auto"]).unwrap();
+        assert_eq!(args.dtype, Some(Precision::Auto));
 
         let args = Args::try_parse_from(["sys1", "--attention", "flash-attn-2"]).unwrap();
         assert_eq!(

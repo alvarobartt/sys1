@@ -2,6 +2,40 @@ use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
+    if env::var_os("CARGO_FEATURE_METAL").is_some()
+        && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
+    {
+        println!("cargo:rerun-if-changed=src/kernels/qwen35.metal");
+        let output_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+        let air = output_dir.join("qwen35.air");
+        let library = output_dir.join("qwen35.metallib");
+        let metal = Command::new("xcrun")
+            .args([
+                "--toolchain",
+                "Metal",
+                "metal",
+                "-std=metal3.0",
+                "-c",
+                "src/kernels/qwen35.metal",
+                "-o",
+            ])
+            .arg(&air)
+            .status()
+            .expect("Failed to run the Metal compiler for Qwen3.5 kernels");
+        assert!(metal.success(), "Failed to compile Qwen3.5 Metal kernels");
+        let link = Command::new("xcrun")
+            .args(["--toolchain", "Metal", "metallib"])
+            .arg(&air)
+            .arg("-o")
+            .arg(&library)
+            .status()
+            .expect("Failed to run metallib for Qwen3.5 kernels");
+        assert!(link.success(), "Failed to link Qwen3.5 Metal kernels");
+        println!(
+            "cargo:rustc-env=SYS1_KERNEL_METALLIB_PATH={}",
+            library.display()
+        );
+    }
     if env::var_os("CARGO_FEATURE_CUDA").is_some() {
         println!("cargo:rerun-if-changed=src/kernels/qwen35.cu");
         let nvcc = env::var_os("CUDA_ROOT")

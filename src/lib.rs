@@ -20,6 +20,8 @@ pub(crate) mod archs;
 pub mod batching;
 mod device;
 pub mod hub;
+#[cfg(feature = "metal")]
+pub(crate) mod kernels;
 pub(crate) mod media;
 mod metrics;
 pub mod models;

@@ -1405,7 +1405,8 @@ mod clef_head {
                 .reshape((batch, kv_len, self.heads, head_dim))?;
             let scale = (head_dim as f32).powf(-0.5);
             #[cfg(feature = "metal")]
-            if query.device().is_metal() {
+            // BF16 Metal SDPA produced non-finite values for Clef's 256-wide heads.
+            if query.device().is_metal() && query.dtype() != DType::BF16 {
                 return candle_nn::ops::sdpa(
                     &q.transpose(1, 2)?.contiguous()?,
                     &k.transpose(1, 2)?.contiguous()?,

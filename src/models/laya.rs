@@ -171,23 +171,53 @@ pub struct Laya {
     scorer_out: Linear,
     config: LayaConfig,
     device: Device,
-    dtype: DType,
     compute_dtype: DType,
     pad_id: u32,
     cls_id: u32,
     sep_id: u32,
     mask_id: u32,
+    metal_amp: Option<Box<Laya>>,
 }
 
 impl Laya {
     pub fn load(
         path: &Path,
-        dtype: DType,
+        dtype: Option<DType>,
         max_model_len: Option<usize>,
         attention: AttentionImplementation,
     ) -> anyhow::Result<Self> {
         let device = device::load()?;
-        let (model_dtype, compute_dtype) = execution_dtypes(dtype, device.is_cuda());
+        if dtype.is_none() && device.is_metal() {
+            let mut model =
+                Self::build_variant(path, DType::F32, DType::F32, max_model_len, attention)?;
+            model.metal_amp = Some(Box::new(Self::build_variant(
+                path,
+                DType::F32,
+                DType::F16,
+                max_model_len,
+                attention,
+            )?));
+            tracing::info!("Laya Metal autocast configured");
+            return Ok(model);
+        }
+        let (model_dtype, compute_dtype) = match dtype {
+            Some(dtype) => execution_dtypes(dtype, device.is_cuda()),
+            None => (
+                DType::F32,
+                super::model_default_dtype(path, super::Architecture::Laya)?,
+            ),
+        };
+        Self::build_variant(path, model_dtype, compute_dtype, max_model_len, attention)
+    }
+
+    fn build_variant(
+        path: &Path,
+        model_dtype: DType,
+        compute_dtype: DType,
+        max_model_len: Option<usize>,
+        attention: AttentionImplementation,
+    ) -> anyhow::Result<Self> {
+        let device = device::load()?;
         validate_attention(attention, &device, compute_dtype)?;
         let mut config: LayaConfig =
             serde_json::from_slice(&fs::read(path.join("rl_agent_config.json"))?)?;
@@ -263,12 +293,12 @@ impl Laya {
             )?,
             config,
             device,
-            dtype: model_dtype,
             compute_dtype,
             pad_id,
             cls_id,
             sep_id,
             mask_id,
+            metal_amp: None,
         })
     }
 
@@ -390,6 +420,11 @@ impl Laya {
     fn forward(&self, prepared: &[RequestItems]) -> anyhow::Result<Vec<Vec<f32>>> {
         let items: Vec<_> = prepared.iter().flat_map(|request| &request.items).collect();
         let (unique, indices) = deduplicate(&items);
+        if unique.len() >= 5
+            && let Some(amp) = &self.metal_amp
+        {
+            return amp.forward(prepared);
+        }
         let batch = unique.len();
         let length = unique.iter().map(|item| item.ids.len()).max().unwrap_or(0);
         let mut ids = vec![self.pad_id; batch * length];
@@ -413,7 +448,7 @@ impl Laya {
             })
             .collect();
         let attention_mask =
-            Tensor::from_vec(mask, (batch, length), &self.device)?.to_dtype(self.dtype)?;
+            Tensor::from_vec(mask, (batch, length), &self.device)?.to_dtype(self.compute_dtype)?;
         let head_mask = Tensor::from_vec(head_mask, (batch, 1, 1, length), &self.device)?
             .to_dtype(self.compute_dtype)?;
         let type_ids = Tensor::from_vec(kinds, batch, &self.device)?;
@@ -944,7 +979,12 @@ mod tests {
 
         for (snapshot, model_id, revision) in models {
             let path = crate::hub::download(model_id, revision).await?;
-            let model = Laya::load(&path, DType::F32, None, AttentionImplementation::Eager)?;
+            let model = Laya::load(
+                &path,
+                Some(DType::F32),
+                None,
+                AttentionImplementation::Eager,
+            )?;
             let request: DecisionRequest = serde_json::from_value(json!({
                 "state": {
                     "message": "I was charged twice for invoice 4411. Please refund me today.",

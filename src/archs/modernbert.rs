@@ -569,7 +569,7 @@ impl Encoder {
                 vb.pp("model.final_norm"),
             )?,
             local_attention_size: config.local_attention,
-            dtype: vb.dtype(),
+            dtype: compute_dtype,
             local_masks: Mutex::new(HashMap::new()),
         })
     }
