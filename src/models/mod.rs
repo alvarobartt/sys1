@@ -65,6 +65,13 @@ pub enum Architecture {
 }
 
 impl Architecture {
+    pub fn default_dtype(self) -> DType {
+        match self {
+            Self::Laya if cfg!(feature = "cuda") => DType::F16,
+            Self::Laya => DType::F32,
+        }
+    }
+
     pub fn from_model_id(model_id: &str) -> anyhow::Result<Self> {
         if LAYA_MODEL_IDS.contains(&model_id) {
             Ok(Self::Laya)
