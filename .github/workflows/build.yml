@@ -43,9 +43,16 @@ jobs:
             file: Dockerfile.cuda
             staging_suffix: -ampere-amd64
             cache_scope: cuda-ampere
-            build_args: CUDA_COMPUTE_CAPS=80;86
+            build_args: CUDA_COMPUTE_CAPS=80;86;88
             platform: linux/amd64
             runner: ubuntu-latest
+          - name: ampere
+            file: Dockerfile.cuda
+            staging_suffix: -ampere-arm64
+            cache_scope: cuda-ampere-arm64
+            build_args: CUDA_COMPUTE_CAPS=87
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
           - name: ada-lovelace
             file: Dockerfile.cuda
             staging_suffix: -ada-lovelace-amd64
@@ -64,14 +71,14 @@ jobs:
             file: Dockerfile.cuda
             staging_suffix: -blackwell-amd64
             cache_scope: cuda-blackwell-amd64
-            build_args: CUDA_COMPUTE_CAPS=100;120
+            build_args: CUDA_COMPUTE_CAPS=100;103;120
             platform: linux/amd64
             runner: ubuntu-latest
           - name: blackwell
             file: Dockerfile.cuda
             staging_suffix: -blackwell-arm64
             cache_scope: cuda-blackwell-arm64
-            build_args: CUDA_COMPUTE_CAPS=121
+            build_args: CUDA_COMPUTE_CAPS=110;121
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     steps:
