@@ -218,9 +218,18 @@ async fn main() -> anyhow::Result<()> {
             let started = Instant::now();
             tracing::info!(model_id = %args.model_id, revision = %args.revision, "Resolving model snapshot");
             let outcome = sys1::hub::download_with_source(&args.model_id, &args.revision).await?;
-            // Includes Hub metadata resolution and cache checks as well as transfer time.
-            let download_ms = started.elapsed().as_millis();
-            tracing::info!(model_id = %args.model_id, path = %outcome.path.display(), download_ms, source = outcome.source.as_str(), "Model files ready");
+            let elapsed_ms = started.elapsed().as_millis();
+            tracing::info!(
+                model_id = %args.model_id,
+                path = %outcome.path.display(),
+                source = outcome.source.as_str(),
+                elapsed_ms,
+                total_files = outcome.total_files,
+                downloaded_files = outcome.downloaded_files,
+                cached_files = outcome.cached_files,
+                total_bytes = outcome.total_bytes,
+                "Model files ready"
+            );
             let architecture = models::Architecture::from_path(&outcome.path)?;
             (
                 outcome.path,
@@ -283,8 +292,9 @@ async fn main() -> anyhow::Result<()> {
     let app = api::router(batcher, args.max_request_bytes);
     let listener = tokio::net::TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
+    tracing::info!("Available API routes:");
     for &(method, route) in api::PUBLIC_ROUTES {
-        tracing::info!("[{method}] {route}");
+        tracing::info!("[{method:>4}] {route}");
     }
     tracing::info!(%address, "Server running");
     axum::serve(listener, app)
