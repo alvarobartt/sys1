@@ -1,0 +1,54 @@
+---
+source: src/models/clef.rs
+expression: image_cases
+---
+red:
+  input_tokens: 207
+  media_spans:
+    - - 37
+      - 64
+      - false
+  grids:
+    - - 1
+      - 16
+      - 16
+  choice: red
+blue:
+  input_tokens: 207
+  media_spans:
+    - - 37
+      - 64
+      - false
+  grids:
+    - - 1
+      - 16
+      - 16
+  choice: blue
+large_red:
+  input_tokens: 433
+  media_spans:
+    - - 37
+      - 300
+      - false
+  grids:
+    - - 1
+      - 30
+      - 40
+  choice: red
+red_then_blue:
+  input_tokens: 276
+  media_spans:
+    - - 37
+      - 64
+      - false
+    - - 103
+      - 64
+      - false
+  grids:
+    - - 1
+      - 16
+      - 16
+    - - 1
+      - 16
+      - 16
+  choice: blue

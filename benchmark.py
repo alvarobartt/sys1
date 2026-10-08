@@ -190,11 +190,6 @@ def resolve_spec(args: argparse.Namespace) -> DatasetSpec:
     )
 
 
-def dataset_cache_path(root: Path, spec: DatasetSpec) -> Path:
-    slug = spec.dataset.replace("/", "--")
-    return root / f"{slug}-{spec.revision}-{spec.config}-{spec.split}.json"
-
-
 async def download_rows(spec: DatasetSpec) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     offset = 0
@@ -264,7 +259,8 @@ def normalize_rows(rows: list[dict[str, Any]], schema: str) -> list[dict[str, An
 
 
 async def load_examples(spec: DatasetSpec, cache_root: Path) -> list[dict[str, Any]]:
-    path = dataset_cache_path(cache_root, spec)
+    slug = spec.dataset.replace("/", "--")
+    path = cache_root / f"{slug}-{spec.revision}-{spec.config}-{spec.split}.json"
     if path.is_file():
         document = json.loads(path.read_text())
         if document.get("dataset") != asdict(spec):
@@ -341,10 +337,6 @@ def token_count(tokenizer: Tokenizer, text: str) -> int:
     return len(tokenizer.encode(text, add_special_tokens=False).ids)
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def git_sha() -> str | None:
     try:
         return subprocess.check_output(
@@ -380,7 +372,7 @@ def metadata(
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "schema_version": 1,
-        "timestamp_utc": utc_now(),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "benchmark": benchmark,
         "benchmark_tool": "benchmark.py",
         "benchmark_tool_version": VERSION,
@@ -676,10 +668,6 @@ async def dataset_stats(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def synthetic_questions(count: int) -> dict[str, Any]:
-    return {f"q{index}": Q_NOUL if index % 2 else Q_CHOICE for index in range(count)}
-
-
 async def synthetic_latency(args: argparse.Namespace) -> dict[str, Any]:
     endpoint = f"{target_url(args.api_url)}{args.endpoint}"
     versions: set[str] = set()
@@ -689,7 +677,10 @@ async def synthetic_latency(args: argparse.Namespace) -> dict[str, Any]:
         for count in sorted(set(args.questions)):
             payload = {
                 "state": SYNTHETIC_STATE,
-                "questions": synthetic_questions(count),
+                "questions": {
+                    f"q{index}": Q_NOUL if index % 2 else Q_CHOICE
+                    for index in range(count)
+                },
             }
             elapsed: list[float] = []
             tokens: list[float] = []

@@ -1,4 +1,4 @@
-use super::AttentionImplementation;
+use crate::models::AttentionImplementation;
 #[cfg(feature = "cuda")]
 use candle_core::backend::BackendStorage;
 #[cfg(feature = "cuda")]
@@ -54,14 +54,6 @@ impl Config {
 
     pub fn max_position_embeddings(&self) -> usize {
         self.max_position_embeddings
-    }
-
-    fn global_rope_theta(&self) -> f64 {
-        self.rope_parameters["full_attention"].rope_theta
-    }
-
-    fn local_rope_theta(&self) -> f64 {
-        self.rope_parameters["sliding_attention"].rope_theta
     }
 }
 
@@ -237,14 +229,14 @@ impl Attention {
     }
 }
 
-pub(super) struct AttentionOptions<'a> {
+pub(crate) struct AttentionOptions<'a> {
     pub mask: Option<&'a Tensor>,
     pub implementation: AttentionImplementation,
     pub lengths: &'a [usize],
     pub window: Option<usize>,
 }
 
-pub(super) fn scaled_dot_product_attention(
+pub(crate) fn scaled_dot_product_attention(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -484,7 +476,7 @@ impl Module for Mlp {
 }
 
 #[cfg(feature = "cuda")]
-const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/modernbert.ptx"));
+const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/sys1.ptx"));
 
 #[cfg(feature = "cuda")]
 struct Geglu;
@@ -531,7 +523,7 @@ impl CustomOp1 for Geglu {
                 let input = storage.as_cuda_slice::<f32>()?.slice(start..end);
                 let output = unsafe { device.alloc::<f32>(count)? };
                 let function =
-                    device.get_or_load_custom_func("modernbert_geglu_f32", "modernbert", PTX)?;
+                    device.get_or_load_custom_func("modernbert_geglu_f32", "sys1", PTX)?;
                 let mut launch = function.builder();
                 launch.arg(&input).arg(&output).arg(&count_arg).arg(&inner);
                 unsafe { launch.launch(config) }.w()?;
@@ -541,7 +533,7 @@ impl CustomOp1 for Geglu {
                 let input = storage.as_cuda_slice::<f16>()?.slice(start..end);
                 let output = unsafe { device.alloc::<f16>(count)? };
                 let function =
-                    device.get_or_load_custom_func("modernbert_geglu_f16", "modernbert", PTX)?;
+                    device.get_or_load_custom_func("modernbert_geglu_f16", "sys1", PTX)?;
                 let mut launch = function.builder();
                 launch.arg(&input).arg(&output).arg(&count_arg).arg(&inner);
                 unsafe { launch.launch(config) }.w()?;
@@ -551,7 +543,7 @@ impl CustomOp1 for Geglu {
                 let input = storage.as_cuda_slice::<bf16>()?.slice(start..end);
                 let output = unsafe { device.alloc::<bf16>(count)? };
                 let function =
-                    device.get_or_load_custom_func("modernbert_geglu_bf16", "modernbert", PTX)?;
+                    device.get_or_load_custom_func("modernbert_geglu_bf16", "sys1", PTX)?;
                 let mut launch = function.builder();
                 launch.arg(&input).arg(&output).arg(&count_arg).arg(&inner);
                 unsafe { launch.launch(config) }.w()?;
@@ -661,7 +653,7 @@ impl CustomOp3 for RopeQkv {
                     .as_cuda_slice::<$type>()?
                     .slice(input_start..input_end);
                 let output = unsafe { device.alloc::<$type>(output_count)? };
-                let function = device.get_or_load_custom_func($kernel, "modernbert", PTX)?;
+                let function = device.get_or_load_custom_func($kernel, "sys1", PTX)?;
                 let mut launch = function.builder();
                 launch
                     .arg(&input)
@@ -865,13 +857,13 @@ impl Encoder {
         let global_rotary = Arc::new(RotaryEmbedding::new(
             vb.dtype(),
             config,
-            config.global_rope_theta(),
+            config.rope_parameters["full_attention"].rope_theta,
             vb.device(),
         )?);
         let local_rotary = Arc::new(RotaryEmbedding::new(
             vb.dtype(),
             config,
-            config.local_rope_theta(),
+            config.rope_parameters["sliding_attention"].rope_theta,
             vb.device(),
         )?);
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -909,7 +901,7 @@ impl Encoder {
             )?,
             local_attention_size: config.local_attention,
             implementation,
-            dtype: vb.dtype(),
+            dtype: compute_dtype,
             local_masks: Mutex::new(HashMap::new()),
         })
     }

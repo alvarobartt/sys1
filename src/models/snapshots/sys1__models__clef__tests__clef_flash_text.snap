@@ -1,0 +1,21 @@
+---
+source: src/models/clef.rs
+expression: text_cases
+---
+sky:
+  input_tokens: 132
+  choice: blue
+checkout:
+  input_tokens: 300
+  department: technical
+  urgency_type: score
+  urgency_legend:
+    "0": Can wait
+    "1": This week
+    "2": Today
+  outage_type: noul
+invoice:
+  input_tokens: 260
+  status: overdue
+  large_type: noul
+  large_positive: true

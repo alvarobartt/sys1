@@ -2,7 +2,40 @@ use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
-
+    if env::var_os("CARGO_FEATURE_METAL").is_some()
+        && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
+    {
+        println!("cargo:rerun-if-changed=src/kernels/qwen35.metal");
+        let output_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+        let air = output_dir.join("qwen35.air");
+        let library = output_dir.join("qwen35.metallib");
+        let metal = Command::new("xcrun")
+            .args([
+                "--toolchain",
+                "Metal",
+                "metal",
+                "-std=metal3.0",
+                "-c",
+                "src/kernels/qwen35.metal",
+                "-o",
+            ])
+            .arg(&air)
+            .status()
+            .expect("Failed to run the Metal compiler for Qwen3.5 kernels");
+        assert!(metal.success(), "Failed to compile Qwen3.5 Metal kernels");
+        let link = Command::new("xcrun")
+            .args(["--toolchain", "Metal", "metallib"])
+            .arg(&air)
+            .arg("-o")
+            .arg(&library)
+            .status()
+            .expect("Failed to run metallib for Qwen3.5 kernels");
+        assert!(link.success(), "Failed to link Qwen3.5 Metal kernels");
+        println!(
+            "cargo:rustc-env=SYS1_KERNEL_METALLIB_PATH={}",
+            library.display()
+        );
+    }
     if env::var_os("CARGO_FEATURE_CUDA").is_some() {
         let capability = compute_capability();
         let flash_attention_2 = env::var_os("CARGO_FEATURE_FLASH_ATTN_2").is_some();
@@ -23,21 +56,23 @@ fn main() {
             }
         }
 
+        println!("cargo:rerun-if-changed=src/kernels/sys1.cu");
         println!("cargo:rerun-if-changed=src/kernels/modernbert.cu");
-        let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("modernbert.ptx");
+        println!("cargo:rerun-if-changed=src/kernels/qwen35.cu");
+        let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("sys1.ptx");
         let status = Command::new("nvcc")
             .args([
                 "-ptx",
                 &format!("-arch=compute_{capability}"),
-                "src/kernels/modernbert.cu",
+                "src/kernels/sys1.cu",
                 "-o",
             ])
             .arg(&output)
             .status()
-            .expect("failed to run nvcc for ModernBERT CUDA kernels");
+            .expect("failed to run nvcc for CUDA kernels");
         assert!(
             status.success(),
-            "failed to compile ModernBERT CUDA kernels for compute capability {capability}"
+            "failed to compile CUDA kernels for compute capability {capability}"
         );
     }
 }

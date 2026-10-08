@@ -5,7 +5,7 @@ use crate::{
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, Extension, Request, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -77,8 +77,27 @@ pub fn router(batcher: Batcher, max_request_bytes: usize) -> Router {
         .route("/v1/decide", post(decide))
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
         .layer(DefaultBodyLimit::max(max_request_bytes.max(1)))
+        .layer(Extension(RequestLimit(max_request_bytes.max(1))))
         .layer(middleware::from_fn(trace_request))
         .with_state(batcher)
+}
+
+#[derive(Clone, Copy)]
+struct RequestLimit(usize);
+
+fn parse_decision_request(
+    request: Result<Json<DecisionRequest>, JsonRejection>,
+    max_request_bytes: usize,
+) -> Result<DecisionRequest, ApiError> {
+    match request {
+        Ok(Json(request)) => Ok(request),
+        Err(error) if error.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            Err(ApiError::payload_too_large(format!(
+                "request body exceeds {max_request_bytes} bytes; base64 images and videos count toward this limit. Resize or compress the media, use a URL, or increase --max-request-bytes"
+            )))
+        }
+        Err(error) => Err(ApiError::new(format!("invalid request JSON: {error}"))),
+    }
 }
 
 async fn trace_request(request: Request, next: Next) -> Response {
@@ -174,13 +193,16 @@ async fn models(State(batcher): State<Batcher>) -> Json<ModelMetadataList> {
     request_body = DecisionRequest,
     responses(
         (status = OK, description = "Decision generated", body = crate::schema::DecisionResponse),
-        (status = BAD_REQUEST, description = "Invalid request", body = ApiError)
+        (status = BAD_REQUEST, description = "Invalid request", body = ApiError),
+        (status = PAYLOAD_TOO_LARGE, description = "Request exceeds --max-request-bytes", body = ApiError)
     )
 )]
 async fn decide(
     State(batcher): State<Batcher>,
-    Json(request): Json<DecisionRequest>,
+    Extension(limit): Extension<RequestLimit>,
+    request: Result<Json<DecisionRequest>, JsonRejection>,
 ) -> Result<Json<crate::schema::DecisionResponse>, ApiError> {
+    let request = parse_decision_request(request, limit.0)?;
     batcher.predict(request).await.map(Json)
 }
 
@@ -193,16 +215,25 @@ async fn decide(
     responses(
         (status = OK, description = "Decision generated", body = crate::schema::DecisionResponse),
         (status = BAD_REQUEST, description = "Unknown model", body = ApiError),
-        (status = UNPROCESSABLE_ENTITY, description = "Validation error", body = HTTPValidationError)
+        (status = UNPROCESSABLE_ENTITY, description = "Validation error", body = HTTPValidationError),
+        (status = PAYLOAD_TOO_LARGE, description = "Request exceeds --max-request-bytes", body = ApiError)
     )
 )]
 async fn systemone(
     State(batcher): State<Batcher>,
+    Extension(limit): Extension<RequestLimit>,
     headers: HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let Json(value) = match payload {
         Ok(value) => value,
+        Err(error) if error.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return ApiError::payload_too_large(format!(
+                "request body exceeds {} bytes; base64 images and videos count toward this limit. Resize or compress the media, use a URL, or increase --max-request-bytes",
+                limit.0
+            ))
+            .into_response();
+        }
         Err(error) => {
             return validation_response(HTTPValidationError::single(
                 vec!["body".into()],
@@ -297,6 +328,14 @@ mod tests {
     struct TestModel;
 
     impl DecisionModel for TestModel {
+        fn supports_images(&self) -> bool {
+            true
+        }
+
+        fn supports_videos(&self) -> bool {
+            true
+        }
+
         fn predict_batch(
             &self,
             requests: Vec<DecisionRequest>,
@@ -374,6 +413,15 @@ mod tests {
                     .get(method.to_ascii_lowercase().as_str())
                     .is_some(),
                 "missing OpenAPI route [{method}] {path}"
+            );
+        }
+        for field in ["images", "videos"] {
+            assert!(
+                json["components"]["schemas"]["DecisionRequest"]["properties"][field]
+                    ["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Experimental")
             );
         }
 
@@ -673,17 +721,50 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_oversized_request_bodies() {
+        for path in ["/v1/decide", "/v1/systemone"] {
+            let response = test_router()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(vec![b' '; 2048]))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                error["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("--max-request-bytes")
+            );
+            assert!(error["error"].as_str().unwrap().contains("base64 images"));
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_image_and_video_sources_in_json_requests() {
         let response = test_router()
             .oneshot(
-                Request::post("/v1/decide")
+                Request::post("/v1/systemone")
                     .header("content-type", "application/json")
-                    .body(Body::from(vec![b' '; 2048]))
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "state": "test",
+                            "images": [{"bytes": [1, 2, 3]}],
+                            "videos": [{"base64": "AA=="}],
+                            "questions": {"q0": {"type": "noul"}}
+                        }))
+                        .unwrap(),
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
-
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

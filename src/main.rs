@@ -102,55 +102,52 @@ struct Args {
         help_heading = "Batching options"
     )]
     request_timeout_ms: u64,
-    /// Maximum request body size in bytes.
+    /// Maximum request body size in bytes, including base64 images and videos.
     #[arg(
         long,
         env,
-        default_value_t = 1_048_576,
+        default_value_t = 16_777_216,
         help_heading = "Server options"
     )]
     max_request_bytes: usize,
     /// Maximum model context length; uses the model configuration when omitted.
     #[arg(long, env, help_heading = "Model options")]
     max_model_len: Option<usize>,
-    /// Floating-point precision used for inference; defaults to the model precision.
+    /// Floating-point precision; omitted or auto uses the model's inference policy.
+    #[arg(short = 'd', long, env, value_enum, help_heading = "Model options")]
+    dtype: Option<Precision>,
+    /// Attention implementation used for inference.
     #[arg(
-        short = 'd',
+        short = 'a',
         long,
         env,
         value_enum,
-        default_value_t = Precision::Auto,
+        default_value_t = models::AttentionImplementation::Auto,
         help_heading = "Model options"
     )]
-    dtype: Precision,
-    /// Attention implementation; defaults to Flash for F16/BF16 when available.
-    #[arg(short = 'a', long, env, value_enum, help_heading = "Model options")]
-    attention: Option<models::AttentionImplementation>,
+    attention: models::AttentionImplementation,
 }
 
 impl Args {
-    fn attention(&self, dtype: DType) -> models::AttentionImplementation {
-        self.attention.unwrap_or_else(|| {
-            if matches!(dtype, DType::F16 | DType::BF16) {
-                if cfg!(feature = "flash-attn-2") {
-                    return models::AttentionImplementation::FlashAttention2;
-                }
-                if cfg!(feature = "flash-attn-3") {
-                    return models::AttentionImplementation::FlashAttention3;
-                }
-            }
-            models::AttentionImplementation::Eager
-        })
-    }
-
-    fn inference(
-        &self,
+    fn attention(
+        requested: models::AttentionImplementation,
         architecture: models::Architecture,
-    ) -> anyhow::Result<(DType, models::AttentionImplementation)> {
-        let dtype = self.dtype.resolve(architecture);
-        let attention = self.attention(dtype);
-        attention.validate(dtype)?;
-        Ok((dtype, attention))
+        dtype: DType,
+    ) -> models::AttentionImplementation {
+        if architecture != models::Architecture::Laya
+            || requested != models::AttentionImplementation::Auto
+        {
+            return requested;
+        }
+        if matches!(dtype, DType::F16 | DType::BF16) {
+            if cfg!(feature = "flash-attn-2") {
+                return models::AttentionImplementation::FlashAttention2;
+            }
+            if cfg!(feature = "flash-attn-3") {
+                return models::AttentionImplementation::FlashAttention3;
+            }
+        }
+        models::AttentionImplementation::Eager
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -176,6 +173,9 @@ impl Args {
             self.max_model_len != Some(0),
             "--max-model-len must be positive"
         );
+        if let Some(dtype) = self.dtype.filter(|dtype| *dtype != Precision::Auto) {
+            self.attention.validate(dtype.resolve_explicit())?;
+        }
         Ok(())
     }
 }
@@ -189,9 +189,9 @@ enum Precision {
 }
 
 impl Precision {
-    fn resolve(self, architecture: models::Architecture) -> DType {
+    fn resolve_explicit(self) -> DType {
         match self {
-            Self::Auto => architecture.default_dtype(),
+            Self::Auto => unreachable!("auto is resolved from model files"),
             Self::F32 => DType::F32,
             Self::F16 => DType::F16,
             Self::Bf16 => DType::BF16,
@@ -210,45 +210,73 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     args.validate()?;
-    let architecture = match &args.model_path {
-        Some(path) => models::Architecture::from_path(path)?,
-        None => models::Architecture::from_model_id(&args.model_id)?,
-    };
-    let (dtype, attention) = args.inference(architecture)?;
     sys1::validate_backend()?;
+    let backend = if cfg!(feature = "cuda") {
+        "cuda"
+    } else if cfg!(feature = "metal") {
+        "metal"
+    } else {
+        "cpu"
+    };
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        backend = backend(),
+        description = env!("CARGO_PKG_DESCRIPTION"),
+        backend,
         ?args,
-        ?dtype,
-        ?attention,
         "Starting sys1"
     );
     let address = SocketAddr::new(args.host, args.port);
-    let (model_path, source_name, source) = match args.model_path {
+    let (model_path, source_name, architecture, source) = match args.model_path {
         Some(path) => {
             if args.served_model_name.is_none() {
                 tracing::warn!("Set --served-model-name when using --model-path");
             }
             let name = path.display().to_string();
-            (path, name, "path")
+            let architecture = models::Architecture::from_path(&path)?;
+            (path, name, architecture, "path")
         }
         None => {
             let started = Instant::now();
+            tracing::info!(model_id = %args.model_id, revision = %args.revision, "Resolving model snapshot");
             let outcome = sys1::hub::download_with_source(&args.model_id, &args.revision).await?;
-            // Includes Hub metadata resolution and cache checks as well as transfer time.
-            let download_ms = started.elapsed().as_millis();
-            tracing::info!(download_ms, "Model files ready");
-            (outcome.path, args.model_id, outcome.source.as_str())
+            let elapsed_ms = started.elapsed().as_millis();
+            tracing::info!(
+                model_id = %args.model_id,
+                path = %outcome.path.display(),
+                source = outcome.source.as_str(),
+                elapsed_ms,
+                total_files = outcome.total_files,
+                downloaded_files = outcome.downloaded_files,
+                cached_files = outcome.cached_files,
+                total_bytes = outcome.total_bytes,
+                "Model files ready"
+            );
+            let architecture = models::Architecture::from_path(&outcome.path)?;
+            (
+                outcome.path,
+                args.model_id,
+                architecture,
+                outcome.source.as_str(),
+            )
         }
     };
+    let requested_dtype = args
+        .dtype
+        .filter(|dtype| *dtype != Precision::Auto)
+        .map(Precision::resolve_explicit);
+    let dtype = match requested_dtype {
+        Some(dtype) => dtype,
+        None => models::model_default_dtype(&model_path, architecture)?,
+    };
+    let attention = Args::attention(args.attention, architecture, dtype);
+    attention.validate(dtype)?;
     let served_model_name = args.served_model_name.unwrap_or(source_name);
     let started = Instant::now();
-    tracing::info!(source, ?architecture, "Loading model");
+    tracing::info!(model = %served_model_name, source, ?architecture, ?dtype, ?attention, path = %model_path.display(), "Loading model");
     let model = models::load(
         &model_path,
         architecture,
-        dtype,
+        requested_dtype,
         args.max_model_len,
         attention,
     )
@@ -279,8 +307,9 @@ async fn main() -> anyhow::Result<()> {
     let app = api::router(batcher, args.max_request_bytes);
     let listener = tokio::net::TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
+    tracing::info!("Available API routes:");
     for &(method, route) in api::PUBLIC_ROUTES {
-        tracing::info!("[{method}] {route}");
+        tracing::info!("[{method:>4}] {route}");
     }
     tracing::info!(%address, "Server running");
     axum::serve(listener, app)
@@ -308,16 +337,6 @@ async fn shutdown() {
     tracing::info!("Shutdown requested");
 }
 
-fn backend() -> &'static str {
-    if cfg!(feature = "cuda") {
-        "cuda"
-    } else if cfg!(feature = "metal") {
-        "metal"
-    } else {
-        "cpu"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,28 +356,15 @@ mod tests {
         assert_eq!(args.max_questions_per_request, 64);
         assert_eq!(args.max_queue_size, 256);
         assert_eq!(args.request_timeout_ms, 30_000);
-        assert_eq!(args.max_request_bytes, 1_048_576);
+        assert_eq!(args.max_request_bytes, 16_777_216);
         assert_eq!(args.max_model_len, None);
-        assert_eq!(args.dtype, Precision::Auto);
-        let (dtype, attention) = args.inference(models::Architecture::Laya).unwrap();
-        assert_eq!(dtype, models::Architecture::Laya.default_dtype());
-        assert_eq!(
-            attention,
-            if cfg!(feature = "cuda") && cfg!(feature = "flash-attn-2") {
-                models::AttentionImplementation::FlashAttention2
-            } else if cfg!(feature = "cuda") && cfg!(feature = "flash-attn-3") {
-                models::AttentionImplementation::FlashAttention3
-            } else {
-                models::AttentionImplementation::Eager
-            }
-        );
+        assert_eq!(args.dtype, None);
+        assert_eq!(args.attention, models::AttentionImplementation::Auto);
     }
 
     #[test]
     fn accepts_a_local_model_path() {
-        let args =
-            Args::try_parse_from(["sys1", "--model-path", "/models/laya", "--dtype", "auto"])
-                .unwrap();
+        let args = Args::try_parse_from(["sys1", "--model-path", "/models/laya"]).unwrap();
         assert_eq!(args.model_path, Some(PathBuf::from("/models/laya")));
     }
 
@@ -394,11 +400,8 @@ mod tests {
         assert_eq!(args.port, 8080);
         assert_eq!(args.max_batch_size, 4);
         assert_eq!(args.request_timeout_ms, 100);
-        assert_eq!(args.dtype, Precision::F16);
-        assert_eq!(
-            args.inference(models::Architecture::Laya).unwrap().1,
-            models::AttentionImplementation::Eager
-        );
+        assert_eq!(args.dtype, Some(Precision::F16));
+        assert_eq!(args.attention, models::AttentionImplementation::Eager);
     }
 
     #[test]
@@ -452,54 +455,57 @@ mod tests {
     }
 
     #[test]
-    fn resolves_dtype_and_default_attention() {
-        let architecture = models::Architecture::Laya;
-        assert_eq!(Precision::F32.resolve(architecture), DType::F32);
-        assert_eq!(Precision::F16.resolve(architecture), DType::F16);
-        assert_eq!(Precision::Bf16.resolve(architecture), DType::BF16);
-        assert_eq!(
-            Precision::Auto.resolve(architecture),
-            architecture.default_dtype()
-        );
+    fn resolves_explicit_dtypes() {
+        assert_eq!(Precision::F32.resolve_explicit(), DType::F32);
+        assert_eq!(Precision::F16.resolve_explicit(), DType::F16);
+        assert_eq!(Precision::Bf16.resolve_explicit(), DType::BF16);
+        let args = Args::try_parse_from(["sys1", "--dtype", "bf16"]).unwrap();
+        assert_eq!(args.dtype, Some(Precision::Bf16));
+        let args = Args::try_parse_from(["sys1", "--dtype", "auto"]).unwrap();
+        assert_eq!(args.dtype, Some(Precision::Auto));
 
-        let default_low_precision_attention = if cfg!(feature = "flash-attn-2") {
+        let args = Args::try_parse_from(["sys1", "--attention", "flash-attn-2"]).unwrap();
+        assert_eq!(
+            args.attention,
+            models::AttentionImplementation::FlashAttention2
+        );
+    }
+
+    #[test]
+    fn defaults_to_available_flash_attention_for_laya() {
+        let args = Args::try_parse_from(["sys1"]).unwrap();
+        assert_eq!(
+            Args::attention(args.attention, models::Architecture::Laya, DType::F32),
+            models::AttentionImplementation::Eager
+        );
+        let low_precision = if cfg!(feature = "flash-attn-2") {
             models::AttentionImplementation::FlashAttention2
         } else if cfg!(feature = "flash-attn-3") {
             models::AttentionImplementation::FlashAttention3
         } else {
             models::AttentionImplementation::Eager
         };
-        for dtype in ["f16", "bf16"] {
-            let args = Args::try_parse_from(["sys1", "--dtype", dtype]).unwrap();
-            assert_eq!(
-                args.inference(architecture).unwrap().1,
-                default_low_precision_attention
-            );
-        }
-
-        let args = Args::try_parse_from(["sys1", "--dtype", "f32"]).unwrap();
         assert_eq!(
-            args.inference(architecture).unwrap().1,
-            models::AttentionImplementation::Eager
+            Args::attention(args.attention, models::Architecture::Laya, DType::F16),
+            low_precision
         );
-
-        let args = Args::try_parse_from(["sys1", "--attention", "flash-attn-2", "--dtype", "f16"])
-            .unwrap();
         assert_eq!(
-            args.attention(DType::F16),
-            models::AttentionImplementation::FlashAttention2
+            Args::attention(args.attention, models::Architecture::Laya, DType::BF16),
+            low_precision
+        );
+        assert_eq!(
+            Args::attention(args.attention, models::Architecture::Qwen35, DType::BF16),
+            models::AttentionImplementation::Auto
         );
     }
 
     #[test]
     fn accepts_a_model_length_override() {
-        let args =
-            Args::try_parse_from(["sys1", "--max-model-len", "8192", "--dtype", "auto"]).unwrap();
+        let args = Args::try_parse_from(["sys1", "--max-model-len", "8192"]).unwrap();
         assert_eq!(args.max_model_len, Some(8192));
         assert!(args.validate().is_ok());
 
-        let args =
-            Args::try_parse_from(["sys1", "--max-model-len", "0", "--dtype", "auto"]).unwrap();
+        let args = Args::try_parse_from(["sys1", "--max-model-len", "0"]).unwrap();
         assert!(args.validate().is_err());
     }
 
@@ -512,8 +518,6 @@ mod tests {
                 "owner/model",
                 "--model-path",
                 "/models/laya",
-                "--dtype",
-                "auto",
             ])
             .is_err()
         );
@@ -527,14 +531,11 @@ mod tests {
             "8",
             "--max-questions-per-request",
             "9",
-            "--dtype",
-            "auto",
         ])
         .unwrap();
         assert!(args.validate().is_err());
 
-        let args =
-            Args::try_parse_from(["sys1", "--max-queue-size", "0", "--dtype", "auto"]).unwrap();
+        let args = Args::try_parse_from(["sys1", "--max-queue-size", "0"]).unwrap();
         assert!(args.validate().is_err());
     }
 
@@ -542,21 +543,6 @@ mod tests {
     fn rejects_flash_attention_with_f32() {
         let args = Args::try_parse_from(["sys1", "--attention", "flash-attn-3", "--dtype", "f32"])
             .unwrap();
-        assert!(args.inference(models::Architecture::Laya).is_err());
-    }
-
-    #[cfg(feature = "flash-attn-2")]
-    #[test]
-    fn flash_attention_2_requires_f16_or_bf16() {
-        let args = Args::try_parse_from(["sys1", "--attention", "flash-attn-2", "--dtype", "f32"])
-            .unwrap();
-        assert!(args.inference(models::Architecture::Laya).is_err());
-
-        for dtype in ["auto", "f16", "bf16"] {
-            let args =
-                Args::try_parse_from(["sys1", "--attention", "flash-attn-2", "--dtype", dtype])
-                    .unwrap();
-            assert!(args.inference(models::Architecture::Laya).is_ok());
-        }
+        assert!(args.validate().is_err());
     }
 }
