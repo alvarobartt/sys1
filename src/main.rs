@@ -271,7 +271,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
     for &(method, route) in api::PUBLIC_ROUTES {
-        tracing::info!(method, route, "Route registered");
+        tracing::info!("[{method:>4}] {route}");
     }
     tracing::info!(%address, "Server running");
     axum::serve(listener, app)

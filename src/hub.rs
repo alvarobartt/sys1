@@ -129,6 +129,10 @@ fn overall_bar(total_bytes: u64) -> ProgressBar {
     bar
 }
 
+fn duration_ms(duration: Duration) -> f64 {
+    (duration.as_secs_f64() * 1_000_000.0).round() / 1_000.0
+}
+
 impl ProgressHandler for DownloadProgress {
     fn on_progress(&self, event: &ProgressEvent) {
         let ProgressEvent::Download(event) = event else {
@@ -401,8 +405,7 @@ pub async fn download_with_source(
             Some((
                 filename.clone(),
                 file.total.max(file.bytes),
-                file.download_elapsed
-                    .map(|elapsed| elapsed.as_secs_f64() * 1_000.0),
+                file.download_elapsed.map(duration_ms),
             ))
         }));
         for (filename, file) in &state.files {
@@ -411,8 +414,7 @@ pub async fn download_with_source(
                     incomplete_files.push((
                         filename.clone(),
                         file.total.max(file.bytes),
-                        file.started_at
-                            .map(|start| start.elapsed().as_secs_f64() * 1_000.0),
+                        file.started_at.map(|start| duration_ms(start.elapsed())),
                     ));
                 }
                 if path.is_ok() {
@@ -488,6 +490,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TOKEN_TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn download_durations_are_rounded_to_three_decimal_places() {
+        assert!((duration_ms(Duration::from_nanos(1_234_567)) - 1.235).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn token_file_precedes_env_and_hf_home_precedes_default_home() {
