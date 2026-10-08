@@ -6,7 +6,7 @@
   />
   <br/>
   <em>
-    Blazing fast, self-hosted structured decisions for open-weight models with a TypeSafe AI compatible API, written in Rust.
+    Blazing fast, self-hosted structured decisions for open models with a TypeSafe AI compatible API, written in Rust.
   </em>
 </div>
 
@@ -53,9 +53,7 @@ curl http://localhost:3000/v1/systemone \
     -H "Content-Type: application/json" \
     -d '{
       "model": "convaiinnovations/laya",
-      "state": {
-        "message": "I was charged twice for invoice 4411. Please refund me today."
-      },
+      "state": "I was charged twice for invoice 4411. Please refund me today.",
       "questions": {
         "route": {
           "type": "choice",
@@ -93,7 +91,7 @@ client = TypeSafeClient(base_url="http://localhost:3000", api_key="-")
 
 response = client.system_one(
     model="convaiinnovations/laya",
-    state={"message": "I was charged twice for invoice 4411."},
+    state="I was charged twice for invoice 4411.",
     questions={
         "route": Choice(
             instructions="Where should this ticket go?",
