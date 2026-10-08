@@ -270,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
     let app = api::router(batcher, args.max_request_bytes);
     let listener = tokio::net::TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
+    tracing::info!("Available API routes:");
     for &(method, route) in api::PUBLIC_ROUTES {
         tracing::info!("[{method:>4}] {route}");
     }
