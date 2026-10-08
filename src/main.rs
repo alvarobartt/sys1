@@ -1,6 +1,6 @@
 use anyhow::Context;
 use candle_core::DType;
-use clap::{Parser, ValueEnum};
+use clap::{ArgGroup, Parser, ValueEnum};
 use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
@@ -15,26 +15,22 @@ use sys1::{
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(
+    version,
+    about,
+    group(
+        ArgGroup::new("model_source")
+            .required(true)
+            .multiple(false)
+            .args(["model_id", "model_path"])
+    )
+)]
 struct Args {
     /// Hugging Face model repository to load.
-    #[arg(
-        short = 'm',
-        long,
-        env,
-        default_value = "convaiinnovations/laya",
-        conflicts_with = "model_path",
-        help_heading = "Model options"
-    )]
-    model_id: String,
+    #[arg(short = 'm', long, env, help_heading = "Model options")]
+    model_id: Option<String>,
     /// Local model directory to load instead of a Hugging Face repository.
-    #[arg(
-        short = 'M',
-        long,
-        env,
-        conflicts_with = "model_id",
-        help_heading = "Model options"
-    )]
+    #[arg(short = 'M', long, env, help_heading = "Model options")]
     model_path: Option<PathBuf>,
     /// Hugging Face model revision (branch, tag, or commit).
     #[arg(
@@ -221,8 +217,8 @@ async fn main() -> anyhow::Result<()> {
         "Starting sys1"
     );
     let address = SocketAddr::new(args.host, args.port);
-    let (model_path, source_name, architecture, source) = match args.model_path {
-        Some(path) => {
+    let (model_path, source_name, architecture, source) = match (args.model_path, args.model_id) {
+        (Some(path), None) => {
             if args.served_model_name.is_none() {
                 tracing::warn!("Set --served-model-name when using --model-path");
             }
@@ -230,13 +226,13 @@ async fn main() -> anyhow::Result<()> {
             let architecture = models::Architecture::from_path(&path)?;
             (path, name, architecture, "path")
         }
-        None => {
+        (None, Some(model_id)) => {
             let started = Instant::now();
-            tracing::info!(model_id = %args.model_id, revision = %args.revision, "Resolving model snapshot");
-            let outcome = sys1::hub::download_with_source(&args.model_id, &args.revision).await?;
+            tracing::info!(%model_id, revision = %args.revision, "Resolving model snapshot");
+            let outcome = sys1::hub::download_with_source(&model_id, &args.revision).await?;
             let elapsed_ms = started.elapsed().as_millis();
             tracing::info!(
-                model_id = %args.model_id,
+                %model_id,
                 path = %outcome.path.display(),
                 source = outcome.source.as_str(),
                 elapsed_ms,
@@ -249,11 +245,12 @@ async fn main() -> anyhow::Result<()> {
             let architecture = models::Architecture::from_path(&outcome.path)?;
             (
                 outcome.path,
-                args.model_id,
+                model_id,
                 architecture,
                 outcome.source.as_str(),
             )
         }
+        _ => unreachable!("model source is validated by clap"),
     };
     let requested_dtype = args
         .dtype
@@ -338,9 +335,10 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn defaults_to_laya_on_hugging_face() {
-        let args = Args::try_parse_from(["sys1"]).unwrap();
-        assert_eq!(args.model_id, "convaiinnovations/laya");
+    fn requires_a_model_source() {
+        assert!(Args::try_parse_from(["sys1"]).is_err());
+        let args = Args::try_parse_from(["sys1", "--model-id", "owner/model"]).unwrap();
+        assert_eq!(args.model_id.as_deref(), Some("owner/model"));
         assert_eq!(args.revision, "main");
         assert_eq!(args.model_path, None);
         assert_eq!(args.served_model_name, None);
@@ -388,7 +386,7 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(args.model_id, "owner/model");
+        assert_eq!(args.model_id.as_deref(), Some("owner/model"));
         assert_eq!(args.revision, "release");
         assert_eq!(args.served_model_name.as_deref(), Some("public-name"));
         assert_eq!(args.host, "127.0.0.1".parse::<IpAddr>().unwrap());
@@ -446,7 +444,7 @@ mod tests {
         assert!(help.contains("Batching options:"));
         assert!(!help.contains("Inference options:"));
         assert!(help.contains("[env: MODEL_ID=]"));
-        assert!(help.contains("[default: convaiinnovations/laya]"));
+        assert!(!help.contains("[default: convaiinnovations/laya]"));
     }
 
     #[test]
@@ -454,12 +452,21 @@ mod tests {
         assert_eq!(Precision::F32.resolve_explicit(), DType::F32);
         assert_eq!(Precision::F16.resolve_explicit(), DType::F16);
         assert_eq!(Precision::Bf16.resolve_explicit(), DType::BF16);
-        let args = Args::try_parse_from(["sys1", "--dtype", "bf16"]).unwrap();
+        let args =
+            Args::try_parse_from(["sys1", "--model-id", "owner/model", "--dtype", "bf16"]).unwrap();
         assert_eq!(args.dtype, Some(Precision::Bf16));
-        let args = Args::try_parse_from(["sys1", "--dtype", "auto"]).unwrap();
+        let args =
+            Args::try_parse_from(["sys1", "--model-id", "owner/model", "--dtype", "auto"]).unwrap();
         assert_eq!(args.dtype, Some(Precision::Auto));
 
-        let args = Args::try_parse_from(["sys1", "--attention", "flash-attn-2"]).unwrap();
+        let args = Args::try_parse_from([
+            "sys1",
+            "--model-id",
+            "owner/model",
+            "--attention",
+            "flash-attn-2",
+        ])
+        .unwrap();
         assert_eq!(
             args.attention,
             models::AttentionImplementation::FlashAttention2
@@ -468,7 +475,7 @@ mod tests {
 
     #[test]
     fn defaults_to_available_flash_attention_for_laya() {
-        let args = Args::try_parse_from(["sys1"]).unwrap();
+        let args = Args::try_parse_from(["sys1", "--model-id", "owner/model"]).unwrap();
         assert_eq!(
             Args::attention(args.attention, models::Architecture::Laya, DType::F32),
             models::AttentionImplementation::Eager
@@ -494,11 +501,20 @@ mod tests {
 
     #[test]
     fn accepts_a_model_length_override() {
-        let args = Args::try_parse_from(["sys1", "--max-model-len", "8192"]).unwrap();
+        let args = Args::try_parse_from([
+            "sys1",
+            "--model-id",
+            "owner/model",
+            "--max-model-len",
+            "8192",
+        ])
+        .unwrap();
         assert_eq!(args.max_model_len, Some(8192));
         assert!(args.validate().is_ok());
 
-        let args = Args::try_parse_from(["sys1", "--max-model-len", "0"]).unwrap();
+        let args =
+            Args::try_parse_from(["sys1", "--model-id", "owner/model", "--max-model-len", "0"])
+                .unwrap();
         assert!(args.validate().is_err());
     }
 
@@ -520,6 +536,8 @@ mod tests {
     fn rejects_invalid_capacity_configuration() {
         let args = Args::try_parse_from([
             "sys1",
+            "--model-id",
+            "owner/model",
             "--max-batch-questions",
             "8",
             "--max-questions-per-request",
@@ -528,14 +546,24 @@ mod tests {
         .unwrap();
         assert!(args.validate().is_err());
 
-        let args = Args::try_parse_from(["sys1", "--max-queue-size", "0"]).unwrap();
+        let args =
+            Args::try_parse_from(["sys1", "--model-id", "owner/model", "--max-queue-size", "0"])
+                .unwrap();
         assert!(args.validate().is_err());
     }
 
     #[test]
     fn rejects_flash_attention_with_f32() {
-        let args = Args::try_parse_from(["sys1", "--attention", "flash-attn-2", "--dtype", "f32"])
-            .unwrap();
+        let args = Args::try_parse_from([
+            "sys1",
+            "--model-id",
+            "owner/model",
+            "--attention",
+            "flash-attn-2",
+            "--dtype",
+            "f32",
+        ])
+        .unwrap();
         assert!(args.validate().is_err());
     }
 }
