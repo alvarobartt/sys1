@@ -102,6 +102,40 @@ response = client.system_one(
 print(response.choices["route"].choice)
 ```
 
+Alternatively, if you were to deploy [`Cloudflare/clef-flash`](https://huggingface.co/Cloudflare/clef-flash) or any other model with vision capabilities as:
+
+```bash
+cargo install sys1 --features cuda,flash-attn-2 --no-default-features
+sys1 --model-id Cloudflare/clef-flash --dtype bf16 --attention flash-attn-2
+```
+
+Then you can send requests to `/v1/systemone` with `images` or `videos` (it accepts public HTTP(s) URLs, raw base64 strings, base64 data URLs, or embedded objects).
+
+```json
+curl http://localhost:3000/v1/systemone \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "Cloudflare/clef-flash",
+      "state": "Classify the attached document.",
+      "images": [
+        "https://huggingface.co/datasets/hf-internal-testing/fixtures_ocr/resolve/main/SROIE-receipt.jpeg"
+      ],
+      "questions": {
+        "document_type": {
+          "type": "choice",
+          "instructions": "What kind of document is this?",
+          "criteria": {
+            "receipt": "proof of a completed purchase",
+            "invoice": "a request for payment",
+            "other": "neither a receipt nor an invoice"
+          }
+        }
+      }
+    }'
+```
+
+And, note it won't be accepted via the TypeSafe AI SDKs as it's not officially supported in the TypeSafe AI API Spec.
+
 ## References
 
 - [TypeSafe AI API](https://docs.typesafe.ai/api)
