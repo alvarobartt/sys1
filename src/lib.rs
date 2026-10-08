@@ -16,9 +16,13 @@ compile_error!("the `metal` feature is only supported when targeting macOS");
 compile_error!("the `cuda` feature is not supported when targeting macOS");
 
 pub mod api;
+pub(crate) mod archs;
 pub mod batching;
 mod device;
 pub mod hub;
+#[cfg(feature = "metal")]
+pub(crate) mod kernels;
+pub(crate) mod media;
 mod metrics;
 pub mod models;
 pub mod schema;

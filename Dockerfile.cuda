@@ -50,6 +50,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 
 COPY --from=planner /app/recipe.json recipe.json
+COPY src/kernels ./src/kernels
 
 ARG CUDA_COMPUTE_CAPS
 ARG SCCACHE_GHA_ENABLED=off
@@ -69,14 +70,14 @@ RUN --mount=type=cache,id=sys1-sccache,target=/root/.cache/sccache,sharing=locke
         unset SCCACHE_GHA_ENABLED; \
     fi; \
     if ! printf '%s\n' "${CUDA_COMPUTE_CAPS}" \
-        | grep -Eq '^(75|80|86|89|90|100|120|121)(;(75|80|86|89|90|100|120|121))*$'; then \
+        | grep -Eq '^(75|80|86|87|88|89|90|100|103|110|120|121)(;(75|80|86|87|88|89|90|100|103|110|120|121))*$'; then \
         echo "unsupported CUDA compute capabilities: ${CUDA_COMPUTE_CAPS}" >&2; \
         exit 1; \
     fi; \
     compute_caps="$(printf '%s' "${CUDA_COMPUTE_CAPS}" | tr ';' ' ')"; \
     for compute_cap in ${compute_caps}; do \
         case "${compute_cap}" in \
-            80|86|89|90) features=cuda,flash-attn-2 ;; \
+            80|86|87|88|89|90) features=cuda,flash-attn-2 ;; \
             *) features=cuda ;; \
         esac; \
         CUDA_COMPUTE_CAP="${compute_cap}" \
@@ -113,7 +114,7 @@ RUN --mount=type=cache,id=sys1-sccache,target=/root/.cache/sccache,sharing=locke
     install -d /app/bin; \
     for compute_cap do \
         case "${compute_cap}" in \
-            80|86|89|90) features=cuda,flash-attn-2 ;; \
+            80|86|87|88|89|90) features=cuda,flash-attn-2 ;; \
             *) features=cuda ;; \
         esac; \
         CUDA_COMPUTE_CAP="${compute_cap}" \
@@ -135,11 +136,12 @@ RUN --mount=type=cache,id=sys1-sccache,target=/root/.cache/sccache,sharing=locke
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
 
 ARG CUDA_COMPAT_VERSION
+ARG FFMPEG_VERSION=7:6.1.1-3ubuntu5
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates "cuda-compat-${CUDA_COMPAT_VERSION}" \
+        ca-certificates "ffmpeg=${FFMPEG_VERSION}" "cuda-compat-${CUDA_COMPAT_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --system --uid 10001 --user-group --create-home sys1 \

@@ -10,6 +10,10 @@ on:
       source_sha:
         required: true
         type: string
+      publish_main:
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   commit:
@@ -34,8 +38,12 @@ jobs:
             expected_platforms: linux/amd64
           - name: ampere
             suffix: -ampere
-            source_suffixes: -ampere-amd64
-            expected_platforms: linux/amd64
+            source_suffixes: |-
+              -ampere-amd64
+              -ampere-arm64
+            expected_platforms: |-
+              linux/amd64
+              linux/arm64
           - name: ada-lovelace
             suffix: -ada-lovelace
             source_suffixes: -ada-lovelace-amd64
@@ -69,8 +77,8 @@ jobs:
           tags: |
             type=raw,value=${{ inputs.source_sha }}${{ matrix.suffix }}
             type=raw,value=${{ inputs.source_sha }},enable=${{ matrix.name == 'cpu' }}
-            type=raw,value=main${{ matrix.suffix }}
-            type=raw,value=main,enable=${{ matrix.name == 'cpu' }}
+            type=raw,value=main${{ matrix.suffix }},enable=${{ inputs.publish_main }}
+            type=raw,value=main,enable=${{ inputs.publish_main && matrix.name == 'cpu' }}
       - name: Push
         env:
           DESTINATION_TAGS: ${{ steps.metadata.outputs.tags }}

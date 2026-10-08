@@ -19,6 +19,13 @@ const MODEL_FILES: &[&str] = &[
     "model.safetensors",
     "rl_agent_config.json",
     "tokenizer/tokenizer.json",
+    "config.json",
+    "joint_head_config.json",
+    "joint_head.safetensors",
+    "model-*.safetensors",
+    "model.safetensors.index.json",
+    "tokenizer.json",
+    "processor_config.json",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

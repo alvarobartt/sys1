@@ -1154,6 +1154,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags 2.13.2",
+ "block2",
+ "libc",
  "objc2",
 ]
 
@@ -3482,6 +3484,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -4090,17 +4093,24 @@ version = "0.0.3"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "candle-core",
  "candle-flash-attn",
  "candle-flash-attn-v3",
+ "candle-metal-kernels",
  "candle-nn",
  "clap",
+ "dispatch2",
+ "half",
  "hf-hub",
  "indicatif",
  "insta",
+ "objc2-metal",
  "prometheus",
+ "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokenizers 1.0.0-rc.2",
  "tokio",
  "tower",

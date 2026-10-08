@@ -1,4 +1,4 @@
-use super::AttentionImplementation;
+use crate::models::AttentionImplementation;
 use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::{
     Embedding, LayerNorm, Linear, Module, VarBuilder, embedding, layer_norm_no_bias, ops::softmax,
@@ -43,14 +43,6 @@ impl Config {
 
     pub fn max_position_embeddings(&self) -> usize {
         self.max_position_embeddings
-    }
-
-    fn global_rope_theta(&self) -> f64 {
-        self.rope_parameters["full_attention"].rope_theta
-    }
-
-    fn local_rope_theta(&self) -> f64 {
-        self.rope_parameters["sliding_attention"].rope_theta
     }
 }
 
@@ -196,14 +188,14 @@ impl Attention {
     }
 }
 
-pub(super) struct AttentionOptions<'a> {
+pub(crate) struct AttentionOptions<'a> {
     pub mask: Option<&'a Tensor>,
     pub implementation: AttentionImplementation,
     pub lengths: &'a [usize],
     pub window: Option<usize>,
 }
 
-pub(super) fn scaled_dot_product_attention(
+pub(crate) fn scaled_dot_product_attention(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -534,13 +526,13 @@ impl Encoder {
         let global_rotary = Arc::new(RotaryEmbedding::new(
             vb.dtype(),
             config,
-            config.global_rope_theta(),
+            config.rope_parameters["full_attention"].rope_theta,
             vb.device(),
         )?);
         let local_rotary = Arc::new(RotaryEmbedding::new(
             vb.dtype(),
             config,
-            config.local_rope_theta(),
+            config.rope_parameters["sliding_attention"].rope_theta,
             vb.device(),
         )?);
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -577,7 +569,7 @@ impl Encoder {
                 vb.pp("model.final_norm"),
             )?,
             local_attention_size: config.local_attention,
-            dtype: vb.dtype(),
+            dtype: compute_dtype,
             local_masks: Mutex::new(HashMap::new()),
         })
     }
