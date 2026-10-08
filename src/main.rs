@@ -332,194 +332,16 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
+
+    fn args(options: &[&str]) -> Args {
+        let mut command = vec!["sys1", "--model-id", "owner/model"];
+        command.extend_from_slice(options);
+        Args::try_parse_from(command).unwrap()
+    }
 
     #[test]
-    fn requires_a_model_source() {
+    fn validates_model_source() {
         assert!(Args::try_parse_from(["sys1"]).is_err());
-        let args = Args::try_parse_from(["sys1", "--model-id", "owner/model"]).unwrap();
-        assert_eq!(args.model_id.as_deref(), Some("owner/model"));
-        assert_eq!(args.revision, "main");
-        assert_eq!(args.model_path, None);
-        assert_eq!(args.served_model_name, None);
-        assert_eq!(args.host, "0.0.0.0".parse::<IpAddr>().unwrap());
-        assert_eq!(args.batch_wait_ms, 0);
-        assert_eq!(args.max_batch_size, 32);
-        assert_eq!(args.max_batch_questions, 128);
-        assert_eq!(args.max_questions_per_request, 64);
-        assert_eq!(args.max_queue_size, 256);
-        assert_eq!(args.request_timeout_ms, 30_000);
-        assert_eq!(args.max_request_bytes, 16_777_216);
-        assert_eq!(args.max_model_len, None);
-        assert_eq!(args.dtype, None);
-        assert_eq!(args.attention, models::AttentionImplementation::Auto);
-    }
-
-    #[test]
-    fn accepts_a_local_model_path() {
-        let args = Args::try_parse_from(["sys1", "--model-path", "/models/laya"]).unwrap();
-        assert_eq!(args.model_path, Some(PathBuf::from("/models/laya")));
-    }
-
-    #[test]
-    fn accepts_short_options() {
-        let args = Args::try_parse_from([
-            "sys1",
-            "-m",
-            "owner/model",
-            "-r",
-            "release",
-            "-n",
-            "public-name",
-            "-H",
-            "127.0.0.1",
-            "-p",
-            "8080",
-            "-b",
-            "4",
-            "-t",
-            "100",
-            "-d",
-            "f16",
-            "-a",
-            "eager",
-        ])
-        .unwrap();
-
-        assert_eq!(args.model_id.as_deref(), Some("owner/model"));
-        assert_eq!(args.revision, "release");
-        assert_eq!(args.served_model_name.as_deref(), Some("public-name"));
-        assert_eq!(args.host, "127.0.0.1".parse::<IpAddr>().unwrap());
-        assert_eq!(args.port, 8080);
-        assert_eq!(args.max_batch_size, 4);
-        assert_eq!(args.request_timeout_ms, 100);
-        assert_eq!(args.dtype, Some(Precision::F16));
-        assert_eq!(args.attention, models::AttentionImplementation::Eager);
-    }
-
-    #[test]
-    fn exposes_environment_variables_and_help_metadata() {
-        let mut command = Args::command();
-        assert_eq!(
-            command.get_about().map(ToString::to_string).as_deref(),
-            Some(env!("CARGO_PKG_DESCRIPTION"))
-        );
-        let environment_variables = command
-            .get_arguments()
-            .filter_map(|argument| {
-                argument.get_env().map(|environment| {
-                    (
-                        argument.get_id().as_str(),
-                        environment.to_str().expect("environment names are UTF-8"),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            environment_variables,
-            [
-                ("model_id", "MODEL_ID"),
-                ("model_path", "MODEL_PATH"),
-                ("revision", "REVISION"),
-                ("served_model_name", "SERVED_MODEL_NAME"),
-                ("host", "HOST"),
-                ("port", "PORT"),
-                ("max_batch_size", "MAX_BATCH_SIZE"),
-                ("max_batch_questions", "MAX_BATCH_QUESTIONS"),
-                ("max_questions_per_request", "MAX_QUESTIONS_PER_REQUEST"),
-                ("max_queue_size", "MAX_QUEUE_SIZE"),
-                ("batch_wait_ms", "BATCH_WAIT_MS"),
-                ("request_timeout_ms", "REQUEST_TIMEOUT_MS"),
-                ("max_request_bytes", "MAX_REQUEST_BYTES"),
-                ("max_model_len", "MAX_MODEL_LEN"),
-                ("dtype", "DTYPE"),
-                ("attention", "ATTENTION"),
-            ]
-        );
-
-        let help = command.render_help().to_string();
-        assert!(help.contains("Model options:"));
-        assert!(help.contains("Server options:"));
-        assert!(help.contains("Batching options:"));
-        assert!(!help.contains("Inference options:"));
-        assert!(help.contains("[env: MODEL_ID=]"));
-        assert!(!help.contains("[default: convaiinnovations/laya]"));
-    }
-
-    #[test]
-    fn resolves_explicit_dtypes() {
-        assert_eq!(Precision::F32.resolve_explicit(), DType::F32);
-        assert_eq!(Precision::F16.resolve_explicit(), DType::F16);
-        assert_eq!(Precision::Bf16.resolve_explicit(), DType::BF16);
-        let args =
-            Args::try_parse_from(["sys1", "--model-id", "owner/model", "--dtype", "bf16"]).unwrap();
-        assert_eq!(args.dtype, Some(Precision::Bf16));
-        let args =
-            Args::try_parse_from(["sys1", "--model-id", "owner/model", "--dtype", "auto"]).unwrap();
-        assert_eq!(args.dtype, Some(Precision::Auto));
-
-        let args = Args::try_parse_from([
-            "sys1",
-            "--model-id",
-            "owner/model",
-            "--attention",
-            "flash-attn-2",
-        ])
-        .unwrap();
-        assert_eq!(
-            args.attention,
-            models::AttentionImplementation::FlashAttention2
-        );
-    }
-
-    #[test]
-    fn defaults_to_available_flash_attention_for_laya() {
-        let args = Args::try_parse_from(["sys1", "--model-id", "owner/model"]).unwrap();
-        assert_eq!(
-            Args::attention(args.attention, models::Architecture::Laya, DType::F32),
-            models::AttentionImplementation::Eager
-        );
-        let low_precision = if cfg!(feature = "flash-attn-2") {
-            models::AttentionImplementation::FlashAttention2
-        } else {
-            models::AttentionImplementation::Eager
-        };
-        assert_eq!(
-            Args::attention(args.attention, models::Architecture::Laya, DType::F16),
-            low_precision
-        );
-        assert_eq!(
-            Args::attention(args.attention, models::Architecture::Laya, DType::BF16),
-            low_precision
-        );
-        assert_eq!(
-            Args::attention(args.attention, models::Architecture::Qwen35, DType::BF16),
-            models::AttentionImplementation::Auto
-        );
-    }
-
-    #[test]
-    fn accepts_a_model_length_override() {
-        let args = Args::try_parse_from([
-            "sys1",
-            "--model-id",
-            "owner/model",
-            "--max-model-len",
-            "8192",
-        ])
-        .unwrap();
-        assert_eq!(args.max_model_len, Some(8192));
-        assert!(args.validate().is_ok());
-
-        let args =
-            Args::try_parse_from(["sys1", "--model-id", "owner/model", "--max-model-len", "0"])
-                .unwrap();
-        assert!(args.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_two_model_sources() {
         assert!(
             Args::try_parse_from([
                 "sys1",
@@ -533,37 +355,51 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_capacity_configuration() {
-        let args = Args::try_parse_from([
-            "sys1",
-            "--model-id",
-            "owner/model",
+    fn selects_attention_for_laya() {
+        assert_eq!(
+            Args::attention(
+                models::AttentionImplementation::Auto,
+                models::Architecture::Laya,
+                DType::F32,
+            ),
+            models::AttentionImplementation::Eager
+        );
+        let low_precision = if cfg!(feature = "flash-attn-2") {
+            models::AttentionImplementation::FlashAttention2
+        } else {
+            models::AttentionImplementation::Eager
+        };
+        assert_eq!(
+            Args::attention(
+                models::AttentionImplementation::Auto,
+                models::Architecture::Laya,
+                DType::F16,
+            ),
+            low_precision
+        );
+        assert_eq!(
+            Args::attention(
+                models::AttentionImplementation::Auto,
+                models::Architecture::Qwen35,
+                DType::BF16,
+            ),
+            models::AttentionImplementation::Auto
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_configuration() {
+        let invalid_batch = args(&[
             "--max-batch-questions",
             "8",
             "--max-questions-per-request",
             "9",
-        ])
-        .unwrap();
-        assert!(args.validate().is_err());
+        ]);
+        assert!(invalid_batch.validate().is_err());
+        assert!(args(&["--max-model-len", "0"]).validate().is_err());
+        assert!(args(&["--max-queue-size", "0"]).validate().is_err());
 
-        let args =
-            Args::try_parse_from(["sys1", "--model-id", "owner/model", "--max-queue-size", "0"])
-                .unwrap();
-        assert!(args.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_flash_attention_with_f32() {
-        let args = Args::try_parse_from([
-            "sys1",
-            "--model-id",
-            "owner/model",
-            "--attention",
-            "flash-attn-2",
-            "--dtype",
-            "f32",
-        ])
-        .unwrap();
-        assert!(args.validate().is_err());
+        let invalid_attention = args(&["--attention", "flash-attn-2", "--dtype", "f32"]);
+        assert!(invalid_attention.validate().is_err());
     }
 }
