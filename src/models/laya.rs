@@ -1,6 +1,6 @@
 use super::AttentionImplementation;
 use super::DecisionModel;
-use super::modernbert::{
+use crate::archs::modernbert::{
     AttentionOptions, Config as ModernBertConfig, Encoder as ModernBertEncoder,
 };
 use crate::{
@@ -118,7 +118,7 @@ impl HeadLayer {
                 .contiguous()?;
             candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
         } else {
-            super::modernbert::scaled_dot_product_attention(
+            crate::archs::modernbert::scaled_dot_product_attention(
                 &q,
                 &k,
                 &v,
@@ -132,7 +132,7 @@ impl HeadLayer {
             )?
         };
         #[cfg(not(feature = "metal"))]
-        let attention = super::modernbert::scaled_dot_product_attention(
+        let attention = crate::archs::modernbert::scaled_dot_product_attention(
             &q,
             &k,
             &v,
@@ -171,7 +171,6 @@ pub struct Laya {
     scorer_out: Linear,
     config: LayaConfig,
     device: Device,
-    dtype: DType,
     compute_dtype: DType,
     pad_id: u32,
     cls_id: u32,
@@ -182,12 +181,24 @@ pub struct Laya {
 impl Laya {
     pub fn load(
         path: &Path,
-        dtype: DType,
+        dtype: Option<DType>,
         max_model_len: Option<usize>,
         attention: AttentionImplementation,
     ) -> anyhow::Result<Self> {
         let device = device::load()?;
+        let dtype = super::dtype::resolve(path, super::Architecture::Laya, dtype)?;
         let (model_dtype, compute_dtype) = execution_dtypes(dtype, device.is_cuda());
+        Self::build_variant(path, model_dtype, compute_dtype, max_model_len, attention)
+    }
+
+    fn build_variant(
+        path: &Path,
+        model_dtype: DType,
+        compute_dtype: DType,
+        max_model_len: Option<usize>,
+        attention: AttentionImplementation,
+    ) -> anyhow::Result<Self> {
+        let device = device::load()?;
         validate_attention(attention, &device, compute_dtype)?;
         let mut config: LayaConfig =
             serde_json::from_slice(&fs::read(path.join("rl_agent_config.json"))?)?;
@@ -263,7 +274,6 @@ impl Laya {
             )?,
             config,
             device,
-            dtype: model_dtype,
             compute_dtype,
             pad_id,
             cls_id,
@@ -279,6 +289,12 @@ impl Laya {
     }
 
     fn prepare(&self, request: DecisionRequest) -> Result<RequestItems, ApiError> {
+        if !request.images.is_empty() {
+            return Err(ApiError::new("images are not supported by this model"));
+        }
+        if !request.videos.is_empty() {
+            return Err(ApiError::new("videos are not supported by this model"));
+        }
         if !matches!(
             request.state,
             Value::String(_) | Value::Array(_) | Value::Object(_)
@@ -306,11 +322,9 @@ impl Laya {
                 .ok_or_else(|| ApiError::new(format!("question {id:?} has invalid type")))?;
             let instructions = object
                 .get("instructions")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    ApiError::new(format!("question {id:?} requires string instructions"))
-                })?
-                .to_owned();
+                .filter(|value| !value.is_null())
+                .map(render_value)
+                .unwrap_or_else(|| id.clone());
             let criteria = object.get("criteria").cloned().unwrap_or(Value::Null);
             let (labels, options) = render_options(kind, &criteria, &id)?;
             let question = Question {
@@ -409,7 +423,7 @@ impl Laya {
             })
             .collect();
         let attention_mask =
-            Tensor::from_vec(mask, (batch, length), &self.device)?.to_dtype(self.dtype)?;
+            Tensor::from_vec(mask, (batch, length), &self.device)?.to_dtype(self.compute_dtype)?;
         let head_mask = Tensor::from_vec(head_mask, (batch, 1, 1, length), &self.device)?
             .to_dtype(self.compute_dtype)?;
         let type_ids = Tensor::from_vec(kinds, batch, &self.device)?;
@@ -425,7 +439,7 @@ impl Laya {
                 .forward(&hidden, &head_mask, &lengths)
                 .with_context(|| format!("decision head layer {index}"))?;
         }
-        let output = if batch >= 8 && !self.device.is_cpu() {
+        let output = if !self.device.is_cpu() {
             self.score_batched(&hidden, &unique, length)?
         } else {
             self.score_rows(&hidden, &unique)?
@@ -516,10 +530,11 @@ impl Laya {
                 .unwrap_or(self.config.temperature[item.question.kind])
                 .clamp(0.5, 5.0);
             let probabilities = probability(&values, temperature);
-            let confidence = round4(confidence(&probabilities));
             let answer = match item.question.kind {
                 0 => {
                     let index = argmax(&probabilities);
+                    let confidence = round4(confidence_from_probs(&probabilities));
+                    let answer_confidence = round4(probabilities[index]);
                     let values = item
                         .question
                         .labels
@@ -536,10 +551,13 @@ impl Laya {
                         "type": "choice",
                         "choice": item.question.labels[index],
                         "probabilities": values,
-                        "confidence": confidence
+                        "confidence": confidence,
+                        "answer_confidence": answer_confidence
                     })
                 }
                 1 => {
+                    let confidence = round4(confidence_from_probs(&probabilities));
+                    let answer_confidence = round4(probabilities[argmax(&probabilities)]);
                     let score = probabilities
                         .iter()
                         .enumerate()
@@ -564,13 +582,15 @@ impl Laya {
                         "score": round4(score),
                         "probabilities": probabilities,
                         "legend": legend,
-                        "confidence": confidence
+                        "confidence": confidence,
+                        "answer_confidence": answer_confidence
                     })
                 }
                 _ => json!({
                     "type": "noul",
                     "noul": round4(probabilities[1]),
-                    "confidence": round4(probabilities[1].max(1.0 - probabilities[1]))
+                    "confidence": round4(probabilities[0].max(probabilities[1])),
+                    "answer_confidence": round4(probabilities[0].max(probabilities[1]))
                 }),
             };
             answers.insert(item.question.id, answer);
@@ -647,6 +667,7 @@ fn validate_flash_capability(
     minor: i32,
 ) -> anyhow::Result<()> {
     let supported = match attention {
+        AttentionImplementation::Auto => true,
         AttentionImplementation::Eager => true,
         AttentionImplementation::FlashAttention2 => (8..=9).contains(&major),
         AttentionImplementation::FlashAttention3 => (major, minor) == (9, 0),
@@ -749,9 +770,9 @@ fn render_options(
             let criteria = criteria.as_array().ok_or_else(|| {
                 ApiError::new(format!("score question {id:?} requires array criteria"))
             })?;
-            if !(2..=10).contains(&criteria.len()) {
+            if !(1..=10).contains(&criteria.len()) {
                 return Err(ApiError::new(format!(
-                    "score question {id:?} requires 2 to 10 criteria"
+                    "score question {id:?} requires 1 to 10 criteria"
                 )));
             }
             Ok((
@@ -868,7 +889,7 @@ fn probability(logits: &[f32], temperature: f32) -> Vec<f32> {
     values
 }
 
-fn confidence(probabilities: &[f32]) -> f32 {
+fn confidence_from_probs(probabilities: &[f32]) -> f32 {
     if probabilities.len() < 2 {
         return 1.0;
     }
@@ -883,7 +904,7 @@ fn argmax(values: &[f32]) -> usize {
     values
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .max_by(|(left, a), (right, b)| a.total_cmp(b).then_with(|| right.cmp(left)))
         .map(|(index, _)| index)
         .unwrap_or(0)
 }
@@ -895,6 +916,21 @@ fn round4(value: f32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confidence_matches_laya_formulas() {
+        let probabilities: [f32; 3] = [0.6, 0.3, 0.1];
+        let entropy = -probabilities
+            .iter()
+            .map(|value| value * value.ln())
+            .sum::<f32>();
+        assert!(
+            (confidence_from_probs(&probabilities) - (1.0 - entropy / 3.0_f32.ln())).abs() < 1e-6
+        );
+        assert_eq!(confidence_from_probs(&[0.5, 0.5]), 0.0);
+        assert_eq!(confidence_from_probs(&[1.0]), 1.0);
+        assert_eq!(argmax(&[0.5, 0.5]), 0);
+    }
 
     #[tokio::test]
     async fn fp32_logits_and_probabilities() -> anyhow::Result<()> {
@@ -918,7 +954,12 @@ mod tests {
 
         for (snapshot, model_id, revision) in models {
             let path = crate::hub::download(model_id, revision).await?;
-            let model = Laya::load(&path, DType::F32, None, AttentionImplementation::Eager)?;
+            let model = Laya::load(
+                &path,
+                Some(DType::F32),
+                None,
+                AttentionImplementation::Eager,
+            )?;
             let request: DecisionRequest = serde_json::from_value(json!({
                 "state": {
                     "message": "I was charged twice for invoice 4411. Please refund me today.",

@@ -58,30 +58,6 @@ jobs:
       push: true
       source_sha: ${{ github.sha }}
 
-  approve_pr_build:
-    name: Approve PR build
-    needs: tests
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.draft == false &&
-      github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    environment: pr-build
-    steps:
-      - run: echo "PR build approved"
-
-  build_pr:
-    name: Build PR
-    needs: approve_pr_build
-    permissions:
-      actions: write
-      contents: read
-      packages: write
-    uses: ./.github/workflows/build.yml
-    with:
-      push: true
-      source_sha: ${{ github.sha }}
-
   push:
     name: Push
     needs: [tests, build]

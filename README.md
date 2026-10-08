@@ -15,12 +15,16 @@
 - [TypeSafe AI compatible API](https://docs.typesafe.ai/api)
 - `candle` with [`tokenizers` release candidate](https://huggingface.co/blog/tokenizers-v1)!
 - Dynamic batching bounded by requests and questions
-- Support on CPU, Metal and CUDA
-- F32, F16 and B16 support
+- SDPA on CPU, Metal, and CUDA
+- Flash Attention on Ampere, Ada Lovelace, and Hopper
+- Blazing fast inference for ModernBERT and Qwen3.5
+- Multimodal decisions from text, images, and video when supported by the model
 
 ## Get started
 
-Install it with support for CPU, Metal or CUDA.
+Rust and Cargo 1.98.1, mandatory. `ffmpeg` and `ffprobe` 6.1.1 or higher for video inputs.
+
+If you run on CUDA you also need `nvcc`. And if you run on Metal, you also need `xcode` and `xcodebuild -downloadComponent MetalToolchain`.
 
 ```bash
 cargo install sys1 --features cpu
@@ -35,6 +39,8 @@ Then run it with any of the supported models (more coming soon!).
 - [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya) for English text, guardrails, email triage
 - [`convaiinnovations/laya-multilingual`](https://huggingface.co/convaiinnovations/laya-multilingual) for 100+ languages, ~2.2x faster
 - [`convaiinnovations/laya-typed-decisions`](https://huggingface.co/convaiinnovations/laya-typed-decisions) for typed-decisions workflows
+- [`Cloudflare/clef`](https://huggingface.co/Cloudflare/clef) for text, image, and video decisions
+- [`Cloudflare/clef-flash`](https://huggingface.co/Cloudflare/clef-flash) for text, image, and video decisions (smaller and faster than the 27B variant)
 
 ```bash
 sys1 --model-id convaiinnovations/laya --dtype auto
@@ -78,9 +84,30 @@ curl http://localhost:3000/v1/systemone \
     }'
 ```
 
+Or, install the [TypeSafe AI SDK for Python](https://github.com/typesafe-ai/typesafe-sdk-python), or the [TypeSafe AI SDK for Javascript / Typescript](https://github.com/typesafe-ai/typesafe-sdk-js).
+
+```python
+from typesafe_sdk import Choice, TypeSafeClient
+
+client = TypeSafeClient(base_url="http://localhost:3000", api_key="-")
+
+response = client.system_one(
+    model="convaiinnovations/laya",
+    state={"message": "I was charged twice for invoice 4411."},
+    questions={
+        "route": Choice(
+            instructions="Where should this ticket go?",
+            criteria={"billing": None, "bug": None, "account": None},
+        ),
+    },
+)
+print(response.choices["route"].choice)
+```
+
 ## References
 
 - [TypeSafe AI API](https://docs.typesafe.ai/api)
 - [TypeSafe AI System One](https://docs.typesafe.ai/concepts/system-one)
 - [TypeSafe AI Python SDK](https://github.com/typesafe-ai/typesafe-sdk-python)
 - [Laya: Multilingual, non-autoregressive System 1 decision engine](https://github.com/NandhaKishorM/laya)
+- [Introducing Clef: our open-source decision models, and new RL fine-tuning platform](https://blog.cloudflare.com/clef-decision-models/)

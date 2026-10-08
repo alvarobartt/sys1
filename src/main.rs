@@ -12,7 +12,6 @@ use sys1::{
     batching::{Batcher, BatcherConfig},
     models,
 };
-use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -103,40 +102,54 @@ struct Args {
         help_heading = "Batching options"
     )]
     request_timeout_ms: u64,
-    /// Maximum request body size in bytes.
+    /// Maximum request body size in bytes, including base64 images and videos.
     #[arg(
         long,
         env,
-        default_value_t = 1_048_576,
+        default_value_t = 16_777_216,
         help_heading = "Server options"
     )]
     max_request_bytes: usize,
     /// Maximum model context length; uses the model configuration when omitted.
     #[arg(long, env, help_heading = "Model options")]
     max_model_len: Option<usize>,
-    /// Floating-point precision used for inference.
-    #[arg(
-        short = 'd',
-        long,
-        env,
-        value_enum,
-        default_value_t = Precision::Auto,
-        help_heading = "Model options"
-    )]
-    dtype: Precision,
+    /// Floating-point precision; omitted or auto uses the model's inference policy.
+    #[arg(short = 'd', long, env, value_enum, help_heading = "Model options")]
+    dtype: Option<Precision>,
     /// Attention implementation used for inference.
     #[arg(
         short = 'a',
         long,
         env,
         value_enum,
-        default_value_t = models::AttentionImplementation::Eager,
+        default_value_t = models::AttentionImplementation::Auto,
         help_heading = "Model options"
     )]
     attention: models::AttentionImplementation,
 }
 
 impl Args {
+    fn attention(
+        requested: models::AttentionImplementation,
+        architecture: models::Architecture,
+        dtype: DType,
+    ) -> models::AttentionImplementation {
+        if architecture != models::Architecture::Laya
+            || requested != models::AttentionImplementation::Auto
+        {
+            return requested;
+        }
+        if matches!(dtype, DType::F16 | DType::BF16) {
+            if cfg!(feature = "flash-attn-2") {
+                return models::AttentionImplementation::FlashAttention2;
+            }
+            if cfg!(feature = "flash-attn-3") {
+                return models::AttentionImplementation::FlashAttention3;
+            }
+        }
+        models::AttentionImplementation::Eager
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.max_batch_size > 0, "--max-batch-size must be positive");
         anyhow::ensure!(
@@ -160,7 +173,9 @@ impl Args {
             self.max_model_len != Some(0),
             "--max-model-len must be positive"
         );
-        self.attention.validate(self.dtype.resolve())?;
+        if let Some(dtype) = self.dtype.filter(|dtype| *dtype != Precision::Auto) {
+            self.attention.validate(dtype.resolve_explicit())?;
+        }
         Ok(())
     }
 }
@@ -174,9 +189,10 @@ enum Precision {
 }
 
 impl Precision {
-    fn resolve(self) -> DType {
+    fn resolve_explicit(self) -> DType {
         match self {
-            Self::Auto | Self::F32 => DType::F32,
+            Self::Auto => unreachable!("auto is resolved from model files"),
+            Self::F32 => DType::F32,
             Self::F16 => DType::F16,
             Self::Bf16 => DType::BF16,
         }
@@ -195,60 +211,78 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     args.validate()?;
     sys1::validate_backend()?;
-    let dtype = args.dtype.resolve();
-    info!(
+    let backend = if cfg!(feature = "cuda") {
+        "cuda"
+    } else if cfg!(feature = "metal") {
+        "metal"
+    } else {
+        "cpu"
+    };
+    tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),
-        backend = backend(),
+        backend,
         ?args,
-        ?dtype,
-        "sys1 starting"
+        "Starting sys1"
     );
     let address = SocketAddr::new(args.host, args.port);
-    let (model_path, source_name, architecture) = match args.model_path {
+    let (model_path, source_name, architecture, source) = match args.model_path {
         Some(path) => {
             if args.served_model_name.is_none() {
-                warn!("--served-model-name is recommended when using --model-path");
+                tracing::warn!("Set --served-model-name when using --model-path");
             }
             let name = path.display().to_string();
             let architecture = models::Architecture::from_path(&path)?;
-            (path, name, architecture)
+            (path, name, architecture, "path")
         }
         None => {
-            let architecture = models::Architecture::from_model_id(&args.model_id)?;
             let started = Instant::now();
-            info!(model_id = %args.model_id, revision = %args.revision, "resolving model snapshot");
-            let path = sys1::hub::download(&args.model_id, &args.revision).await?;
-            info!(
+            tracing::info!(model_id = %args.model_id, revision = %args.revision, "Resolving model snapshot");
+            let outcome = sys1::hub::download_with_source(&args.model_id, &args.revision).await?;
+            let elapsed_ms = started.elapsed().as_millis();
+            tracing::info!(
                 model_id = %args.model_id,
-                path = %path.display(),
-                elapsed_ms = started.elapsed().as_millis(),
-                "model snapshot ready"
+                path = %outcome.path.display(),
+                source = outcome.source.as_str(),
+                elapsed_ms,
+                total_files = outcome.total_files,
+                downloaded_files = outcome.downloaded_files,
+                cached_files = outcome.cached_files,
+                total_bytes = outcome.total_bytes,
+                "Model files ready"
             );
-            (path, args.model_id, architecture)
+            let architecture = models::Architecture::from_path(&outcome.path)?;
+            (
+                outcome.path,
+                args.model_id,
+                architecture,
+                outcome.source.as_str(),
+            )
         }
     };
+    let requested_dtype = args
+        .dtype
+        .filter(|dtype| *dtype != Precision::Auto)
+        .map(Precision::resolve_explicit);
+    let dtype = match requested_dtype {
+        Some(dtype) => dtype,
+        None => models::model_default_dtype(&model_path, architecture)?,
+    };
+    let attention = Args::attention(args.attention, architecture, dtype);
+    attention.validate(dtype)?;
     let served_model_name = args.served_model_name.unwrap_or(source_name);
     let started = Instant::now();
-    info!(
-        model = %served_model_name,
-        ?architecture,
-        path = %model_path.display(),
-        "loading model"
-    );
+    tracing::info!(model = %served_model_name, source, ?architecture, ?dtype, ?attention, path = %model_path.display(), "Loading model");
     let model = models::load(
         &model_path,
         architecture,
-        dtype,
+        requested_dtype,
         args.max_model_len,
-        args.attention,
+        attention,
     )
     .with_context(|| format!("failed to load model from {}", model_path.display()))?;
-    info!(
-        model = %served_model_name,
-        elapsed_ms = started.elapsed().as_millis(),
-        "model loaded"
-    );
+    let model_load_ms = started.elapsed().as_millis();
+    tracing::info!(model_load_ms, "Model loaded");
     let batcher = Batcher::new(
         Arc::new(model),
         served_model_name.clone(),
@@ -263,24 +297,25 @@ async fn main() -> anyhow::Result<()> {
         },
     );
     let started = Instant::now();
-    info!(model = %served_model_name, "model warmup started");
     batcher
         .warmup()
         .await
         .map_err(|error| anyhow::anyhow!(error.error))
         .context("model warmup failed")?;
-    info!(
-        model = %served_model_name,
-        elapsed_ms = started.elapsed().as_millis(),
-        "model warmup completed"
-    );
+    let warmup_ms = started.elapsed().as_millis();
+    tracing::info!(warmup_ms, "Model warmup complete");
     let app = api::router(batcher, args.max_request_bytes);
     let listener = tokio::net::TcpListener::bind(address).await?;
-    info!(%address, model = %served_model_name, "sys1 ready");
+    let address = listener.local_addr()?;
+    tracing::info!("Available API routes:");
+    for &(method, route) in api::PUBLIC_ROUTES {
+        tracing::info!("[{method:>4}] {route}");
+    }
+    tracing::info!(%address, "Server running");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await?;
-    info!("sys1 stopped");
+    tracing::info!("Server stopped");
     Ok(())
 }
 
@@ -293,23 +328,13 @@ async fn shutdown() {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
     }
-    info!("shutdown requested");
+    tracing::info!("Shutdown requested");
 }
 
 #[cfg(not(unix))]
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
-    info!("shutdown requested");
-}
-
-fn backend() -> &'static str {
-    if cfg!(feature = "cuda") {
-        "cuda"
-    } else if cfg!(feature = "metal") {
-        "metal"
-    } else {
-        "cpu"
-    }
+    tracing::info!("Shutdown requested");
 }
 
 #[cfg(test)]
@@ -331,10 +356,10 @@ mod tests {
         assert_eq!(args.max_questions_per_request, 64);
         assert_eq!(args.max_queue_size, 256);
         assert_eq!(args.request_timeout_ms, 30_000);
-        assert_eq!(args.max_request_bytes, 1_048_576);
+        assert_eq!(args.max_request_bytes, 16_777_216);
         assert_eq!(args.max_model_len, None);
-        assert_eq!(args.dtype, Precision::Auto);
-        assert_eq!(args.attention, models::AttentionImplementation::Eager);
+        assert_eq!(args.dtype, None);
+        assert_eq!(args.attention, models::AttentionImplementation::Auto);
     }
 
     #[test]
@@ -375,7 +400,7 @@ mod tests {
         assert_eq!(args.port, 8080);
         assert_eq!(args.max_batch_size, 4);
         assert_eq!(args.request_timeout_ms, 100);
-        assert_eq!(args.dtype, Precision::F16);
+        assert_eq!(args.dtype, Some(Precision::F16));
         assert_eq!(args.attention, models::AttentionImplementation::Eager);
     }
 
@@ -430,19 +455,47 @@ mod tests {
     }
 
     #[test]
-    fn resolves_requested_and_backend_default_dtypes() {
-        assert_eq!(Precision::F32.resolve(), DType::F32);
-        assert_eq!(Precision::F16.resolve(), DType::F16);
-        assert_eq!(Precision::Bf16.resolve(), DType::BF16);
-        assert_eq!(Precision::Auto.resolve(), DType::F32);
-
+    fn resolves_explicit_dtypes() {
+        assert_eq!(Precision::F32.resolve_explicit(), DType::F32);
+        assert_eq!(Precision::F16.resolve_explicit(), DType::F16);
+        assert_eq!(Precision::Bf16.resolve_explicit(), DType::BF16);
         let args = Args::try_parse_from(["sys1", "--dtype", "bf16"]).unwrap();
-        assert_eq!(args.dtype, Precision::Bf16);
+        assert_eq!(args.dtype, Some(Precision::Bf16));
+        let args = Args::try_parse_from(["sys1", "--dtype", "auto"]).unwrap();
+        assert_eq!(args.dtype, Some(Precision::Auto));
 
         let args = Args::try_parse_from(["sys1", "--attention", "flash-attn-2"]).unwrap();
         assert_eq!(
             args.attention,
             models::AttentionImplementation::FlashAttention2
+        );
+    }
+
+    #[test]
+    fn defaults_to_available_flash_attention_for_laya() {
+        let args = Args::try_parse_from(["sys1"]).unwrap();
+        assert_eq!(
+            Args::attention(args.attention, models::Architecture::Laya, DType::F32),
+            models::AttentionImplementation::Eager
+        );
+        let low_precision = if cfg!(feature = "flash-attn-2") {
+            models::AttentionImplementation::FlashAttention2
+        } else if cfg!(feature = "flash-attn-3") {
+            models::AttentionImplementation::FlashAttention3
+        } else {
+            models::AttentionImplementation::Eager
+        };
+        assert_eq!(
+            Args::attention(args.attention, models::Architecture::Laya, DType::F16),
+            low_precision
+        );
+        assert_eq!(
+            Args::attention(args.attention, models::Architecture::Laya, DType::BF16),
+            low_precision
+        );
+        assert_eq!(
+            Args::attention(args.attention, models::Architecture::Qwen35, DType::BF16),
+            models::AttentionImplementation::Auto
         );
     }
 

@@ -7,7 +7,6 @@ use crate::{
 use serde_json::{Map, json};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error};
 
 struct Job {
     request: DecisionRequest,
@@ -43,6 +42,8 @@ pub struct Batcher {
     served_model_name: Arc<str>,
     response_timeout: Option<Duration>,
     max_questions_per_request: usize,
+    supports_images: bool,
+    supports_videos: bool,
     metrics: Arc<BatcherMetrics>,
 }
 
@@ -52,6 +53,8 @@ impl Batcher {
         served_model_name: String,
         config: BatcherConfig,
     ) -> Self {
+        let supports_images = model.supports_images();
+        let supports_videos = model.supports_videos();
         let max_batch_size = config.max_batch_size.max(1);
         let max_batch_questions = config.max_batch_questions.max(1);
         let max_questions_per_request = config
@@ -109,7 +112,7 @@ impl Batcher {
                 let batch_guard = (metric_batch_size > 0).then(|| {
                     worker_metrics.batch_started(metric_batch_size, metric_question_count)
                 });
-                debug!(batch_size, question_count, "inference batch started");
+                tracing::debug!(batch_size, question_count, "Inference batch started");
                 let (requests, deliveries): (Vec<_>, Vec<_>) = jobs
                     .into_iter()
                     .map(|job| (job.request, (job.response, job.kind)))
@@ -118,7 +121,7 @@ impl Batcher {
                 let responses = tokio::task::spawn_blocking(move || model.predict_batch(requests))
                     .await
                     .unwrap_or_else(|error| {
-                        error!(%error, "inference worker failed");
+                        tracing::error!(%error, "Inference worker failed");
                         (0..batch_size)
                             .map(|_| Err(ApiError::internal(error.to_string())))
                             .collect()
@@ -135,11 +138,11 @@ impl Batcher {
                         .count();
                 worker_metrics.model_requests_failed(failures);
                 drop(batch_guard);
-                debug!(
+                tracing::debug!(
                     batch_size,
                     failures,
                     elapsed_ms = started.elapsed().as_millis(),
-                    "inference batch completed"
+                    "Inference batch completed"
                 );
                 let response_count = responses.len();
                 let mut responses = responses.into_iter();
@@ -152,9 +155,10 @@ impl Batcher {
                     let _ = channel.send(response);
                 }
                 if response_count != batch_size {
-                    error!(
+                    tracing::error!(
                         batch_size,
-                        response_count, "inference response count mismatch"
+                        response_count,
+                        "Inference response count mismatch"
                     );
                 }
             }
@@ -164,6 +168,8 @@ impl Batcher {
             served_model_name: served_model_name.into(),
             response_timeout: config.response_timeout,
             max_questions_per_request,
+            supports_images,
+            supports_videos,
             metrics,
         }
     }
@@ -197,6 +203,8 @@ impl Batcher {
             DecisionRequest {
                 model: None,
                 state: json!("Warm up the decision model before serving requests."),
+                images: Vec::new(),
+                videos: Vec::new(),
                 questions,
             },
             None,
@@ -219,7 +227,7 @@ impl Batcher {
     ) -> Result<DecisionResponse, ApiError> {
         if !matches_model(request.model.as_deref(), &self.served_model_name) {
             let model = request.model.as_deref().unwrap();
-            return Err(ApiError::new(format!("unknown model: {model}")));
+            return Err(ApiError::unknown_model(model));
         }
         if request.questions.is_empty() {
             return Err(ApiError::new("questions must not be empty"));
@@ -230,6 +238,12 @@ impl Batcher {
                 request.questions.len(),
                 self.max_questions_per_request
             )));
+        }
+        if !request.images.is_empty() && !self.supports_images {
+            return Err(ApiError::new("images are not supported by this model"));
+        }
+        if !request.videos.is_empty() && !self.supports_videos {
+            return Err(ApiError::new("videos are not supported by this model"));
         }
         let (response, receiver) = oneshot::channel();
         if kind.records_metrics() {
@@ -261,7 +275,9 @@ impl Batcher {
                 if kind.records_metrics() {
                     self.metrics.request_timed_out();
                 }
-                ApiError::timeout("inference request timed out")
+                ApiError::timeout(
+                    "inference request timed out; shorten the state or media, or increase --request-timeout-ms",
+                )
             })?
         } else {
             receiver.await
@@ -292,7 +308,7 @@ impl Batcher {
 }
 
 fn matches_model(requested: Option<&str>, served: &str) -> bool {
-    requested.is_none_or(|model| model.is_empty() || model == served)
+    requested.is_none_or(|model| model.is_empty() || model == served || model == "jev-latest")
 }
 
 #[cfg(test)]
@@ -413,6 +429,8 @@ mod tests {
         DecisionRequest {
             model: None,
             state: json!("test"),
+            images: Vec::new(),
+            videos: Vec::new(),
             questions,
         }
     }
@@ -447,6 +465,7 @@ mod tests {
         assert!(matches_model(None, served));
         assert!(matches_model(Some(""), served));
         assert!(matches_model(Some(served), served));
+        assert!(matches_model(Some("jev-latest"), served));
         assert!(!matches_model(Some("other/model"), served));
     }
 
@@ -470,11 +489,14 @@ mod tests {
             .predict(DecisionRequest {
                 model: None,
                 state: json!("test"),
+                images: Vec::new(),
+                videos: Vec::new(),
                 questions,
             })
             .await
             .unwrap_err();
         assert_eq!(error.status(), 504);
+        assert!(error.error.contains("--request-timeout-ms"));
         wait_for_metric(&batcher, "sys1_inference_duration_seconds_count", 1.0).await;
         assert_eq!(metric_value(&batcher, "sys1_requests_accepted_total"), 1.0);
         assert_eq!(metric_value(&batcher, "sys1_requests_timed_out_total"), 1.0);
@@ -612,6 +634,8 @@ mod tests {
             .predict(DecisionRequest {
                 model: None,
                 state: json!("test"),
+                images: Vec::new(),
+                videos: Vec::new(),
                 questions: Map::new(),
             })
             .await
@@ -625,11 +649,55 @@ mod tests {
             .predict(DecisionRequest {
                 model: None,
                 state: json!("test"),
+                images: Vec::new(),
+                videos: Vec::new(),
                 questions,
             })
             .await
             .unwrap_err();
         assert_eq!(oversized.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn rejects_images_for_models_without_vision() {
+        let batcher = Batcher::new(
+            Arc::new(RecordingModel::default()),
+            "test".to_owned(),
+            BatcherConfig {
+                max_batch_size: 1,
+                max_batch_questions: 1,
+                max_questions_per_request: 1,
+                wait: Duration::ZERO,
+                queue_capacity: 1,
+                response_timeout: None,
+            },
+        );
+        let mut request = one_question_request();
+        request.images.push("data:image/png;base64,AAAA".into());
+        let error = batcher.predict(request).await.unwrap_err();
+        assert_eq!(error.status(), 400);
+        assert!(error.error.contains("not supported"));
+    }
+
+    #[tokio::test]
+    async fn rejects_videos_for_models_without_vision() {
+        let batcher = Batcher::new(
+            Arc::new(RecordingModel::default()),
+            "test".to_owned(),
+            BatcherConfig {
+                max_batch_size: 1,
+                max_batch_questions: 1,
+                max_questions_per_request: 1,
+                wait: Duration::ZERO,
+                queue_capacity: 1,
+                response_timeout: None,
+            },
+        );
+        let mut request = one_question_request();
+        request.videos.push("data:video/mp4;base64,AAAA".into());
+        let error = batcher.predict(request).await.unwrap_err();
+        assert_eq!(error.status(), 400);
+        assert!(error.error.contains("videos are not supported"));
     }
 
     #[tokio::test]

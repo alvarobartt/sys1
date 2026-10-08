@@ -1,15 +1,316 @@
 use anyhow::{Context, bail};
-use hf_hub::HFClient;
-use std::path::PathBuf;
+use hf_hub::{
+    HFClient,
+    progress::{DownloadEvent, FileStatus, ProgressEvent, ProgressHandler},
+};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
+const STALL_TIMEOUT: Duration = Duration::from_secs(600);
+const DOWNLOAD_WORKERS: usize = 8;
 const MODEL_FILES: &[&str] = &[
     "encoder/config.json",
     "model.safetensors",
     "rl_agent_config.json",
     "tokenizer/tokenizer.json",
+    "config.json",
+    "joint_head_config.json",
+    "joint_head.safetensors",
+    "model-*.safetensors",
+    "model.safetensors.index.json",
+    "tokenizer.json",
+    "processor_config.json",
 ];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownloadSource {
+    Cache,
+    HuggingFace,
+}
+
+impl DownloadSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cache => "cache",
+            Self::HuggingFace => "huggingface",
+        }
+    }
+}
+
+pub struct DownloadOutcome {
+    pub path: PathBuf,
+    pub source: DownloadSource,
+    pub total_files: usize,
+    pub downloaded_files: usize,
+    pub cached_files: usize,
+    pub total_bytes: u64,
+}
+
+struct DownloadProgress {
+    multi: MultiProgress,
+    resolving: ProgressBar,
+    state: Arc<Mutex<DownloadState>>,
+}
+
+struct DownloadState {
+    started: bool,
+    total_files: usize,
+    total_bytes: u64,
+    overall: Option<ProgressBar>,
+    files: HashMap<String, FileState>,
+    completion_order: Vec<String>,
+    aggregate_bytes: u64,
+    transfer_started: bool,
+    last_change: Instant,
+}
+
+#[derive(Default)]
+struct FileState {
+    bytes: u64,
+    total: u64,
+    complete: bool,
+    bar: Option<ProgressBar>,
+    started_at: Option<Instant>,
+    download_elapsed: Option<Duration>,
+}
+
+impl Default for DownloadState {
+    fn default() -> Self {
+        Self {
+            started: false,
+            total_files: 0,
+            total_bytes: 0,
+            overall: None,
+            files: HashMap::new(),
+            completion_order: Vec::new(),
+            aggregate_bytes: 0,
+            transfer_started: false,
+            last_change: Instant::now(),
+        }
+    }
+}
+
+impl DownloadState {
+    fn source(&self) -> DownloadSource {
+        if self.transfer_started {
+            DownloadSource::HuggingFace
+        } else {
+            DownloadSource::Cache
+        }
+    }
+
+    fn downloaded(&self) -> u64 {
+        let file_bytes = self
+            .files
+            .values()
+            .fold(0u64, |sum, file| sum.saturating_add(file.bytes));
+        // Xet's batch total overlaps with per-file updates.
+        file_bytes.max(self.aggregate_bytes).min(self.total_bytes)
+    }
+}
+
+fn file_style(known_total: bool) -> ProgressStyle {
+    let template = if known_total {
+        "Downloading {msg} [{wide_bar}] {bytes}/{total_bytes} {bytes_per_sec}"
+    } else {
+        "Downloading {msg} {bytes} {bytes_per_sec}"
+    };
+    ProgressStyle::with_template(template)
+        .expect("Valid file download template")
+        .progress_chars("=> ")
+}
+
+fn overall_bar(total_bytes: u64) -> ProgressBar {
+    let bar = ProgressBar::new(total_bytes);
+    bar.set_style(
+        ProgressStyle::with_template("All files [{wide_bar}] {bytes}/{total_bytes}")
+            .expect("Valid overall download template")
+            .progress_chars("=> "),
+    );
+    bar
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    (duration.as_secs_f64() * 1_000_000.0).round() / 1_000.0
+}
+
+impl ProgressHandler for DownloadProgress {
+    fn on_progress(&self, event: &ProgressEvent) {
+        let ProgressEvent::Download(event) = event else {
+            return;
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let mut changed = false;
+        let mut started_downloads = Vec::new();
+        match event {
+            DownloadEvent::Start {
+                total_files,
+                total_bytes,
+            } if !state.started => {
+                state.started = true;
+                state.total_files = *total_files;
+                state.total_bytes = *total_bytes;
+                state.last_change = Instant::now();
+                self.resolving.finish_and_clear();
+                if *total_bytes > 0 {
+                    let overall = self.multi.add(overall_bar(*total_bytes));
+                    overall.tick();
+                    state.overall = Some(overall);
+                }
+            }
+            DownloadEvent::Progress { files } => {
+                for file in files {
+                    if file.status != FileStatus::Complete {
+                        state.transfer_started = true;
+                    }
+                    if file.status != FileStatus::Complete
+                        && state.overall.is_none()
+                        && file.total_bytes > 0
+                    {
+                        state.total_bytes = state.total_bytes.max(file.total_bytes);
+                        state.overall = Some(self.multi.add(overall_bar(state.total_bytes)));
+                    }
+                    let overall = state.overall.clone();
+                    let completed = {
+                        let entry = state.files.entry(file.filename.clone()).or_default();
+                        if file.status != FileStatus::Complete && entry.bar.is_none() {
+                            entry.started_at = Some(Instant::now());
+                            started_downloads.push((file.filename.clone(), file.total_bytes));
+                            let bar = if let Some(overall) = &overall {
+                                self.multi
+                                    .insert_before(overall, ProgressBar::new(file.total_bytes))
+                            } else {
+                                self.multi.add(ProgressBar::new(file.total_bytes))
+                            };
+                            bar.set_style(file_style(file.total_bytes > 0));
+                            bar.set_message(file.filename.clone());
+                            entry.bar = Some(bar);
+                        }
+                        if file.total_bytes > entry.total {
+                            entry.total = file.total_bytes;
+                            if let Some(bar) = &entry.bar {
+                                bar.set_length(entry.total);
+                                bar.set_style(file_style(true));
+                            }
+                        }
+                        if file.bytes_completed > entry.bytes {
+                            entry.bytes = file.bytes_completed;
+                            changed = true;
+                        }
+                        let completed = file.status == FileStatus::Complete && !entry.complete;
+                        if completed {
+                            entry.complete = true;
+                            entry.download_elapsed = entry.started_at.map(|start| start.elapsed());
+                            changed = true;
+                        }
+                        if let Some(bar) = &entry.bar {
+                            bar.set_position(if entry.total > 0 {
+                                entry.bytes.min(entry.total)
+                            } else {
+                                entry.bytes
+                            });
+                            if entry.complete {
+                                bar.finish();
+                            }
+                        }
+                        completed
+                    };
+                    if completed {
+                        state.completion_order.push(file.filename.clone());
+                    }
+                }
+            }
+            DownloadEvent::AggregateProgress {
+                bytes_completed,
+                total_bytes,
+                ..
+            } => {
+                if *bytes_completed > state.aggregate_bytes {
+                    state.aggregate_bytes = *bytes_completed;
+                    state.transfer_started = true;
+                    changed = true;
+                    let active_count = state
+                        .files
+                        .values()
+                        .filter(|file| !file.complete && file.bar.is_some())
+                        .count();
+                    if active_count == 1
+                        && let Some(file) = state
+                            .files
+                            .values_mut()
+                            .find(|file| !file.complete && file.bar.is_some())
+                        && file.total == *total_bytes
+                        && *bytes_completed > file.bytes
+                    {
+                        file.bytes = *bytes_completed;
+                        if let Some(bar) = &file.bar {
+                            bar.set_position(file.bytes.min(file.total));
+                        }
+                    }
+                }
+            }
+            DownloadEvent::Complete => return,
+            // Snapshot downloads may also emit Start for individual files.
+            DownloadEvent::Start { .. } => return,
+        }
+        if changed {
+            state.last_change = Instant::now();
+        }
+        if let Some(overall) = &state.overall {
+            overall.set_position(state.downloaded());
+        }
+        // `set_position` is deliberately rate-limited by indicatif. The Hub has
+        // already coalesced network reads into progress events, so render every
+        // event we receive rather than coalescing those a second time.
+        if changed && let Some(overall) = &state.overall {
+            overall.force_draw();
+        }
+        drop(state);
+        for (filename, total_bytes) in started_downloads {
+            self.multi
+                .suspend(|| tracing::info!(file = %filename, total_bytes, "File download started"));
+        }
+    }
+}
+
+fn token_from_file_or_env(
+    hf_home: Option<OsString>,
+    home: Option<OsString>,
+    env_token: Option<String>,
+) -> Option<String> {
+    let root = hf_home
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|path| !path.is_empty())
+                .map(|path| PathBuf::from(path).join(".cache/huggingface"))
+        });
+    root.and_then(|path| std::fs::read_to_string(path.join("token")).ok())
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+        .or_else(|| {
+            env_token
+                .map(|token| token.trim().to_owned())
+                .filter(|token| !token.is_empty())
+        })
+}
+
 pub async fn download(model_id: &str, revision: &str) -> anyhow::Result<PathBuf> {
+    Ok(download_with_source(model_id, revision).await?.path)
+}
+
+pub async fn download_with_source(
+    model_id: &str,
+    revision: &str,
+) -> anyhow::Result<DownloadOutcome> {
     let Some((owner, name)) = model_id.split_once('/') else {
         bail!("model id must use the owner/name format")
     };
@@ -17,13 +318,412 @@ pub async fn download(model_id: &str, revision: &str) -> anyhow::Result<PathBuf>
         bail!("model id must use the owner/name format")
     }
 
-    HFClient::new()
-        .context("failed to create Hugging Face client")?
-        .model(owner, name)
+    let token = token_from_file_or_env(
+        std::env::var_os("HF_HOME"),
+        std::env::var_os("HOME"),
+        std::env::var("HF_TOKEN").ok(),
+    );
+    let token_available = token.is_some();
+    let mut client_builder = HFClient::builder();
+    if let Some(token) = token {
+        client_builder = client_builder.token(token);
+    }
+    let client = client_builder
+        .build()
+        .context("failed to create Hugging Face client")?;
+    tracing::info!(
+        model_id,
+        revision,
+        token_found = token_available,
+        workers = DOWNLOAD_WORKERS,
+        "Resolving model files"
+    );
+    let multi = MultiProgress::new();
+    let resolving = multi.add(ProgressBar::new_spinner());
+    resolving.set_style(
+        ProgressStyle::with_template("Resolving model files...")
+            .expect("Valid model resolution template"),
+    );
+    resolving.tick();
+    let state = Arc::new(Mutex::new(DownloadState::default()));
+    let repository = client.model(owner, name);
+    let download = repository
         .snapshot_download()
         .revision(revision)
         .allow_patterns(MODEL_FILES.iter().map(|path| (*path).to_owned()).collect())
-        .send()
-        .await
-        .with_context(|| format!("failed to download {model_id} at revision {revision}"))
+        .max_workers(DOWNLOAD_WORKERS)
+        .progress(DownloadProgress {
+            multi: multi.clone(),
+            resolving: resolving.clone(),
+            state: Arc::clone(&state),
+        })
+        .send();
+    tokio::pin!(download);
+    let mut check = tokio::time::interval(Duration::from_secs(5));
+    let result = loop {
+        tokio::select! {
+            result = &mut download => break result.context("model download failed"),
+            _ = check.tick() => {
+                if let Ok(state) = state.lock() {
+                    for file in state.files.values() {
+                        if !file.complete
+                            && let Some(bar) = &file.bar {
+                                bar.tick();
+                            }
+                    }
+                    if let Some(overall) = &state.overall {
+                        overall.tick();
+                    }
+                    if !state.started {
+                        resolving.tick();
+                    }
+                    if state.last_change.elapsed() >= STALL_TIMEOUT {
+                        break Err(anyhow::anyhow!("model download made no progress for {} seconds; check the network connection and retry", STALL_TIMEOUT.as_secs()));
+                    }
+                }
+            }
+        }
+    };
+    let path =
+        result.with_context(|| format!("failed to download {model_id} at revision {revision}"));
+    let mut completed_files = Vec::new();
+    let mut incomplete_files = Vec::new();
+    if let Ok(mut state) = state.lock() {
+        if let Ok(snapshot) = &path {
+            for (filename, file) in &mut state.files {
+                if file.total == 0
+                    && let Ok(metadata) = std::fs::metadata(snapshot.join(filename))
+                {
+                    file.total = metadata.len();
+                    if file.complete {
+                        file.bytes = file.total;
+                    }
+                }
+            }
+            if state.total_bytes == 0 {
+                state.total_bytes = state
+                    .files
+                    .values()
+                    .fold(0u64, |sum, file| sum.saturating_add(file.total));
+            }
+        }
+        completed_files.extend(state.completion_order.iter().filter_map(|filename| {
+            let file = state.files.get(filename)?;
+            Some((
+                filename.clone(),
+                file.total.max(file.bytes),
+                file.download_elapsed.map(duration_ms),
+            ))
+        }));
+        for (filename, file) in &state.files {
+            if let Some(bar) = &file.bar {
+                if !file.complete {
+                    incomplete_files.push((
+                        filename.clone(),
+                        file.total.max(file.bytes),
+                        file.started_at.map(|start| duration_ms(start.elapsed())),
+                    ));
+                }
+                if path.is_ok() {
+                    bar.set_position(file.total.max(file.bytes));
+                    bar.finish();
+                } else {
+                    bar.finish_and_clear();
+                }
+            }
+        }
+        if path.is_ok() && state.transfer_started {
+            if let Some(overall) = &state.overall {
+                overall.set_position(state.total_bytes);
+                overall.finish();
+            }
+        } else {
+            if let Some(overall) = &state.overall {
+                overall.finish_and_clear();
+            }
+            resolving.finish_and_clear();
+        }
+    }
+    // Emit durable INFO records only after the dynamic display is finalized.
+    // Otherwise tracing writes above the active MultiProgress area and makes a
+    // completed bar appear after its corresponding completion message.
+    for (filename, bytes, download_ms) in completed_files {
+        if let Some(download_ms) = download_ms {
+            tracing::info!(file = %filename, bytes, download_ms, "File downloaded");
+        } else {
+            tracing::info!(file = %filename, bytes, "File found in cache");
+        }
+    }
+    for (filename, bytes, download_ms) in incomplete_files {
+        let download_ms = download_ms.unwrap_or_default();
+        if path.is_ok() {
+            tracing::info!(file = %filename, bytes, download_ms, "File downloaded");
+        } else {
+            tracing::error!(file = %filename, bytes, download_ms, "File download failed");
+        }
+    }
+    if let Err(error) = &path {
+        tracing::error!(%error, "Model download failed");
+    }
+    let path = path?;
+    let state = state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("model download progress state poisoned"))?;
+    let source = state.source();
+    let downloaded_files = state
+        .files
+        .values()
+        .filter(|file| file.started_at.is_some())
+        .count();
+    let cached_files = state
+        .files
+        .values()
+        .filter(|file| file.complete && file.started_at.is_none())
+        .count();
+    Ok(DownloadOutcome {
+        path,
+        source,
+        total_files: state.total_files,
+        downloaded_files,
+        cached_files,
+        total_bytes: state.total_bytes,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hf_hub::progress::FileProgress;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TOKEN_TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn download_durations_are_rounded_to_three_decimal_places() {
+        assert!((duration_ms(Duration::from_nanos(1_234_567)) - 1.235).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn token_file_precedes_env_and_hf_home_precedes_default_home() {
+        let root = std::env::temp_dir().join(format!(
+            "sys1-hub-token-{}-{}",
+            std::process::id(),
+            TOKEN_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let default_home = root.join("default");
+        let hf_home = root.join("hf");
+        std::fs::create_dir_all(default_home.join(".cache/huggingface")).unwrap();
+        std::fs::create_dir_all(&hf_home).unwrap();
+        std::fs::write(
+            default_home.join(".cache/huggingface/token"),
+            "default-token\n",
+        )
+        .unwrap();
+        std::fs::write(hf_home.join("token"), "hf-home-token\n").unwrap();
+
+        assert_eq!(
+            token_from_file_or_env(
+                Some(hf_home.clone().into_os_string()),
+                Some(default_home.clone().into_os_string()),
+                Some("env-token".into())
+            )
+            .as_deref(),
+            Some("hf-home-token")
+        );
+        assert_eq!(
+            token_from_file_or_env(
+                None,
+                Some(default_home.into_os_string()),
+                Some("env-token".into())
+            )
+            .as_deref(),
+            Some("default-token")
+        );
+        std::fs::remove_file(hf_home.join("token")).unwrap();
+        assert_eq!(
+            token_from_file_or_env(
+                Some(hf_home.into_os_string()),
+                None,
+                Some("env-token".into())
+            )
+            .as_deref(),
+            Some("env-token")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn handler() -> (DownloadProgress, Arc<Mutex<DownloadState>>) {
+        let state = Arc::new(Mutex::new(DownloadState::default()));
+        let multi = MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+        let resolving = multi.add(ProgressBar::new_spinner());
+        (
+            DownloadProgress {
+                multi,
+                resolving,
+                state: Arc::clone(&state),
+            },
+            state,
+        )
+    }
+
+    #[test]
+    fn source_distinguishes_cached_files_from_transfers() {
+        let (handler, state) = handler();
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Start {
+            total_files: 2,
+            total_bytes: 200,
+        }));
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: vec![FileProgress {
+                filename: "cached.bin".into(),
+                bytes_completed: 100,
+                total_bytes: 100,
+                status: FileStatus::Complete,
+            }],
+        }));
+        assert_eq!(state.lock().unwrap().source(), DownloadSource::Cache);
+        assert!(state.lock().unwrap().files["cached.bin"].bar.is_none());
+        assert_eq!(state.lock().unwrap().completion_order, ["cached.bin"]);
+        assert!(
+            state.lock().unwrap().files["cached.bin"]
+                .started_at
+                .is_none()
+        );
+        assert!(
+            state.lock().unwrap().files["cached.bin"]
+                .download_elapsed
+                .is_none()
+        );
+        assert_eq!(state.lock().unwrap().completion_order.len(), 1);
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: vec![FileProgress {
+                filename: "remote.bin".into(),
+                bytes_completed: 0,
+                total_bytes: 100,
+                status: FileStatus::Started,
+            }],
+        }));
+        assert_eq!(state.lock().unwrap().source(), DownloadSource::HuggingFace);
+        assert!(state.lock().unwrap().files["remote.bin"].bar.is_some());
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: vec![FileProgress {
+                filename: "remote.bin".into(),
+                bytes_completed: 100,
+                total_bytes: 100,
+                status: FileStatus::Complete,
+            }],
+        }));
+        assert_eq!(state.lock().unwrap().completion_order.len(), 2);
+        assert_eq!(
+            state.lock().unwrap().completion_order,
+            ["cached.bin", "remote.bin"]
+        );
+        assert!(
+            state.lock().unwrap().files["remote.bin"]
+                .download_elapsed
+                .is_some()
+        );
+        assert!(
+            state.lock().unwrap().files["remote.bin"]
+                .bar
+                .as_ref()
+                .unwrap()
+                .is_finished()
+        );
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: vec![FileProgress {
+                filename: "remote.bin".into(),
+                bytes_completed: 100,
+                total_bytes: 100,
+                status: FileStatus::Complete,
+            }],
+        }));
+        assert_eq!(
+            state.lock().unwrap().completion_order,
+            ["cached.bin", "remote.bin"]
+        );
+    }
+
+    #[test]
+    fn cached_snapshot_does_not_show_transfer_progress() {
+        let (handler, state) = handler();
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Start {
+            total_files: 1,
+            total_bytes: 0,
+        }));
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: vec![FileProgress {
+                filename: "cached.bin".into(),
+                bytes_completed: 0,
+                total_bytes: 0,
+                status: FileStatus::Complete,
+            }],
+        }));
+
+        let state = state.lock().unwrap();
+        assert!(state.overall.is_none());
+        assert!(state.files["cached.bin"].bar.is_none());
+        assert!(handler.resolving.is_finished());
+    }
+
+    #[test]
+    fn aggregate_progress_updates_a_single_matching_file() {
+        let (handler, state) = handler();
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Start {
+            total_files: 1,
+            total_bytes: 100,
+        }));
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: vec![FileProgress {
+                filename: "model.safetensors".into(),
+                bytes_completed: 40,
+                total_bytes: 100,
+                status: FileStatus::InProgress,
+            }],
+        }));
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::AggregateProgress {
+            bytes_completed: 50,
+            total_bytes: 100,
+            bytes_per_sec: None,
+        }));
+        let state = state.lock().unwrap();
+        assert_eq!(state.files["model.safetensors"].bytes, 50);
+        assert_eq!(
+            state.files["model.safetensors"]
+                .bar
+                .as_ref()
+                .unwrap()
+                .position(),
+            50
+        );
+        assert_eq!(state.overall.as_ref().unwrap().position(), 50);
+        assert!(state.files.values().all(|file| !file.complete));
+    }
+
+    #[test]
+    fn aggregate_progress_is_not_assigned_to_multiple_files() {
+        let (handler, state) = handler();
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Start {
+            total_files: 2,
+            total_bytes: 200,
+        }));
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::Progress {
+            files: ["a.bin", "b.bin"]
+                .map(|filename| FileProgress {
+                    filename: filename.into(),
+                    bytes_completed: 10,
+                    total_bytes: 100,
+                    status: FileStatus::InProgress,
+                })
+                .to_vec(),
+        }));
+        handler.on_progress(&ProgressEvent::Download(DownloadEvent::AggregateProgress {
+            bytes_completed: 50,
+            total_bytes: 100,
+            bytes_per_sec: None,
+        }));
+        let state = state.lock().unwrap();
+        assert_eq!(state.files["a.bin"].bytes, 10);
+        assert_eq!(state.files["b.bin"].bytes, 10);
+    }
 }
