@@ -6,32 +6,32 @@
   />
   <br/>
   <em>
-    Blazing fast, self-hosted structured decisions for open-weight models with a TypeSafe AI compatible API, written in Rust.
+    Blazing fast, self-hosted structured decisions for open models with a TypeSafe AI compatible API, written in Rust.
   </em>
 </div>
 
 ## Features
 
 - [TypeSafe AI compatible API](https://docs.typesafe.ai/api)
-- `candle` with [`tokenizers` release candidate](https://huggingface.co/blog/tokenizers-v1)!
-- Dynamic batching bounded by requests and questions
-- SDPA on CPU, Metal, and CUDA
-- Flash Attention on Ampere, Ada Lovelace, and Hopper
-- Blazing fast inference for ModernBERT and Qwen3.5
-- Multimodal decisions from text, images, and video when supported by the model
+- Backed by [`candle`](https://github.com/huggingface/candle) and [`tokenizers`](https://github.com/huggingface/tokenizers)
+- Dynamic, token-based batching bounded by requests
+- Support for CPU, Metal, and CUDA
+- Support for F32, F16, and BF16
+- Support for ModernBERT and Qwen3.5
+- Custom kernels optimized for Metal and CUDA
 
 ## Get started
 
-Rust and Cargo 1.98.1, mandatory. `ffmpeg` and `ffprobe` 6.1.1 or higher for video inputs.
-
-If you run on CUDA you also need `nvcc`. And if you run on Metal, you also need `xcode` and `xcodebuild -downloadComponent MetalToolchain`.
+- Rust and Cargo 1.98.1.
+- NVIDIA CUDA Compiler (`nvcc`) on CUDA
+- XCode and Metal Toolchain on Metal
+- `ffmpeg` and `ffprobe` 6.1.1 or higher for video inputs.
 
 ```bash
 cargo install sys1 --features cpu
 # cargo install sys1 --no-default-features --features metal
 # cargo install sys1 --no-default-features --features cuda
 # cargo install sys1 --no-default-features --features cuda,flash-attn-2 # Ampere, Ada Lovelace, or Hopper
-# cargo install sys1 --no-default-features --features cuda,flash-attn-3 # Hopper
 ```
 
 Then run it with any of the supported models (more coming soon!).
@@ -53,9 +53,7 @@ curl http://localhost:3000/v1/systemone \
     -H "Content-Type: application/json" \
     -d '{
       "model": "convaiinnovations/laya",
-      "state": {
-        "message": "I was charged twice for invoice 4411. Please refund me today."
-      },
+      "state": "I was charged twice for invoice 4411. Please refund me today.",
       "questions": {
         "route": {
           "type": "choice",
@@ -93,7 +91,7 @@ client = TypeSafeClient(base_url="http://localhost:3000", api_key="-")
 
 response = client.system_one(
     model="convaiinnovations/laya",
-    state={"message": "I was charged twice for invoice 4411."},
+    state="I was charged twice for invoice 4411.",
     questions={
         "route": Choice(
             instructions="Where should this ticket go?",
