@@ -34,12 +34,8 @@ jobs:
             expected_platforms: linux/amd64
           - name: ampere
             suffix: -ampere
-            source_suffixes: |-
-              -ampere-amd64
-              -ampere-arm64
-            expected_platforms: |-
-              linux/amd64
-              linux/arm64
+            source_suffixes: -ampere-amd64
+            expected_platforms: linux/amd64
           - name: ada-lovelace
             suffix: -ada-lovelace
             source_suffixes: -ada-lovelace-amd64
