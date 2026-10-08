@@ -1,8 +1,19 @@
 use crate::models::AttentionImplementation;
+#[cfg(feature = "cuda")]
+use candle_core::backend::BackendStorage;
+#[cfg(feature = "cuda")]
+use candle_core::cuda_backend::{
+    WrapErr,
+    cudarc::driver::{LaunchConfig, PushKernelArg},
+};
+#[cfg(feature = "cuda")]
+use candle_core::{CpuStorage, CudaStorage, CustomOp1, CustomOp3, Layout, Shape};
 use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::{
     Embedding, LayerNorm, Linear, Module, VarBuilder, embedding, layer_norm_no_bias, ops::softmax,
 };
+#[cfg(feature = "cuda")]
+use half::{bf16, f16};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -87,6 +98,16 @@ impl RotaryEmbedding {
         .to_dtype(dtype)?;
         Ok((q, k))
     }
+
+    #[cfg(feature = "cuda")]
+    fn apply_qkv(&self, qkv: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let output = qkv.apply_op3_no_bwd(&self.cos, &self.sin, &RopeQkv)?;
+        Ok((
+            output.get(0)?.transpose(1, 2)?,
+            output.get(1)?.transpose(1, 2)?,
+            output.get(2)?.transpose(1, 2)?,
+        ))
+    }
 }
 
 struct Attention {
@@ -139,12 +160,32 @@ impl Attention {
         let qkv = xs
             .to_dtype(self.compute_dtype)?
             .apply(&self.qkv)?
-            .reshape((batch, length, 3, self.heads, self.head_size))?
-            .permute((2, 0, 3, 1, 4))?;
-        let q = qkv.get(0)?;
-        let k = qkv.get(1)?;
-        let v = qkv.get(2)?;
-        let (q, k) = self.rotary.apply(&q, &k)?;
+            .reshape((batch, length, 3, self.heads, self.head_size))?;
+        #[cfg(feature = "cuda")]
+        let fused_rope = xs.device().is_cuda()
+            && self.implementation != AttentionImplementation::Eager
+            && matches!(qkv.dtype(), DType::F16 | DType::BF16)
+            && self.rotary.cos.dtype() == DType::F32;
+        #[cfg(feature = "cuda")]
+        let (q, k, v) = if fused_rope {
+            self.rotary.apply_qkv(&qkv)?
+        } else {
+            let qkv = qkv.permute((2, 0, 3, 1, 4))?;
+            let q = qkv.get(0)?;
+            let k = qkv.get(1)?;
+            let v = qkv.get(2)?;
+            let (q, k) = self.rotary.apply(&q, &k)?;
+            (q, k, v)
+        };
+        #[cfg(not(feature = "cuda"))]
+        let (q, k, v) = {
+            let qkv = qkv.permute((2, 0, 3, 1, 4))?;
+            let q = qkv.get(0)?;
+            let k = qkv.get(1)?;
+            let v = qkv.get(2)?;
+            let (q, k) = self.rotary.apply(&q, &k)?;
+            (q, k, v)
+        };
         let scale = (self.head_size as f64).powf(-0.5);
 
         #[cfg(feature = "metal")]
@@ -244,6 +285,9 @@ fn cpu_windowed_attention(
     window: usize,
 ) -> Result<Tensor> {
     let length = q.dim(2)?;
+    if length <= window.saturating_add(window / 4) {
+        return eager_attention(q, k, v, scale, mask);
+    }
     let block = window.div_ceil(2).max(1);
     let mut output = Vec::with_capacity(length.div_ceil(block));
     for query_start in (0..length).step_by(block) {
@@ -421,11 +465,297 @@ impl Mlp {
 
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let parts = xs
-            .to_dtype(self.compute_dtype)?
-            .apply(&self.input)?
-            .chunk(2, D::Minus1)?;
+        let projected = xs.to_dtype(self.compute_dtype)?.apply(&self.input)?;
+        #[cfg(feature = "cuda")]
+        if projected.device().is_cuda() {
+            return geglu(&projected)?.apply(&self.output);
+        }
+        let parts = projected.chunk(2, D::Minus1)?;
         (&parts[0].gelu_erf()? * &parts[1])?.apply(&self.output)
+    }
+}
+
+#[cfg(feature = "cuda")]
+const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/cuda.ptx"));
+
+#[cfg(feature = "cuda")]
+struct Geglu;
+
+#[cfg(feature = "cuda")]
+impl CustomOp1 for Geglu {
+    fn name(&self) -> &'static str {
+        "modernbert-geglu"
+    }
+
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("ModernBERT GeGLU kernel requires CUDA")
+    }
+
+    fn cuda_fwd(&self, storage: &CudaStorage, layout: &Layout) -> Result<(CudaStorage, Shape)> {
+        let mut dims = layout.shape().dims().to_vec();
+        let Some(last) = dims.last_mut() else {
+            candle_core::bail!("ModernBERT GeGLU input has no feature dimension")
+        };
+        if *last == 0 || *last % 2 != 0 {
+            candle_core::bail!("ModernBERT GeGLU feature dimension must be positive and even")
+        }
+        *last /= 2;
+        let inner = i32::try_from(*last).map_err(|_| {
+            candle_core::Error::Msg("ModernBERT GeGLU feature dimension is too large".into())
+        })?;
+        let count = layout.shape().elem_count() / 2;
+        let count_arg = i64::try_from(count)
+            .map_err(|_| candle_core::Error::Msg("ModernBERT GeGLU input is too large".into()))?;
+        let blocks = u32::try_from(count.div_ceil(256)).map_err(|_| {
+            candle_core::Error::Msg("ModernBERT GeGLU launch grid is too large".into())
+        })?;
+        let (start, end) = layout.contiguous_offsets().ok_or_else(|| {
+            candle_core::Error::Msg("ModernBERT GeGLU input must be contiguous".into())
+        })?;
+        let device = storage.device().clone();
+        let config = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let output = match storage.dtype() {
+            DType::F32 => {
+                let input = storage.as_cuda_slice::<f32>()?.slice(start..end);
+                let output = unsafe { device.alloc::<f32>(count)? };
+                let function =
+                    device.get_or_load_custom_func("modernbert_geglu_f32", "sys1", PTX)?;
+                let mut launch = function.builder();
+                launch.arg(&input).arg(&output).arg(&count_arg).arg(&inner);
+                unsafe { launch.launch(config) }.w()?;
+                CudaStorage::wrap_cuda_slice(output, device)
+            }
+            DType::F16 => {
+                let input = storage.as_cuda_slice::<f16>()?.slice(start..end);
+                let output = unsafe { device.alloc::<f16>(count)? };
+                let function =
+                    device.get_or_load_custom_func("modernbert_geglu_f16", "sys1", PTX)?;
+                let mut launch = function.builder();
+                launch.arg(&input).arg(&output).arg(&count_arg).arg(&inner);
+                unsafe { launch.launch(config) }.w()?;
+                CudaStorage::wrap_cuda_slice(output, device)
+            }
+            DType::BF16 => {
+                let input = storage.as_cuda_slice::<bf16>()?.slice(start..end);
+                let output = unsafe { device.alloc::<bf16>(count)? };
+                let function =
+                    device.get_or_load_custom_func("modernbert_geglu_bf16", "sys1", PTX)?;
+                let mut launch = function.builder();
+                launch.arg(&input).arg(&output).arg(&count_arg).arg(&inner);
+                unsafe { launch.launch(config) }.w()?;
+                CudaStorage::wrap_cuda_slice(output, device)
+            }
+            dtype => candle_core::bail!("unsupported ModernBERT GeGLU dtype {dtype:?}"),
+        };
+        Ok((output, Shape::from(dims)))
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn geglu(input: &Tensor) -> Result<Tensor> {
+    input.contiguous()?.apply_op1_no_bwd(&Geglu)
+}
+
+#[cfg(feature = "cuda")]
+struct RopeQkv;
+
+#[cfg(feature = "cuda")]
+impl CustomOp3 for RopeQkv {
+    fn name(&self) -> &'static str {
+        "modernbert-rope-qkv"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("ModernBERT fused RoPE requires CUDA")
+    }
+
+    fn cuda_fwd(
+        &self,
+        input_storage: &CudaStorage,
+        input_layout: &Layout,
+        cos_storage: &CudaStorage,
+        cos_layout: &Layout,
+        sin_storage: &CudaStorage,
+        sin_layout: &Layout,
+    ) -> Result<(CudaStorage, Shape)> {
+        let &[batch, length, 3, heads, dim] = input_layout.shape().dims() else {
+            candle_core::bail!("ModernBERT fused RoPE expects [batch, length, 3, heads, dim]")
+        };
+        if dim == 0 || dim % 2 != 0 || heads == 0 || length == 0 {
+            candle_core::bail!("ModernBERT fused RoPE has invalid dimensions")
+        }
+        if cos_storage.dtype() != DType::F32
+            || sin_storage.dtype() != DType::F32
+            || cos_layout.shape().dims() != sin_layout.shape().dims()
+            || cos_layout.shape().dims().len() != 2
+            || cos_layout.shape().dims()[0] < length
+            || cos_layout.shape().dims()[1] != dim / 2
+        {
+            candle_core::bail!("ModernBERT fused RoPE has invalid cosine/sine tables")
+        }
+        let pairs = batch
+            .checked_mul(length)
+            .and_then(|value| value.checked_mul(heads))
+            .and_then(|value| value.checked_mul(dim / 2))
+            .ok_or_else(|| {
+                candle_core::Error::Msg("ModernBERT fused RoPE shape is too large".into())
+            })?;
+        let output_count = input_layout.shape().elem_count();
+        let pairs_arg = i64::try_from(pairs).map_err(|_| {
+            candle_core::Error::Msg("ModernBERT fused RoPE shape is too large".into())
+        })?;
+        let length_arg = i32::try_from(length)
+            .map_err(|_| candle_core::Error::Msg("ModernBERT sequence is too long".into()))?;
+        let heads_arg = i32::try_from(heads)
+            .map_err(|_| candle_core::Error::Msg("ModernBERT has too many heads".into()))?;
+        let dim_arg = i32::try_from(dim).map_err(|_| {
+            candle_core::Error::Msg("ModernBERT head dimension is too large".into())
+        })?;
+        let blocks = u32::try_from(pairs.div_ceil(256)).map_err(|_| {
+            candle_core::Error::Msg("ModernBERT fused RoPE grid is too large".into())
+        })?;
+        let (input_start, input_end) = input_layout.contiguous_offsets().ok_or_else(|| {
+            candle_core::Error::Msg("ModernBERT fused RoPE input must be contiguous".into())
+        })?;
+        let (cos_start, cos_end) = cos_layout.contiguous_offsets().ok_or_else(|| {
+            candle_core::Error::Msg("ModernBERT RoPE cosine table must be contiguous".into())
+        })?;
+        let (sin_start, sin_end) = sin_layout.contiguous_offsets().ok_or_else(|| {
+            candle_core::Error::Msg("ModernBERT RoPE sine table must be contiguous".into())
+        })?;
+        let device = input_storage.device().clone();
+        let cos = cos_storage
+            .as_cuda_slice::<f32>()?
+            .slice(cos_start..cos_end);
+        let sin = sin_storage
+            .as_cuda_slice::<f32>()?
+            .slice(sin_start..sin_end);
+        let config = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        macro_rules! launch_rope {
+            ($type:ty, $kernel:literal) => {{
+                let input = input_storage
+                    .as_cuda_slice::<$type>()?
+                    .slice(input_start..input_end);
+                let output = unsafe { device.alloc::<$type>(output_count)? };
+                let function = device.get_or_load_custom_func($kernel, "sys1", PTX)?;
+                let mut launch = function.builder();
+                launch
+                    .arg(&input)
+                    .arg(&cos)
+                    .arg(&sin)
+                    .arg(&output)
+                    .arg(&pairs_arg)
+                    .arg(&length_arg)
+                    .arg(&heads_arg)
+                    .arg(&dim_arg);
+                unsafe { launch.launch(config) }.w()?;
+                CudaStorage::wrap_cuda_slice(output, device)
+            }};
+        }
+        let output = match input_storage.dtype() {
+            DType::F16 => launch_rope!(f16, "modernbert_rope_qkv_f16"),
+            DType::BF16 => launch_rope!(bf16, "modernbert_rope_qkv_bf16"),
+            dtype => candle_core::bail!("unsupported ModernBERT fused RoPE dtype {dtype:?}"),
+        };
+        Ok((output, Shape::from((3, batch, length, heads, dim))))
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_tests {
+    use super::*;
+    use candle_core::{D, Device};
+
+    #[test]
+    fn fused_geglu_matches_candle() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let values = [
+            -4.0, -1.5, -0.25, 0.0, 0.5, 1.25, 3.0, 5.0, 2.0, -0.75, 0.125, -3.5, 1.0, 0.5, -2.0,
+            4.5,
+        ];
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let input = Tensor::from_vec(values.to_vec(), (2, 8), &device)?.to_dtype(dtype)?;
+            let parts = input.chunk(2, D::Minus1)?;
+            let expected = (&parts[0].gelu_erf()? * &parts[1])?
+                .to_dtype(DType::F32)?
+                .to_vec2::<f32>()?;
+            let actual = geglu(&input)?.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+            let tolerance = if dtype == DType::F32 { 1e-5 } else { 0.04 };
+            for (expected, actual) in expected.iter().flatten().zip(actual.iter().flatten()) {
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "{dtype:?}: expected {expected}, got {actual}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_rope_qkv_matches_candle() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let cos = Tensor::from_vec(
+            (0..20).map(|i| (i as f32 * 0.13).cos()).collect::<Vec<_>>(),
+            (5, 4),
+            &device,
+        )?;
+        let sin = Tensor::from_vec(
+            (0..20).map(|i| (i as f32 * 0.13).sin()).collect::<Vec<_>>(),
+            (5, 4),
+            &device,
+        )?;
+        let rotary = RotaryEmbedding { sin, cos };
+        let values = (0..480)
+            .map(|i| ((i * 37 % 127) as f32 - 63.0) / 21.0)
+            .collect::<Vec<_>>();
+        for dtype in [DType::F16, DType::BF16] {
+            let qkv =
+                Tensor::from_vec(values.clone(), (2, 5, 3, 2, 8), &device)?.to_dtype(dtype)?;
+            let original = qkv.permute((2, 0, 3, 1, 4))?;
+            let q = original.get(0)?;
+            let k = original.get(1)?;
+            let v = original.get(2)?;
+            let (expected_q, expected_k) = rotary.apply(&q, &k)?;
+            let (actual_q, actual_k, actual_v) = rotary.apply_qkv(&qkv)?;
+            let tolerance = if dtype == DType::F16 { 0.003 } else { 0.03 };
+            for (actual, expected) in [
+                (actual_q, expected_q),
+                (actual_k, expected_k),
+                (actual_v, v),
+            ] {
+                let actual = actual
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let expected = expected
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert!(
+                        (actual - expected).abs() <= tolerance,
+                        "{dtype:?}: expected {expected}, got {actual}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -474,7 +804,7 @@ impl Layer {
         &self,
         xs: &Tensor,
         global_mask: Option<&Tensor>,
-        local_mask: &Tensor,
+        local_mask: Option<&Tensor>,
         lengths: &[usize],
         local_window: usize,
     ) -> Result<Tensor> {
@@ -482,13 +812,13 @@ impl Layer {
             Some(norm) => xs.apply(norm)?,
             None => xs.clone(),
         };
-        let mask = if self.uses_local_attention {
-            Some(match global_mask {
-                Some(global_mask) => global_mask.broadcast_add(local_mask)?,
-                None => local_mask.clone(),
-            })
-        } else {
-            global_mask.cloned()
+        let mask = match (self.uses_local_attention, local_mask, global_mask) {
+            (true, Some(local_mask), Some(global_mask)) => {
+                Some(global_mask.broadcast_add(local_mask)?)
+            }
+            (true, Some(local_mask), None) => Some(local_mask.clone()),
+            (false, _, global_mask) => global_mask.cloned(),
+            (true, None, _) => None,
         };
         let attention = self
             .attention
@@ -512,6 +842,7 @@ pub struct Encoder {
     layers: Vec<Layer>,
     final_norm: LayerNorm,
     local_attention_size: usize,
+    implementation: AttentionImplementation,
     dtype: DType,
     local_masks: Mutex<HashMap<usize, Tensor>>,
 }
@@ -569,6 +900,7 @@ impl Encoder {
                 vb.pp("model.final_norm"),
             )?,
             local_attention_size: config.local_attention,
+            implementation,
             dtype: compute_dtype,
             local_masks: Mutex::new(HashMap::new()),
         })
@@ -582,17 +914,20 @@ impl Encoder {
         has_padding: bool,
     ) -> Result<Tensor> {
         let length = ids.dim(1)?;
-        let global_mask = has_padding
+        let uses_eager_masks = self.implementation == AttentionImplementation::Eager;
+        let global_mask = (uses_eager_masks && has_padding)
             .then(|| global_attention_mask(mask, length, self.dtype))
             .transpose()?;
-        let local_mask = self.local_mask(length, ids.device())?;
+        let local_mask = uses_eager_masks
+            .then(|| self.local_mask(length, ids.device()))
+            .transpose()?;
         let local_window = self.local_attention_size / 2;
         let mut xs = ids.apply(&self.embeddings)?.apply(&self.norm)?;
         for layer in &self.layers {
             xs = layer.forward(
                 &xs,
                 global_mask.as_ref(),
-                &local_mask,
+                local_mask.as_ref(),
                 lengths,
                 local_window,
             )?;

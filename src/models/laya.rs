@@ -464,7 +464,7 @@ impl Laya {
                 .forward(&hidden, &head_mask, &lengths)
                 .with_context(|| format!("decision head layer {index}"))?;
         }
-        let output = if batch >= 8 && !self.device.is_cpu() {
+        let output = if !self.device.is_cpu() {
             self.score_batched(&hidden, &unique, length)?
         } else {
             self.score_rows(&hidden, &unique)?

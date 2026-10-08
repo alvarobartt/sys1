@@ -23,7 +23,7 @@
 
 ## Get started
 
-Rust and Cargo 1.98.1, mandatory. `ffmpeg` 6.1.1 or higher (and `ffmprobe`), optional, for models with support for vision.
+Rust and Cargo 1.98.1, mandatory. `ffmpeg` and `ffprobe` 6.1.1 or higher for video inputs.
 
 If you run on CUDA you also need `nvcc`. And if you run on Metal, you also need `xcode` and `xcodebuild -downloadComponent MetalToolchain`.
 

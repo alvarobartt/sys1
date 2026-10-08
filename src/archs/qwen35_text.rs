@@ -21,7 +21,7 @@ use candle_core::{
 use half::bf16;
 
 #[cfg(feature = "cuda")]
-const CUDA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/qwen35.ptx"));
+const CUDA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/cuda.ptx"));
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -589,8 +589,7 @@ fn cuda_conv_silu(input: &Tensor, weights: &Tensor) -> Result<Tensor> {
                 .as_cuda_slice::<bf16>()?
                 .slice(weight_start..weight_end);
             let output = unsafe { device.alloc::<bf16>(count)? };
-            let function =
-                device.get_or_load_custom_func("qwen35_conv_bf16", "qwen35", CUDA_PTX)?;
+            let function = device.get_or_load_custom_func("qwen35_conv_bf16", "sys1", CUDA_PTX)?;
             let mut launch = function.builder();
             launch.arg(&source);
             launch.arg(&filters);
@@ -610,7 +609,7 @@ fn cuda_conv_silu(input: &Tensor, weights: &Tensor) -> Result<Tensor> {
                 .as_cuda_slice::<f32>()?
                 .slice(weight_start..weight_end);
             let output = unsafe { device.alloc::<f32>(count)? };
-            let function = device.get_or_load_custom_func("qwen35_conv_f32", "qwen35", CUDA_PTX)?;
+            let function = device.get_or_load_custom_func("qwen35_conv_f32", "sys1", CUDA_PTX)?;
             let mut launch = function.builder();
             launch.arg(&source);
             launch.arg(&filters);
@@ -661,7 +660,7 @@ fn cuda_delta_rule(
     let source = storage.as_cuda_slice::<f32>()?.slice(start..end);
     let device = storage.device().clone();
     let output = unsafe { device.alloc::<f32>(batch * heads * length * value_dim)? };
-    let function = device.get_or_load_custom_func("qwen35_delta_f32", "qwen35_delta", CUDA_PTX)?;
+    let function = device.get_or_load_custom_func("qwen35_delta_f32", "sys1", CUDA_PTX)?;
     let config = LaunchConfig {
         grid_dim: ((batch * heads) as u32, value_dim.div_ceil(4) as u32, 1),
         block_dim: (128, 1, 1),

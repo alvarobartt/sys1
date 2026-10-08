@@ -5,11 +5,63 @@ use std::{
     io::{Read, Write},
     net::{IpAddr, ToSocketAddrs},
     process::{Command, Stdio},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
 const MAX_MEDIA_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DECODED_BYTES: usize = 128 * 1024 * 1024;
+static VIDEO_TOOLS_VALIDATED: OnceLock<()> = OnceLock::new();
+
+fn parse_tool_version(output: &str, program: &str) -> anyhow::Result<(u32, u32, u32)> {
+    let version = output
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix(&format!("{program} version ")))
+        .context("unexpected FFmpeg version output")?
+        .trim_start_matches('n');
+    let mut parts = version.split('.');
+    let major = parts
+        .next()
+        .context("missing FFmpeg major version")?
+        .parse()?;
+    let minor = parts
+        .next()
+        .context("missing FFmpeg minor version")?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()?;
+    let patch = parts
+        .next()
+        .unwrap_or("0")
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()?;
+    Ok((major, minor, patch))
+}
+
+pub(crate) fn require_video_tools() -> anyhow::Result<()> {
+    if VIDEO_TOOLS_VALIDATED.get().is_some() {
+        return Ok(());
+    }
+    for program in ["ffmpeg", "ffprobe"] {
+        let output = Command::new(program)
+            .arg("-version")
+            .output()
+            .with_context(|| format!("{program} is required for video processing"))?;
+        anyhow::ensure!(output.status.success(), "failed to check {program} version");
+        let version = String::from_utf8_lossy(&output.stdout);
+        let (major, minor, patch) = parse_tool_version(&version, program)?;
+        anyhow::ensure!(
+            (major, minor, patch) >= (6, 1, 1),
+            "{program} 6.1.1 or newer is required for video processing; found {major}.{minor}.{patch}"
+        );
+    }
+    let _ = VIDEO_TOOLS_VALIDATED.set(());
+    Ok(())
+}
 
 fn public_ip(address: IpAddr) -> bool {
     match address {
@@ -236,6 +288,22 @@ pub(crate) fn run_file_tool(
 mod tests {
     use super::*;
     use crate::schema::{MediaBase64, MediaUrl};
+
+    #[test]
+    fn parses_ffmpeg_versions() {
+        assert_eq!(
+            parse_tool_version("ffmpeg version 6.1.1-3ubuntu5 Copyright", "ffmpeg").unwrap(),
+            (6, 1, 1)
+        );
+        assert_eq!(
+            parse_tool_version("ffprobe version n5.1.6 Copyright", "ffprobe").unwrap(),
+            (5, 1, 6)
+        );
+        assert_eq!(
+            parse_tool_version("ffmpeg version 8.0 Copyright", "ffmpeg").unwrap(),
+            (8, 0, 0)
+        );
+    }
 
     #[cfg(unix)]
     #[test]

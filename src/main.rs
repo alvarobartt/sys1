@@ -129,6 +129,27 @@ struct Args {
 }
 
 impl Args {
+    fn attention(
+        requested: models::AttentionImplementation,
+        architecture: models::Architecture,
+        dtype: DType,
+    ) -> models::AttentionImplementation {
+        if architecture != models::Architecture::Laya
+            || requested != models::AttentionImplementation::Auto
+        {
+            return requested;
+        }
+        if matches!(dtype, DType::F16 | DType::BF16) {
+            if cfg!(feature = "flash-attn-2") {
+                return models::AttentionImplementation::FlashAttention2;
+            }
+            if cfg!(feature = "flash-attn-3") {
+                return models::AttentionImplementation::FlashAttention3;
+            }
+        }
+        models::AttentionImplementation::Eager
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.max_batch_size > 0, "--max-batch-size must be positive");
         anyhow::ensure!(
@@ -247,13 +268,7 @@ async fn main() -> anyhow::Result<()> {
         Some(dtype) => dtype,
         None => models::model_default_dtype(&model_path, architecture)?,
     };
-    let attention = if architecture == models::Architecture::Laya
-        && args.attention == models::AttentionImplementation::Auto
-    {
-        models::AttentionImplementation::Eager
-    } else {
-        args.attention
-    };
+    let attention = Args::attention(args.attention, architecture, dtype);
     attention.validate(dtype)?;
     let served_model_name = args.served_model_name.unwrap_or(source_name);
     let started = Instant::now();
@@ -453,6 +468,34 @@ mod tests {
         assert_eq!(
             args.attention,
             models::AttentionImplementation::FlashAttention2
+        );
+    }
+
+    #[test]
+    fn defaults_to_available_flash_attention_for_laya() {
+        let args = Args::try_parse_from(["sys1"]).unwrap();
+        assert_eq!(
+            Args::attention(args.attention, models::Architecture::Laya, DType::F32),
+            models::AttentionImplementation::Eager
+        );
+        let low_precision = if cfg!(feature = "flash-attn-2") {
+            models::AttentionImplementation::FlashAttention2
+        } else if cfg!(feature = "flash-attn-3") {
+            models::AttentionImplementation::FlashAttention3
+        } else {
+            models::AttentionImplementation::Eager
+        };
+        assert_eq!(
+            Args::attention(args.attention, models::Architecture::Laya, DType::F16),
+            low_precision
+        );
+        assert_eq!(
+            Args::attention(args.attention, models::Architecture::Laya, DType::BF16),
+            low_precision
+        );
+        assert_eq!(
+            Args::attention(args.attention, models::Architecture::Qwen35, DType::BF16),
+            models::AttentionImplementation::Auto
         );
     }
 

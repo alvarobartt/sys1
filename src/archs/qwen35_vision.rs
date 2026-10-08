@@ -798,6 +798,7 @@ pub mod video {
         config: &VisionConfig,
         max_tokens: usize,
     ) -> anyhow::Result<Videos> {
+        crate::media::require_video_tools()?;
         let mut patches = Vec::new();
         let mut grids = Vec::with_capacity(inputs.len());
         let mut timestamps = Vec::with_capacity(inputs.len());
