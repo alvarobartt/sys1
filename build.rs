@@ -1,7 +1,26 @@
-use std::env;
+use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
+
+    if env::var_os("CARGO_FEATURE_CUDA").is_some() {
+        println!("cargo:rerun-if-changed=src/kernels/modernbert.cu");
+        let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("modernbert.ptx");
+        let status = Command::new("nvcc")
+            .args([
+                "-ptx",
+                "-arch=compute_75",
+                "src/kernels/modernbert.cu",
+                "-o",
+            ])
+            .arg(&output)
+            .status()
+            .expect("failed to run nvcc for ModernBERT CUDA kernels");
+        assert!(
+            status.success(),
+            "failed to compile ModernBERT CUDA kernels"
+        );
+    }
 
     let flash_attention_2 = env::var_os("CARGO_FEATURE_FLASH_ATTN_2").is_some();
     let flash_attention_3 = env::var_os("CARGO_FEATURE_FLASH_ATTN_3").is_some();
