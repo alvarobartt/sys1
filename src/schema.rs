@@ -7,10 +7,10 @@ pub struct DecisionRequest {
     #[serde(default)]
     pub model: Option<String>,
     pub state: Value,
-    /// Experimental image inputs, accepted only by models with image support. Each item may be a public HTTP(S) URL, base64 string or data URL, JSON byte array, or object containing url, base64, or bytes.
+    /// Experimental image inputs, accepted only by models with image support. Each item may be a public HTTP(S) URL, base64 string or data URL, object with content_type and base64 (image/png, image/jpeg, or image/webp for images; video/* for videos), JSON byte array, or legacy object containing url, base64, or bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<MediaInput>,
-    /// Experimental video inputs, accepted only by models with video support. Each item may be a public HTTP(S) URL, base64 string or data URL, JSON byte array, or object containing url, base64, or bytes.
+    /// Experimental video inputs, accepted only by models with video support. Each item may be a public HTTP(S) URL, base64 string or data URL, object with content_type and base64 (image/png, image/jpeg, or image/webp for images; video/* for videos), JSON byte array, or legacy object containing url, base64, or bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub videos: Vec<MediaInput>,
     #[schema(value_type = Object)]
@@ -23,6 +23,8 @@ pub enum MediaInput {
     Text(String),
     Bytes(Vec<u8>),
     Url(MediaUrl),
+    /// Embedded base64 media with an explicit MIME type.
+    Embedded(MediaContent),
     Base64(MediaBase64),
     ByteObject(MediaBytes),
 }
@@ -51,6 +53,46 @@ pub struct MediaBase64 {
     pub base64: String,
 }
 
+/// Cloudflare-compatible embedded media. Both fields are required.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MediaContent {
+    /// image/png, image/jpeg, or image/webp for images; video/* for videos.
+    pub content_type: String,
+    /// Base64-encoded file bytes, without a data URL prefix.
+    pub base64: String,
+}
+
+impl MediaInput {
+    pub(crate) fn validate_content_type(&self, kind: &str) -> Result<(), String> {
+        if let Self::Embedded(value) = self {
+            let valid = match kind {
+                "image" => matches!(
+                    value.content_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/webp"
+                ),
+                "video" => value
+                    .content_type
+                    .strip_prefix("video/")
+                    .is_some_and(|subtype| {
+                        !subtype.is_empty()
+                            && subtype.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&byte)
+                            })
+                    }),
+                _ => false,
+            };
+            if !valid {
+                return Err(format!(
+                    "invalid {kind} content_type: {:?}",
+                    value.content_type
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MediaBytes {
@@ -61,10 +103,10 @@ pub struct MediaBytes {
 pub struct SystemOneRequest {
     pub model: Option<String>,
     pub state: Value,
-    /// Experimental image inputs, accepted only by models with image support.
+    /// Experimental image inputs: public HTTP(S) URL or base64 strings (including data URLs), or objects with content_type (image/png, image/jpeg, image/webp) and base64. Legacy byte arrays and url/base64/bytes objects are also accepted.
     #[schema(required = false)]
     pub images: Vec<MediaInput>,
-    /// Experimental video inputs, accepted only by models with video support.
+    /// Experimental video inputs: public HTTP(S) URL or base64 strings (including data URLs), or objects with content_type (e.g. video/mp4 or video/webm) and base64. Legacy byte arrays and url/base64/bytes objects are also accepted.
     #[schema(required = false)]
     pub videos: Vec<MediaInput>,
     #[schema(value_type = Object)]
@@ -141,8 +183,27 @@ impl TryFrom<Value> for SystemOneRequest {
         let media = |name: &str| -> Result<Vec<MediaInput>, HTTPValidationError> {
             match body.get(name) {
                 None => Ok(Vec::new()),
-                Some(value) => serde_json::from_value(value.clone())
-                    .map_err(|error| invalid(vec!["body".into(), name.into()], error.to_string())),
+                Some(value) => {
+                    let inputs: Vec<MediaInput> =
+                        serde_json::from_value(value.clone()).map_err(|error| {
+                            invalid(vec!["body".into(), name.into()], error.to_string())
+                        })?;
+                    let kind = if name == "images" { "image" } else { "video" };
+                    for (index, input) in inputs.iter().enumerate() {
+                        input.validate_content_type(kind).map_err(|message| {
+                            invalid(
+                                vec![
+                                    "body".into(),
+                                    name.into(),
+                                    index.to_string(),
+                                    "content_type".into(),
+                                ],
+                                message,
+                            )
+                        })?;
+                    }
+                    Ok(inputs)
+                }
             }
         };
         let images = media("images")?;
@@ -357,6 +418,32 @@ impl ApiError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn validates_embedded_media_types_in_systemone_requests() {
+        for (field, content_type, valid) in [
+            ("images", "image/png", true),
+            ("images", "image/jpeg", true),
+            ("images", "image/webp", true),
+            ("videos", "video/mp4", true),
+            ("videos", "video/webm", true),
+            ("images", "video/mp4", false),
+            ("images", "image/svg+xml", false),
+            ("videos", "image/png", false),
+            ("videos", "video/", false),
+        ] {
+            let mut body = json!({"state": "Review", "questions": {"ok": {"type": "noul"}}});
+            body[field] = json!([{"content_type": content_type, "base64": "AA=="}]);
+            assert_eq!(
+                SystemOneRequest::try_from(body).is_ok(),
+                valid,
+                "{field}: {content_type}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<MediaInput>(json!({"content_type": "image/png"})).is_err()
+        );
+    }
 
     #[test]
     fn accepts_each_json_media_representation() {

@@ -138,6 +138,9 @@ fn download_url(value: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 pub(crate) fn input_bytes(input: &MediaInput, kind: &str) -> anyhow::Result<Vec<u8>> {
+    input
+        .validate_content_type(kind)
+        .map_err(anyhow::Error::msg)?;
     let bytes = match input {
         MediaInput::Text(value) if value.contains("://") => download_url(value)?,
         MediaInput::Url(value) => download_url(&value.url)?,
@@ -153,6 +156,9 @@ pub(crate) fn input_bytes(input: &MediaInput, kind: &str) -> anyhow::Result<Vec<
             };
             STANDARD.decode(encoded).context("invalid media base64")?
         }
+        MediaInput::Embedded(value) => STANDARD
+            .decode(&value.base64)
+            .context("invalid media base64")?,
         MediaInput::Base64(value) => STANDARD
             .decode(&value.base64)
             .context("invalid media base64")?,
@@ -329,6 +335,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("decoded image exceeds 4 bytes"));
+    }
+
+    #[test]
+    fn decodes_embedded_images_and_videos() {
+        for (kind, content_type) in [("image", "image/png"), ("video", "video/mp4")] {
+            let input: MediaInput = serde_json::from_value(serde_json::json!({
+                "content_type": content_type, "base64": STANDARD.encode(b"file bytes")
+            }))
+            .unwrap();
+            assert_eq!(input_bytes(&input, kind).unwrap(), b"file bytes");
+            let wrong_kind = if kind == "image" { "video" } else { "image" };
+            assert!(input_bytes(&input, wrong_kind).is_err());
+        }
+        let invalid: MediaInput = serde_json::from_value(serde_json::json!({
+            "content_type": "video/mp4", "base64": "invalid!"
+        }))
+        .unwrap();
+        assert!(
+            input_bytes(&invalid, "video")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid media base64")
+        );
     }
 
     #[test]
