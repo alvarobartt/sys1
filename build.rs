@@ -54,22 +54,8 @@ fn main() {
     }
     if env::var_os("CARGO_FEATURE_CUDA").is_some() {
         let capability = compute_capability();
-        let flash_attention_2 = env::var_os("CARGO_FEATURE_FLASH_ATTN_2").is_some();
-        let flash_attention_3 = env::var_os("CARGO_FEATURE_FLASH_ATTN_3").is_some();
-        if flash_attention_2 || flash_attention_3 {
-            match (flash_attention_2, capability) {
-                (true, 80..=99) | (false, 90) => {}
-                (true, _) => {
-                    panic!(
-                        "`flash-attn-2` supports compute capability 8.x or 9.x; got {capability}"
-                    )
-                }
-                (false, _) => {
-                    panic!(
-                        "`flash-attn-3` requires Hopper compute capability 9.0; got {capability}"
-                    )
-                }
-            }
+        if env::var_os("CARGO_FEATURE_FLASH_ATTN_2").is_some() && !(80..=99).contains(&capability) {
+            panic!("`flash-attn-2` supports compute capability 8.x or 9.x; got {capability}")
         }
 
         let sources = kernel_sources("cu");

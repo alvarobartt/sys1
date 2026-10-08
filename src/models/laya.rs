@@ -637,7 +637,7 @@ fn validate_attention(
     compute_dtype: DType,
 ) -> anyhow::Result<()> {
     attention.validate(compute_dtype)?;
-    #[cfg(any(feature = "flash-attn-2", feature = "flash-attn-3"))]
+    #[cfg(feature = "flash-attn-2")]
     match attention {
         AttentionImplementation::Eager => {}
         implementation => {
@@ -660,7 +660,7 @@ fn validate_attention(
     Ok(())
 }
 
-#[cfg(any(feature = "flash-attn-2", feature = "flash-attn-3", test))]
+#[cfg(any(feature = "flash-attn-2", test))]
 fn validate_flash_capability(
     attention: AttentionImplementation,
     major: i32,
@@ -670,7 +670,6 @@ fn validate_flash_capability(
         AttentionImplementation::Auto => true,
         AttentionImplementation::Eager => true,
         AttentionImplementation::FlashAttention2 => (8..=9).contains(&major),
-        AttentionImplementation::FlashAttention3 => (major, minor) == (9, 0),
     };
     anyhow::ensure!(
         supported,
@@ -1081,16 +1080,10 @@ mod tests {
     fn validates_flash_attention_compute_capabilities() {
         validate_flash_capability(AttentionImplementation::FlashAttention2, 8, 9).unwrap();
         validate_flash_capability(AttentionImplementation::FlashAttention2, 9, 0).unwrap();
-        validate_flash_capability(AttentionImplementation::FlashAttention3, 9, 0).unwrap();
 
         assert!(validate_flash_capability(AttentionImplementation::FlashAttention2, 7, 5).is_err());
         assert!(
             validate_flash_capability(AttentionImplementation::FlashAttention2, 10, 0).is_err()
-        );
-        assert!(validate_flash_capability(AttentionImplementation::FlashAttention3, 8, 9).is_err());
-        assert!(validate_flash_capability(AttentionImplementation::FlashAttention3, 9, 1).is_err());
-        assert!(
-            validate_flash_capability(AttentionImplementation::FlashAttention3, 12, 0).is_err()
         );
     }
 }

@@ -21,8 +21,6 @@ pub enum AttentionImplementation {
     Eager,
     #[value(name = "flash-attn-2")]
     FlashAttention2,
-    #[value(name = "flash-attn-3")]
-    FlashAttention3,
 }
 
 impl AttentionImplementation {
@@ -31,7 +29,6 @@ impl AttentionImplementation {
             Self::Auto => "auto",
             Self::Eager => "eager",
             Self::FlashAttention2 => "flash-attn-2",
-            Self::FlashAttention3 => "flash-attn-3",
         }
     }
 
@@ -41,7 +38,6 @@ impl AttentionImplementation {
             Self::Auto => return Ok(()),
             Self::Eager => return Ok(()),
             Self::FlashAttention2 => cfg!(feature = "flash-attn-2"),
-            Self::FlashAttention3 => cfg!(feature = "flash-attn-3"),
         };
         anyhow::ensure!(
             enabled,
@@ -62,42 +58,47 @@ pub enum Architecture {
 }
 
 impl Architecture {
-    pub fn from_path(path: &Path) -> anyhow::Result<Self> {
-        let root_config = path.join("config.json");
-        let encoder_config = path.join("encoder/config.json");
-        let config_path = if root_config.is_file() {
-            root_config
-        } else {
-            encoder_config
-        };
-        let config: ModelConfig = serde_json::from_slice(
-            &fs::read(&config_path)
-                .with_context(|| format!("failed to read {}", config_path.display()))?,
-        )
-        .with_context(|| format!("failed to parse {}", config_path.display()))?;
-        let laya_config_path = path.join("rl_agent_config.json");
-        if config.model_type == "qwen3_5" {
-            return Ok(Self::Qwen35);
+    fn from_model_type(model_type: &str) -> Option<Self> {
+        match model_type {
+            "laya" => Some(Self::Laya),
+            "qwen3_5" => Some(Self::Qwen35),
+            _ => None,
         }
-        if matches!(config.model_type.as_str(), "laya" | "modernbert") && laya_config_path.is_file()
-        {
-            let encoder_config_path = path.join("encoder/config.json");
-            let encoder_config: ModelConfig =
-                serde_json::from_slice(&fs::read(&encoder_config_path).with_context(|| {
-                    format!("failed to read {}", encoder_config_path.display())
-                })?)
-                .with_context(|| format!("failed to parse {}", encoder_config_path.display()))?;
+    }
+
+    pub fn from_path(path: &Path) -> anyhow::Result<Self> {
+        let config_path = path.join("config.json");
+        if config_path.is_file() {
+            let config = ModelConfig::load(&config_path)?;
+            if let Some(architecture) = Self::from_model_type(&config.model_type) {
+                return Ok(architecture);
+            }
+            if config.model_type != "modernbert" {
+                bail!(
+                    "unsupported model type {:?} in {}",
+                    config.model_type,
+                    config_path.display()
+                );
+            }
+        }
+
+        Self::from_legacy_laya(path)
+    }
+
+    fn from_legacy_laya(path: &Path) -> anyhow::Result<Self> {
+        let config_path = path.join("encoder/config.json");
+        let config = ModelConfig::load(&config_path)?;
+        let laya_config_path = path.join("rl_agent_config.json");
+        if config.model_type == "modernbert" && laya_config_path.is_file() {
             let laya_config: LayaIdentity = serde_json::from_slice(
                 &fs::read(&laya_config_path)
                     .with_context(|| format!("failed to read {}", laya_config_path.display()))?,
             )
             .with_context(|| format!("failed to parse {}", laya_config_path.display()))?;
-            if encoder_config.model_type == "modernbert"
-                && matches!(
-                    laya_config.model_name.as_str(),
-                    "rl-agent" | "laya-typed-decisions"
-                )
-            {
+            if matches!(
+                laya_config.model_name.as_str(),
+                "rl-agent" | "laya-typed-decisions"
+            ) {
                 return Ok(Self::Laya);
             }
         }
@@ -117,6 +118,15 @@ pub fn model_default_dtype(path: &Path, architecture: Architecture) -> anyhow::R
 #[derive(Deserialize)]
 struct ModelConfig {
     model_type: String,
+}
+
+impl ModelConfig {
+    fn load(path: &Path) -> anyhow::Result<Self> {
+        serde_json::from_slice(
+            &fs::read(path).with_context(|| format!("failed to read {}", path.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", path.display()))
+    }
 }
 
 #[derive(Deserialize)]
@@ -221,6 +231,8 @@ mod tests {
             br#"{"model_name":"rl-agent"}"#,
         )
         .unwrap();
+        assert_eq!(Architecture::from_path(&path).unwrap(), Architecture::Laya);
+        std::fs::write(path.join("config.json"), br#"{"model_type":"modernbert"}"#).unwrap();
         assert_eq!(Architecture::from_path(&path).unwrap(), Architecture::Laya);
         std::fs::remove_file(path.join("config.json")).unwrap();
         assert_eq!(Architecture::from_path(&path).unwrap(), Architecture::Laya);
