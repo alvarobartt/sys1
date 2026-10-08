@@ -95,28 +95,25 @@ fn validate_declared_dtypes(
     vision_dtype: Option<&str>,
     requested: DType,
 ) -> anyhow::Result<()> {
-    fn parse(value: &str) -> anyhow::Result<DType> {
-        match value {
-            "float32" | "f32" => Ok(DType::F32),
-            "float16" | "f16" => Ok(DType::F16),
-            "bfloat16" | "bf16" => Ok(DType::BF16),
-            _ => anyhow::bail!("Unsupported Clef checkpoint dtype {value:?} in config.json"),
-        }
-    }
+    use super::dtype::parse;
 
-    let declared = declared.context("Clef config.json is missing dtype")?;
-    let source = parse(declared)?;
+    let mut source = declared.map(parse).transpose()?;
     for (section, value) in [("text_config", text_dtype), ("vision_config", vision_dtype)] {
         if let Some(value) = value {
-            anyhow::ensure!(
-                parse(value)? == source,
-                "Clef {section}.dtype {value:?} differs from config.json dtype {declared:?}"
-            );
+            let dtype = parse(value)?;
+            if let Some(source) = source {
+                anyhow::ensure!(
+                    dtype == source,
+                    "Clef {section}.dtype {value:?} differs from checkpoint dtype {source:?}"
+                );
+            } else {
+                source = Some(dtype);
+            }
         }
     }
     anyhow::ensure!(
-        requested != DType::F16 || source == DType::F16,
-        "Unsafe Clef dtype conversion from {declared} to f16: FP16 has a narrower exponent range; use --dtype bf16 or --dtype f32"
+        requested != DType::F16 || source.is_none_or(|source| source == DType::F16),
+        "Unsafe Clef dtype conversion from {source:?} to f16: FP16 has a narrower exponent range; use --dtype bf16 or --dtype f32"
     );
     tracing::info!(checkpoint_dtype = declared, inference_dtype = ?requested, "Clef dtype validated");
     Ok(())
@@ -143,6 +140,7 @@ impl Clef {
         max_model_len: Option<usize>,
         attention: AttentionImplementation,
     ) -> anyhow::Result<Self> {
+        let dtype = super::dtype::resolve(path, super::Architecture::Qwen35, Some(dtype))?;
         let config = text::Config::load(&path.join("config.json"))?;
         validate_declared_dtypes(
             config.dtype.as_deref(),
@@ -163,7 +161,7 @@ impl Clef {
         let device = device::load()?;
         anyhow::ensure!(
             !device.is_cpu() || dtype == DType::F32,
-            "Clef on CPU requires f32; use --dtype f32 or --dtype auto"
+            "Clef on CPU requires f32; use --dtype f32 explicitly"
         );
         let capability = if attention == AttentionImplementation::Eager
             || (attention == AttentionImplementation::Auto && dtype == DType::F32)
@@ -854,7 +852,7 @@ mod tests {
             DType::F16,
         )
         .unwrap();
-        assert!(validate_declared_dtypes(None, None, None, DType::F16).is_err());
+        validate_declared_dtypes(None, None, None, DType::F16).unwrap();
         assert!(
             validate_declared_dtypes(
                 Some("bfloat16"),
@@ -924,7 +922,7 @@ mod tests {
         }
         let dtype = if cfg!(feature = "cpu") {
             DType::F32
-        } else if cfg!(feature = "cuda") {
+        } else if cfg!(any(feature = "cuda", feature = "metal")) {
             DType::BF16
         } else {
             DType::F16

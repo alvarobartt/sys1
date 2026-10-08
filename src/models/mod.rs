@@ -1,4 +1,5 @@
 mod clef;
+mod dtype;
 mod laya;
 
 use crate::schema::{ApiError, DecisionRequest, DecisionResponse};
@@ -108,50 +109,9 @@ impl Architecture {
     }
 }
 
-/// Resolve the model's default inference dtype for the active backend.
+/// Resolve the checkpoint's declared dtype, falling back to Safetensors metadata.
 pub fn model_default_dtype(path: &Path, architecture: Architecture) -> anyhow::Result<DType> {
-    if architecture == Architecture::Laya {
-        #[cfg(feature = "metal")]
-        return Ok(DType::F16);
-
-        #[cfg(feature = "cuda")]
-        {
-            let device = crate::device::load()?;
-            let candle_core::Device::Cuda(cuda) = device else {
-                bail!("CUDA backend did not provide a CUDA device")
-            };
-            let (major, _) = cuda.cuda_stream().context().compute_capability()?;
-            if major < 8 {
-                return Ok(DType::F16);
-            }
-            let config_path = path.join("rl_agent_config.json");
-            let config: serde_json::Value = serde_json::from_slice(&fs::read(&config_path)?)
-                .with_context(|| format!("parsing {}", config_path.display()))?;
-            return match config.get("amp_dtype").and_then(|value| value.as_str()) {
-                Some("bf16" | "bfloat16") => Ok(DType::BF16),
-                Some("fp16" | "float16" | "f16") | None => Ok(DType::F16),
-                Some(other) => bail!(
-                    "Unsupported Laya amp_dtype {other:?} in {}",
-                    config_path.display()
-                ),
-            };
-        }
-
-        #[cfg(feature = "cpu")]
-        return Ok(DType::F32);
-    }
-    let config_path = path.join("config.json");
-    let config: serde_json::Value = serde_json::from_slice(&fs::read(&config_path)?)
-        .with_context(|| format!("parsing {}", config_path.display()))?;
-    match config.get("dtype").and_then(|value| value.as_str()) {
-        Some("bfloat16" | "bf16") => Ok(DType::BF16),
-        Some("float16" | "f16") => Ok(DType::F16),
-        Some("float32" | "f32") => Ok(DType::F32),
-        other => bail!(
-            "Unsupported or missing Clef dtype {other:?} in {}",
-            config_path.display()
-        ),
-    }
+    dtype::resolve(path, architecture, None)
 }
 
 #[derive(Deserialize)]
