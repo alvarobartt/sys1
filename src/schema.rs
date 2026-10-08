@@ -62,8 +62,10 @@ pub struct SystemOneRequest {
     pub model: Option<String>,
     pub state: Value,
     /// Experimental image inputs, accepted only by models with image support.
+    #[schema(required = false)]
     pub images: Vec<MediaInput>,
     /// Experimental video inputs, accepted only by models with video support.
+    #[schema(required = false)]
     pub videos: Vec<MediaInput>,
     #[schema(value_type = Object)]
     pub questions: Map<String, Value>,
