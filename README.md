@@ -15,23 +15,24 @@
 - [TypeSafe AI compatible API](https://docs.typesafe.ai/api)
 - Backed by [`candle`](https://github.com/huggingface/candle) and [`tokenizers`](https://github.com/huggingface/tokenizers)
 - Dynamic, token-based batching bounded by requests
-- Support for CPU, Metal, and CUDA
+- Compatible with CPU
+- Compatible with Metal (macOS M-series)
+- Compatible with CUDA (NVIDIA Turing, Ampere, Ada, Hopper, and Blackwell)
 - Support for F32, F16, and BF16
-- Support for ModernBERT and Qwen3.5
-- Custom kernels optimized for Metal and CUDA
+- Optimized ModernBERT and Qwen3.5 architectures
 
 ## Get started
 
-- Rust and Cargo 1.98.1.
-- NVIDIA CUDA Compiler (`nvcc`) on CUDA
-- XCode and Metal Toolchain on Metal
-- `ffmpeg` and `ffprobe` 6.1.1 or higher for video inputs.
+- Rust and Cargo 1.98.1
+- NVIDIA CUDA Compiler (`nvcc`) on CUDA only i.e., `--features cuda`
+- XCode and Metal Toolchain on Metal only i.e., `--features metal`
+- (Optional) `ffmpeg` and `ffprobe` 6.1.1 or higher for video inputs
 
 ```bash
 cargo install sys1 --features cpu
 # cargo install sys1 --no-default-features --features metal
 # cargo install sys1 --no-default-features --features cuda
-# cargo install sys1 --no-default-features --features cuda,flash-attn-2 # Ampere, Ada Lovelace, or Hopper
+# cargo install sys1 --no-default-features --features cuda,flash-attn-2 # Ampere, Ada, Hopper, or Blackwell
 ```
 
 Then run it with any of the supported models (more coming soon!).
@@ -39,11 +40,22 @@ Then run it with any of the supported models (more coming soon!).
 - [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya) for English text, guardrails, email triage
 - [`convaiinnovations/laya-multilingual`](https://huggingface.co/convaiinnovations/laya-multilingual) for 100+ languages, ~2.2x faster
 - [`convaiinnovations/laya-typed-decisions`](https://huggingface.co/convaiinnovations/laya-typed-decisions) for typed-decisions workflows
-- [`Cloudflare/clef`](https://huggingface.co/Cloudflare/clef) for text, image, and video decisions
-- [`Cloudflare/clef-flash`](https://huggingface.co/Cloudflare/clef-flash) for text, image, and video decisions (smaller and faster than the 27B variant)
+- [NEW!] [`Cloudflare/clef`](https://huggingface.co/Cloudflare/clef) for text, image, and video decisions
+- [NEW!] [`Cloudflare/clef-flash`](https://huggingface.co/Cloudflare/clef-flash) for text, image, and video decisions (smaller and faster than the 27B variant)
 
 ```bash
 sys1 --model-id convaiinnovations/laya --dtype auto
+```
+
+Or, alternatively run with Docker instead.
+
+```bash
+docker run -p 3000:3000 ghcr.io/alvarobartt/sys1:0.1.0-cpu --model-id convaiinnovations/laya --dtype auto
+# docker run --gpus all -p 3000:3000 ghcr.io/alvarobartt/sys1:0.1.0-turing --model-id convaiinnovations/laya --dtype f16
+# docker run --gpus all -p 3000:3000 ghcr.io/alvarobartt/sys1:0.1.0-ampere --model-id convaiinnovations/laya --dtype f16
+# docker run --gpus all -p 3000:3000 ghcr.io/alvarobartt/sys1:0.1.0-ada-lovelace --model-id convaiinnovations/laya --dtype f16
+# docker run --gpus all -p 3000:3000 ghcr.io/alvarobartt/sys1:0.1.0-hopper --model-id convaiinnovations/laya --dtype f16
+# docker run --gpus all -p 3000:3000 ghcr.io/alvarobartt/sys1:0.1.0-blackwell --model-id convaiinnovations/laya --dtype f16
 ```
 
 Then query the System One compatible endpoint at `/v1/systemone` (or `/v1/decide`).
@@ -102,16 +114,17 @@ response = client.system_one(
 print(response.choices["route"].choice)
 ```
 
+---
+
 Alternatively, if you were to deploy [`Cloudflare/clef-flash`](https://huggingface.co/Cloudflare/clef-flash) or any other model with vision capabilities as:
 
 ```bash
-cargo install sys1 --features cuda,flash-attn-2 --no-default-features
-sys1 --model-id Cloudflare/clef-flash --dtype bf16 --attention flash-attn-2
+sys1 --model-id Cloudflare/clef-flash --dtype auto
 ```
 
 Then you can send requests to `/v1/systemone` with `images` or `videos` (it accepts public HTTP(s) URLs, raw base64 strings, base64 data URLs, or embedded objects).
 
-```json
+```bash
 curl http://localhost:3000/v1/systemone \
     -H "Content-Type: application/json" \
     -d '{
@@ -134,7 +147,7 @@ curl http://localhost:3000/v1/systemone \
     }'
 ```
 
-And, note it won't be accepted via the TypeSafe AI SDKs as it's not officially supported in the TypeSafe AI API Spec.
+And, note `images` or `videos` won't be accepted via the TypeSafe AI SDKs as it's not officially supported in the TypeSafe AI API Spec ([yet](https://x.com/CompleteSkeptic/status/2108629012474175685)).
 
 ## References
 
