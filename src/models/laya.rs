@@ -1040,6 +1040,77 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "metal")]
+    #[tokio::test]
+    async fn metal_f16_and_bf16_logits_and_probabilities() -> anyhow::Result<()> {
+        let path = crate::hub::download(
+            "convaiinnovations/laya-typed-decisions",
+            "1a793eb568e6718f15941d08f85432581df534e3",
+        )
+        .await?;
+
+        let reference = {
+            let model = Laya::load(
+                &path,
+                Some(DType::F32),
+                None,
+                AttentionImplementation::Eager,
+            )?;
+            let prepared = model
+                .prepare(decision_request()?)
+                .expect("prepare the test request");
+            let logits = model.forward(std::slice::from_ref(&prepared))?;
+            scored(&model, &prepared, &logits)
+        };
+
+        for (dtype, logit_digits, probability_digits, tolerance) in [
+            (DType::F16, 2usize, 3usize, 0.01f32),
+            (DType::BF16, 1, 2, 0.05),
+        ] {
+            let model = Laya::load(&path, Some(dtype), None, AttentionImplementation::Eager)?;
+            let prepared = model
+                .prepare(decision_request()?)
+                .expect("prepare the test request");
+            let logits = model.forward(std::slice::from_ref(&prepared))?;
+            let probabilities = scored(&model, &prepared, &logits);
+
+            assert!(
+                logits.iter().flatten().all(|value| value.is_finite()),
+                "{dtype:?} produced non-finite logits"
+            );
+            for (expected, actual) in reference.iter().zip(&probabilities) {
+                assert_eq!(
+                    argmax(expected),
+                    argmax(actual),
+                    "{dtype:?} changed the selected option"
+                );
+                let difference = expected
+                    .iter()
+                    .zip(actual)
+                    .map(|(left, right)| (left - right).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    difference <= tolerance,
+                    "{dtype:?} probabilities drifted by {difference} from f32"
+                );
+            }
+
+            let name = if dtype == DType::F16 { "f16" } else { "bf16" };
+            insta::assert_yaml_snapshot!(
+                format!("laya_typed_decisions_{name}_logits"),
+                logits,
+                { "[][]" => insta::rounded_redaction(logit_digits) }
+            );
+            insta::assert_yaml_snapshot!(
+                format!("laya_typed_decisions_{name}_probabilities"),
+                probabilities,
+                { "[][]" => insta::rounded_redaction(probability_digits) }
+            );
+        }
+
+        Ok(())
+    }
+
     fn item(id: &str, kind: usize, ids: &[u32]) -> Item {
         Item {
             question: Question {
