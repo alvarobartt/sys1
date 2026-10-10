@@ -92,52 +92,100 @@ fn public_ip(address: IpAddr) -> bool {
     }
 }
 
-fn download_url(value: &str) -> anyhow::Result<Vec<u8>> {
-    let url = reqwest::Url::parse(value).context("invalid media URL")?;
-    anyhow::ensure!(
-        matches!(url.scheme(), "http" | "https"),
-        "media URL must use http or https"
-    );
-    anyhow::ensure!(
-        url.username().is_empty() && url.password().is_none(),
-        "media URL must not contain credentials"
-    );
+const MAX_MEDIA_REDIRECTS: usize = 10;
+const MEDIA_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn fetch_media_url(
+    url: &reqwest::Url,
+    deadline: Instant,
+) -> anyhow::Result<reqwest::blocking::Response> {
     let host = url.host_str().context("media URL has no host")?;
     let port = url
         .port_or_known_default()
         .context("media URL has no port")?;
-    let addresses: Vec<_> = (host, port)
-        .to_socket_addrs()
-        .with_context(|| format!("could not resolve media host {host:?}"))?
-        .collect();
+    let addresses: Vec<_> = if let Ok(address) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        vec![std::net::SocketAddr::new(address, port)]
+    } else {
+        (host, port)
+            .to_socket_addrs()
+            .with_context(|| format!("could not resolve media host {host:?}"))?
+            .collect()
+    };
     anyhow::ensure!(!addresses.is_empty(), "media host has no addresses");
     anyhow::ensure!(
         addresses.iter().all(|address| public_ip(address.ip())),
         "media URL resolves to a private or reserved address"
     );
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    anyhow::ensure!(!remaining.is_zero(), "media download timed out");
+    // Each hop uses only the addresses validated above, including cross-host redirects.
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(20))
+        .timeout(remaining)
         .resolve_to_addrs(host, &addresses)
         .build()?;
-    let response = client.get(url).send()?.error_for_status()?;
-    anyhow::ensure!(
-        !response.status().is_redirection(),
-        "media URL redirects are not followed; use the final URL"
-    );
-    let mut bytes = Vec::new();
-    response
-        .take((MAX_MEDIA_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    anyhow::ensure!(
-        bytes.len() <= MAX_MEDIA_BYTES,
-        "media URL exceeds 32 MiB; use a smaller file"
-    );
-    Ok(bytes)
+    Ok(client.get(url.clone()).send()?)
+}
+
+fn download_url(value: &str) -> anyhow::Result<Vec<u8>> {
+    download_url_with(value, fetch_media_url)
+}
+
+fn download_url_with(
+    value: &str,
+    mut fetch: impl FnMut(&reqwest::Url, Instant) -> anyhow::Result<reqwest::blocking::Response>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut url = reqwest::Url::parse(value).context("invalid media URL")?;
+    let deadline = Instant::now() + MEDIA_DOWNLOAD_TIMEOUT;
+    for redirects in 0..=MAX_MEDIA_REDIRECTS {
+        anyhow::ensure!(
+            matches!(url.scheme(), "http" | "https"),
+            "media URL must use http or https"
+        );
+        anyhow::ensure!(
+            url.username().is_empty() && url.password().is_none(),
+            "media URL must not contain credentials"
+        );
+        anyhow::ensure!(Instant::now() < deadline, "media download timed out");
+        let response = fetch(&url, deadline)?.error_for_status()?;
+        if response.status().is_redirection() {
+            anyhow::ensure!(
+                matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308),
+                "unsupported media redirect status: {}",
+                response.status()
+            );
+            anyhow::ensure!(
+                redirects < MAX_MEDIA_REDIRECTS,
+                "media URL exceeds {MAX_MEDIA_REDIRECTS} redirects"
+            );
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .context("media redirect has no Location header")?
+                .to_str()
+                .context("invalid media redirect Location header")?;
+            url = url.join(location).context("invalid media redirect URL")?;
+            continue;
+        }
+        let mut bytes = Vec::new();
+        response
+            .take((MAX_MEDIA_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        anyhow::ensure!(Instant::now() < deadline, "media download timed out");
+        anyhow::ensure!(
+            bytes.len() <= MAX_MEDIA_BYTES,
+            "media URL exceeds 32 MiB; use a smaller file"
+        );
+        return Ok(bytes);
+    }
+    unreachable!("redirect limit is checked before following a redirect")
 }
 
 pub(crate) fn input_bytes(input: &MediaInput, kind: &str) -> anyhow::Result<Vec<u8>> {
+    input
+        .validate_content_type(kind)
+        .map_err(anyhow::Error::msg)?;
     let bytes = match input {
         MediaInput::Text(value) if value.contains("://") => download_url(value)?,
         MediaInput::Url(value) => download_url(&value.url)?,
@@ -153,6 +201,9 @@ pub(crate) fn input_bytes(input: &MediaInput, kind: &str) -> anyhow::Result<Vec<
             };
             STANDARD.decode(encoded).context("invalid media base64")?
         }
+        MediaInput::Embedded(value) => STANDARD
+            .decode(&value.base64)
+            .context("invalid media base64")?,
         MediaInput::Base64(value) => STANDARD
             .decode(&value.base64)
             .context("invalid media base64")?,
@@ -289,6 +340,93 @@ mod tests {
     use super::*;
     use crate::schema::{MediaBase64, MediaUrl};
 
+    fn media_response(
+        status: u16,
+        location: Option<&str>,
+        body: Vec<u8>,
+    ) -> reqwest::blocking::Response {
+        let mut builder = axum::http::Response::builder().status(status);
+        if let Some(location) = location {
+            builder = builder.header(reqwest::header::LOCATION, location);
+        }
+        builder.body(body).unwrap().into()
+    }
+
+    #[test]
+    fn follows_relative_and_cross_host_media_redirects() {
+        for status in [301, 302, 303, 307, 308] {
+            let mut visited = Vec::new();
+            let bytes = download_url_with("https://example.com/start", |url, _| {
+                visited.push(url.to_string());
+                Ok(match visited.len() {
+                    1 => media_response(status, Some("/next"), vec![]),
+                    2 => media_response(status, Some("https://cdn.example.com/image.jpg"), vec![]),
+                    _ => media_response(200, None, b"image bytes".to_vec()),
+                })
+            })
+            .unwrap();
+            assert_eq!(bytes, b"image bytes");
+            assert_eq!(
+                visited,
+                [
+                    "https://example.com/start",
+                    "https://example.com/next",
+                    "https://cdn.example.com/image.jpg"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_media_redirect_destinations() {
+        for (location, expected) in [
+            ("file:///tmp/image.jpg", "http or https"),
+            ("https://user:password@example.com/image.jpg", "credentials"),
+            ("http://127.0.0.1/image.jpg", "private or reserved"),
+            ("http://10.0.0.1/image.jpg", "private or reserved"),
+            ("http://[::1]/image.jpg", "private or reserved"),
+        ] {
+            let mut calls = 0;
+            let error = download_url_with("https://example.com/start", |url, deadline| {
+                calls += 1;
+                if calls == 1 {
+                    Ok(media_response(302, Some(location), vec![]))
+                } else {
+                    fetch_media_url(url, deadline)
+                }
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{location}: {error}");
+        }
+    }
+
+    #[test]
+    fn rejects_redirect_loops_and_missing_locations() {
+        let mut calls = 0;
+        let error = download_url_with("https://example.com/start", |_, _| {
+            calls += 1;
+            Ok(media_response(307, Some("/start"), vec![]))
+        })
+        .unwrap_err();
+        assert_eq!(calls, MAX_MEDIA_REDIRECTS + 1);
+        assert!(error.to_string().contains("exceeds 10 redirects"));
+        let error = download_url_with("https://example.com/start", |_, _| {
+            Ok(media_response(302, None, vec![]))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("no Location header"));
+    }
+
+    #[test]
+    #[ignore = "requires public network access"]
+    fn downloads_huggingface_image_through_redirects() {
+        let bytes = download_url("https://huggingface.co/datasets/hf-internal-testing/fixtures_ocr/resolve/main/SROIE-receipt.jpeg").unwrap();
+        assert!(
+            bytes.starts_with(&[0xff, 0xd8, 0xff]),
+            "expected a JPEG image"
+        );
+    }
+
     #[test]
     fn parses_ffmpeg_versions() {
         assert_eq!(
@@ -329,6 +467,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("decoded image exceeds 4 bytes"));
+    }
+
+    #[test]
+    fn decodes_embedded_images_and_videos() {
+        for (kind, content_type) in [("image", "image/png"), ("video", "video/mp4")] {
+            let input: MediaInput = serde_json::from_value(serde_json::json!({
+                "content_type": content_type, "base64": STANDARD.encode(b"file bytes")
+            }))
+            .unwrap();
+            assert_eq!(input_bytes(&input, kind).unwrap(), b"file bytes");
+            let wrong_kind = if kind == "image" { "video" } else { "image" };
+            assert!(input_bytes(&input, wrong_kind).is_err());
+        }
+        let invalid: MediaInput = serde_json::from_value(serde_json::json!({
+            "content_type": "video/mp4", "base64": "invalid!"
+        }))
+        .unwrap();
+        assert!(
+            input_bytes(&invalid, "video")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid media base64")
+        );
     }
 
     #[test]
