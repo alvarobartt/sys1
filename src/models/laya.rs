@@ -440,6 +440,17 @@ impl Laya {
         } else {
             self.score_rows(&hidden, &unique)?
         };
+        if let Some((row, _)) = output
+            .iter()
+            .enumerate()
+            .find(|(_, scores)| scores.iter().any(|score| !score.is_finite()))
+        {
+            anyhow::bail!(
+                "non-finite logits for question {:?}; the model produced values outside the \
+                 inference dtype's range",
+                unique[row].question.id
+            )
+        }
         Ok(indices
             .into_iter()
             .map(|index| output[index].clone())

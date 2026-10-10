@@ -106,10 +106,7 @@ fn validate_declared_dtypes(
             }
         }
     }
-    anyhow::ensure!(
-        requested != DType::F16 || source.is_none_or(|source| source == DType::F16),
-        "Unsafe Clef dtype conversion from {source:?} to f16: FP16 has a narrower exponent range; use --dtype bf16 or --dtype f32"
-    );
+    // Narrowing to f16 is decided in `models::dtype::resolve`.
     tracing::info!(checkpoint_dtype = declared, inference_dtype = ?requested, "Clef dtype validated");
     Ok(())
 }
@@ -824,38 +821,24 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_dtype_rejects_unsafe_fp16_conversion() {
-        for source in ["bfloat16", "float32"] {
-            let error =
-                validate_declared_dtypes(Some(source), Some(source), Some(source), DType::F16)
-                    .unwrap_err();
-            assert!(error.to_string().contains("Unsafe Clef dtype conversion"));
+    fn declared_dtypes_must_agree_across_the_config_sections() {
+        for requested in [DType::F16, DType::BF16, DType::F32] {
+            for source in ["bfloat16", "float16", "float32"] {
+                validate_declared_dtypes(Some(source), Some(source), Some(source), requested)
+                    .unwrap();
+            }
+            validate_declared_dtypes(None, None, None, requested).unwrap();
         }
-        for requested in [DType::BF16, DType::F32] {
-            validate_declared_dtypes(
-                Some("bfloat16"),
-                Some("bfloat16"),
-                Some("bfloat16"),
-                requested,
-            )
-            .unwrap();
-        }
-        validate_declared_dtypes(
+        let error = validate_declared_dtypes(
+            Some("bfloat16"),
             Some("float16"),
-            Some("float16"),
-            Some("float16"),
-            DType::F16,
+            Some("bfloat16"),
+            DType::BF16,
         )
-        .unwrap();
-        validate_declared_dtypes(None, None, None, DType::F16).unwrap();
+        .unwrap_err();
+        assert!(error.to_string().contains("text_config.dtype"), "{error}");
         assert!(
-            validate_declared_dtypes(
-                Some("bfloat16"),
-                Some("float16"),
-                Some("bfloat16"),
-                DType::BF16,
-            )
-            .is_err()
+            validate_declared_dtypes(None, Some("bfloat16"), Some("float16"), DType::BF16).is_err()
         );
     }
 

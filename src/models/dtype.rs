@@ -32,6 +32,12 @@ fn declared(path: &Path, architecture: Architecture) -> anyhow::Result<Option<DT
     Ok(None)
 }
 
+fn is_weight_shard(name: &str) -> bool {
+    name == "model.safetensors"
+        || name == "joint_head.safetensors"
+        || (name.starts_with("model-") && name.ends_with(".safetensors"))
+}
+
 // Inspect headers without loading tensor values into CPU or GPU memory.
 fn stored(path: &Path) -> anyhow::Result<Vec<(DType, usize)>> {
     let mut counts = Vec::<(DType, usize)>::new();
@@ -39,10 +45,7 @@ fn stored(path: &Path) -> anyhow::Result<Vec<(DType, usize)>> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !(name == "model.safetensors"
-            || name == "joint_head.safetensors"
-            || (name.starts_with("model-") && name.ends_with(".safetensors")))
-        {
+        if !is_weight_shard(&name) {
             continue;
         }
         // SAFETY: Checkpoint files must remain immutable while mapped, as with the
@@ -87,11 +90,15 @@ pub(super) fn resolve(
             candidates[0].0
         }
     };
+    // Refused on the source dtype, not on the values: narrowing a bf16-trained checkpoint
+    // changes answers while producing no non-finite value, so nothing downstream catches it.
     ensure!(
         dtype != DType::F16
             || (declared != Some(DType::BF16)
                 && !stored.iter().any(|(kind, _)| *kind == DType::BF16)),
-        "Unsafe checkpoint conversion from bf16 to f16: FP16 has a narrower exponent range and may produce non-finite hidden states; use --dtype bf16 or --dtype f32"
+        "Unsafe checkpoint conversion from bf16 to f16: on a bf16-trained checkpoint this \
+         measurably changes answers while producing no non-finite values, so nothing \
+         downstream can detect it; use --dtype bf16 or --dtype f32"
     );
     Ok(dtype)
 }
@@ -103,6 +110,15 @@ mod tests {
 
     fn weights(path: &Path, name: &str, dtype: DType, elements: usize) {
         Tensor::zeros(elements, dtype, &Device::Cpu)
+            .unwrap()
+            .save_safetensors("weight", path.join(name))
+            .unwrap();
+    }
+
+    fn weights_peaking(path: &Path, name: &str, dtype: DType, peak: f32) {
+        Tensor::new(&[0.5f32, -peak, 0.25], &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
             .unwrap()
             .save_safetensors("weight", path.join(name))
             .unwrap();
@@ -123,6 +139,28 @@ mod tests {
         );
         let error = resolve(dir.path(), Architecture::Qwen35, Some(DType::F16)).unwrap_err();
         assert!(error.to_string().contains("bf16 to f16"));
+    }
+
+    #[test]
+    fn narrowing_from_bf16_to_f16_is_refused_but_from_f32_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), br#"{"dtype":"bfloat16"}"#).unwrap();
+        weights_peaking(dir.path(), "model.safetensors", DType::BF16, 25.6);
+        let error = resolve(dir.path(), Architecture::Qwen35, Some(DType::F16)).unwrap_err();
+        assert!(error.to_string().contains("bf16 to f16"), "{error}");
+
+        assert!(
+            error.to_string().contains("no non-finite values"),
+            "the message should say why the runtime check cannot catch this: {error}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), br#"{"dtype":"float32"}"#).unwrap();
+        weights_peaking(dir.path(), "model.safetensors", DType::F32, 25.6);
+        assert_eq!(
+            resolve(dir.path(), Architecture::Qwen35, Some(DType::F16)).unwrap(),
+            DType::F16
+        );
     }
 
     #[test]
@@ -154,10 +192,10 @@ mod tests {
     }
 
     #[test]
-    fn bf16_weights_cannot_be_narrowed_even_with_an_incorrect_fp16_config() {
+    fn the_config_dtype_wins_over_the_stored_dtype() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("config.json"), br#"{"dtype":"float16"}"#).unwrap();
-        weights(dir.path(), "model.safetensors", DType::BF16, 4);
+        weights_peaking(dir.path(), "model.safetensors", DType::BF16, 1.5);
         assert!(resolve(dir.path(), Architecture::Laya, None).is_err());
         assert_eq!(
             resolve(dir.path(), Architecture::Laya, Some(DType::F32)).unwrap(),
