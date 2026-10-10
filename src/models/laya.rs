@@ -92,6 +92,36 @@ impl HeadLayer {
         })
     }
 
+    fn attention_fn(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f64,
+        mask: &Tensor,
+        lengths: &[usize],
+    ) -> candle_core::Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if q.device().is_metal() {
+            // `sdpa` reads the mask through its strides, so the broadcast view is enough.
+            let (batch, _, length, _) = q.dims4()?;
+            let mask = mask.broadcast_as((batch, self.heads, length, length))?;
+            return candle_nn::ops::sdpa(q, k, v, Some(&mask), false, scale as f32, 1.0);
+        }
+        crate::archs::modernbert::scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale,
+            AttentionOptions {
+                mask: Some(mask),
+                implementation: self.attention,
+                lengths,
+                window: None,
+            },
+        )
+    }
+
     fn forward(
         &self,
         xs: &Tensor,
@@ -111,42 +141,8 @@ impl HeadLayer {
         let v = qkv.get(2)?;
         let scale = (size as f64).powf(-0.5);
 
-        #[cfg(feature = "metal")]
-        let attention = if xs.device().is_metal() {
-            let mask = mask
-                .broadcast_as((batch, self.heads, length, length))?
-                .contiguous()?;
-            candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
-        } else {
-            crate::archs::modernbert::scaled_dot_product_attention(
-                &q,
-                &k,
-                &v,
-                scale,
-                AttentionOptions {
-                    mask: Some(mask),
-                    implementation: self.attention,
-                    lengths,
-                    window: None,
-                },
-            )?
-        };
-        #[cfg(not(feature = "metal"))]
-        let attention = crate::archs::modernbert::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            scale,
-            AttentionOptions {
-                mask: Some(mask),
-                implementation: self.attention,
-                lengths,
-                window: None,
-            },
-        )?;
-        let attention = attention
-            .transpose(1, 2)?
-            .reshape((batch, length, hidden))?
+        let attention = self.attention_fn(&q, &k, &v, scale, mask, lengths)?;
+        let attention = crate::archs::modernbert::merge_heads(&attention, batch, length, hidden)?
             .apply(&self.projection)?
             .to_dtype(xs.dtype())?;
         let xs = (xs + attention)?;
@@ -444,6 +440,17 @@ impl Laya {
         } else {
             self.score_rows(&hidden, &unique)?
         };
+        if let Some((row, _)) = output
+            .iter()
+            .enumerate()
+            .find(|(_, scores)| scores.iter().any(|score| !score.is_finite()))
+        {
+            anyhow::bail!(
+                "non-finite logits for question {:?}; the model produced values outside the \
+                 inference dtype's range",
+                unique[row].question.id
+            )
+        }
         Ok(indices
             .into_iter()
             .map(|index| output[index].clone())
@@ -931,6 +938,59 @@ mod tests {
         assert_eq!(argmax(&[0.5, 0.5]), 0);
     }
 
+    fn decision_request() -> anyhow::Result<DecisionRequest> {
+        Ok(serde_json::from_value(json!({
+            "state": {
+                "message": "I was charged twice for invoice 4411. Please refund me today.",
+                "account_tier": "enterprise"
+            },
+            "questions": {
+                "route": {
+                    "type": "choice",
+                    "instructions": "Where should this ticket go?",
+                    "criteria": {
+                        "billing": "payments, refunds, invoices",
+                        "bug": "the product is broken",
+                        "account": "login or access"
+                    }
+                },
+                "urgency": {
+                    "type": "score",
+                    "instructions": "How urgent is this message?",
+                    "criteria": [
+                        "routine, no rush",
+                        "today",
+                        "urgent",
+                        "critical, about to churn"
+                    ]
+                },
+                "escalate": {
+                    "type": "noul",
+                    "instructions": "Escalate to a human immediately?"
+                }
+            }
+        }))?)
+    }
+
+    fn scored(model: &Laya, prepared: &RequestItems, logits: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        prepared
+            .items
+            .iter()
+            .zip(logits)
+            .map(|(item, logits)| {
+                let bucket = bucket(item.question.kind, logits.len());
+                let temperature = model
+                    .config
+                    .temperature_by_options
+                    .get(&bucket)
+                    .copied()
+                    .unwrap_or(model.config.temperature[item.question.kind])
+                    .clamp(0.5, 5.0);
+                probability(logits, temperature)
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn fp32_logits_and_probabilities() -> anyhow::Result<()> {
         let models = [
@@ -959,56 +1019,11 @@ mod tests {
                 None,
                 AttentionImplementation::Eager,
             )?;
-            let request: DecisionRequest = serde_json::from_value(json!({
-                "state": {
-                    "message": "I was charged twice for invoice 4411. Please refund me today.",
-                    "account_tier": "enterprise"
-                },
-                "questions": {
-                    "route": {
-                        "type": "choice",
-                        "instructions": "Where should this ticket go?",
-                        "criteria": {
-                            "billing": "payments, refunds, invoices",
-                            "bug": "the product is broken",
-                            "account": "login or access"
-                        }
-                    },
-                    "urgency": {
-                        "type": "score",
-                        "instructions": "How urgent is this message?",
-                        "criteria": [
-                            "routine, no rush",
-                            "today",
-                            "urgent",
-                            "critical, about to churn"
-                        ]
-                    },
-                    "escalate": {
-                        "type": "noul",
-                        "instructions": "Escalate to a human immediately?"
-                    }
-                }
-            }))?;
+            let request = decision_request()?;
 
             let prepared = model.prepare(request).expect("prepare the test request");
             let logits = model.forward(std::slice::from_ref(&prepared))?;
-            let probabilities: Vec<_> = prepared
-                .items
-                .iter()
-                .zip(&logits)
-                .map(|(item, logits)| {
-                    let bucket = bucket(item.question.kind, logits.len());
-                    let temperature = model
-                        .config
-                        .temperature_by_options
-                        .get(&bucket)
-                        .copied()
-                        .unwrap_or(model.config.temperature[item.question.kind])
-                        .clamp(0.5, 5.0);
-                    probability(logits, temperature)
-                })
-                .collect();
+            let probabilities = scored(&model, &prepared, &logits);
 
             insta::assert_yaml_snapshot!(format!("{snapshot}_fp32_logits"), logits, {
                 "[][]" => insta::rounded_redaction(3),
@@ -1019,6 +1034,77 @@ mod tests {
                 {
                     "[][]" => insta::rounded_redaction(4),
                 }
+            );
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[tokio::test]
+    async fn metal_f16_and_bf16_logits_and_probabilities() -> anyhow::Result<()> {
+        let path = crate::hub::download(
+            "convaiinnovations/laya-typed-decisions",
+            "1a793eb568e6718f15941d08f85432581df534e3",
+        )
+        .await?;
+
+        let reference = {
+            let model = Laya::load(
+                &path,
+                Some(DType::F32),
+                None,
+                AttentionImplementation::Eager,
+            )?;
+            let prepared = model
+                .prepare(decision_request()?)
+                .expect("prepare the test request");
+            let logits = model.forward(std::slice::from_ref(&prepared))?;
+            scored(&model, &prepared, &logits)
+        };
+
+        for (dtype, logit_digits, probability_digits, tolerance) in [
+            (DType::F16, 2usize, 3usize, 0.01f32),
+            (DType::BF16, 1, 2, 0.05),
+        ] {
+            let model = Laya::load(&path, Some(dtype), None, AttentionImplementation::Eager)?;
+            let prepared = model
+                .prepare(decision_request()?)
+                .expect("prepare the test request");
+            let logits = model.forward(std::slice::from_ref(&prepared))?;
+            let probabilities = scored(&model, &prepared, &logits);
+
+            assert!(
+                logits.iter().flatten().all(|value| value.is_finite()),
+                "{dtype:?} produced non-finite logits"
+            );
+            for (expected, actual) in reference.iter().zip(&probabilities) {
+                assert_eq!(
+                    argmax(expected),
+                    argmax(actual),
+                    "{dtype:?} changed the selected option"
+                );
+                let difference = expected
+                    .iter()
+                    .zip(actual)
+                    .map(|(left, right)| (left - right).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    difference <= tolerance,
+                    "{dtype:?} probabilities drifted by {difference} from f32"
+                );
+            }
+
+            let name = if dtype == DType::F16 { "f16" } else { "bf16" };
+            insta::assert_yaml_snapshot!(
+                format!("laya_typed_decisions_{name}_logits"),
+                logits,
+                { "[][]" => insta::rounded_redaction(logit_digits) }
+            );
+            insta::assert_yaml_snapshot!(
+                format!("laya_typed_decisions_{name}_probabilities"),
+                probabilities,
+                { "[][]" => insta::rounded_redaction(probability_digits) }
             );
         }
 

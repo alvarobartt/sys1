@@ -47,10 +47,6 @@ fn main() {
             .status()
             .expect("failed to run metallib");
         assert!(link.success(), "failed to link Metal kernels");
-        println!(
-            "cargo:rustc-env=SYS1_KERNEL_METALLIB_PATH={}",
-            library.display()
-        );
     }
     if env::var_os("CARGO_FEATURE_CUDA").is_some() {
         let capability = compute_capability();

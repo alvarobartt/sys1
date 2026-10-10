@@ -265,6 +265,8 @@ async fn main() -> anyhow::Result<()> {
     let served_model_name = args.served_model_name.unwrap_or(source_name);
     let started = Instant::now();
     tracing::info!(model = %served_model_name, source, ?architecture, ?dtype, ?attention, path = %model_path.display(), "Loading model");
+    #[cfg(feature = "metal")]
+    sys1::report_dtype_support(dtype);
     let model = models::load(
         &model_path,
         architecture,

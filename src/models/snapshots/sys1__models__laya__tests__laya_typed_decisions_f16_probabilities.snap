@@ -1,0 +1,13 @@
+---
+source: src/models/laya.rs
+expression: probabilities
+---
+- - 0.833
+  - 0.088
+  - 0.079
+- - 0.016
+  - 0.668
+  - 0.24
+  - 0.075
+- - 0.298
+  - 0.702

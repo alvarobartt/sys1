@@ -11,6 +11,9 @@ compile_error!("the `metal` feature is only supported when targeting macOS");
 #[cfg(all(feature = "cuda", target_os = "macos"))]
 compile_error!("the `cuda` feature is not supported when targeting macOS");
 
+#[cfg(feature = "metal")]
+pub use device::report_dtype_support;
+
 pub mod api;
 pub(crate) mod archs;
 pub mod batching;
