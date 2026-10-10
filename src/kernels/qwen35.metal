@@ -121,7 +121,7 @@ kernel void qwen35_pack_delta_f32(device const float* q [[buffer(0)]],
 
 kernel void qwen35_post_finalize_bf16(device const float* input [[buffer(0)]],
                                       device const float* denominator [[buffer(1)]],
-                                      device const float* gate_silu [[buffer(2)]],
+                                      device const ushort* gate [[buffer(2)]],
                                       device const float* norm [[buffer(3)]],
                                       device ushort* output [[buffer(4)]],
                                       constant uint4& dims [[buffer(5)]],
@@ -134,9 +134,91 @@ kernel void qwen35_post_finalize_bf16(device const float* input [[buffer(0)]],
     uint token = index / (dims.w * dims.z) % dims.y;
     uint batch = index / (dims.w * dims.z * dims.y);
     uint source = batch * strides.x + token * strides.y + head * strides.z + channel * strides.w;
+    float raw = bf16_to_f32(gate[index]);
+    float gate_silu = raw / (1.f + exp(-raw));
     // Preserve Candle's separate arithmetic steps; reassociation changed BF16 outputs.
     volatile float value = input[source] / denominator[index / dims.w];
     value = value * norm[channel];
-    value = value * gate_silu[index];
+    value = value * gate_silu;
     output[index] = f32_to_bf16(value);
 }
+
+kernel void qwen35_pack_delta_inputs_bf16(
+    device const ushort* mixed [[buffer(0)]],
+    device const ushort* beta_projection [[buffer(1)]],
+    device const ushort* gate_projection [[buffer(2)]],
+    device const float* dt_bias [[buffer(3)]],
+    device const float* decay [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    constant uint4& dims [[buffer(6)]],
+    constant uint2& widths [[buffer(7)]],
+    constant float& query_scale [[buffer(8)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    uint length = dims.y;
+    uint value_heads = dims.z;
+    uint key_heads = dims.w;
+    uint key_width = widths.x;
+    uint mixed_width = widths.y;
+    const uint dim = 128;
+
+    uint token = group % length;
+    uint head = (group / length) % value_heads;
+    uint batch = group / (length * value_heads);
+    uint key_head = head / (value_heads / key_heads);
+
+    device const ushort* row = mixed + (batch * length + token) * mixed_width;
+    float query = bf16_to_f32(row[key_head * dim + tid]);
+    float key = bf16_to_f32(row[key_width + key_head * dim + tid]);
+    float value = bf16_to_f32(row[2u * key_width + head * dim + tid]);
+
+    threadgroup float query_partials[4];
+    threadgroup float key_partials[4];
+    float query_sum = simd_sum(query * query);
+    float key_sum = simd_sum(key * key);
+    if (lane == 0) {
+        query_partials[simd_group] = query_sum;
+        key_partials[simd_group] = key_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float query_total = query_partials[0] + query_partials[1] + query_partials[2] + query_partials[3];
+    float key_total = key_partials[0] + key_partials[1] + key_partials[2] + key_partials[3];
+    float query_denominator = sqrt(query_total + 1e-6f);
+    float key_denominator = sqrt(key_total + 1e-6f);
+
+    device float* destination =
+        output + ((batch * value_heads + head) * length + token) * (258u + dim);
+    destination[tid] = (query / query_denominator) * query_scale;
+    destination[dim + tid] = key / key_denominator;
+    destination[2u * dim + tid] = value;
+    if (tid == 0) {
+        uint scalar = (batch * length + token) * value_heads + head;
+        float gate = bf16_to_f32(gate_projection[scalar]) + dt_bias[head];
+        float softplus = (gate < 0.f ? 0.f : gate) + log(exp(-fabs(gate)) + 1.f);
+        destination[2u * dim + 128u] = softplus * decay[head];
+        destination[2u * dim + 129u] = 1.f / (1.f + exp(-bf16_to_f32(beta_projection[scalar])));
+    }
+}
+
+template <typename T>
+void swiglu(device const T* gate, device const T* up, device T* output,
+            constant uint& count, uint index) {
+    if (index >= count) return;
+    float raw = read_value(gate[index]);
+    T activated = write_value<T>(raw / (1.f + exp(-raw)));
+    output[index] = write_value<T>(read_value(activated) * read_value(up[index]));
+}
+
+#define SWIGLU_KERNEL(NAME, TYPE) \
+kernel void NAME(device const TYPE* gate [[buffer(0)]], \
+                 device const TYPE* up [[buffer(1)]], \
+                 device TYPE* output [[buffer(2)]], \
+                 constant uint& count [[buffer(3)]], \
+                 uint index [[thread_position_in_grid]]) { \
+    swiglu(gate, up, output, count, index); \
+}
+SWIGLU_KERNEL(qwen35_swiglu_f32, float)
+SWIGLU_KERNEL(qwen35_swiglu_f16, half)
+SWIGLU_KERNEL(qwen35_swiglu_bf16, ushort)

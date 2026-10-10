@@ -1,5 +1,5 @@
 use crate::models::AttentionImplementation;
-use candle_core::{D, DType, Result, Tensor};
+use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::{
     Embedding, Linear, VarBuilder, embedding,
     ops::{sigmoid, softmax},
@@ -85,28 +85,119 @@ impl Config {
     }
 }
 
+/// Additive mask value for disallowed positions: finite, so a masked row cannot give `0/0`.
+#[cfg(feature = "metal")]
+const ATTENTION_MASK_VALUE: f64 = -10_000.0;
+
+struct Shared {
+    #[cfg(feature = "metal")]
+    causal: Option<Tensor>,
+    cos: Tensor,
+    sin: Tensor,
+}
+
+/// `divisors` holds `rope_theta.powf(..)` rather than its reciprocal, so the phase stays a
+/// division.
+struct RopeParams {
+    divisors: Vec<f32>,
+    axes: Vec<usize>,
+    rotary_dim: usize,
+}
+
+impl RopeParams {
+    fn new(config: &TextConfig) -> Result<Self> {
+        let rotary_dim =
+            (config.head_dim as f64 * config.rope_parameters.partial_rotary_factor) as usize;
+        if !rotary_dim.is_multiple_of(2) {
+            candle_core::bail!("Qwen3.5 rotary dimension must be even")
+        }
+        let section = config.rope_parameters.mrope_section;
+        if section.iter().sum::<usize>() != rotary_dim / 2 {
+            candle_core::bail!("Qwen3.5 mRoPE sections do not match the rotary dimension")
+        }
+        let half = rotary_dim / 2;
+        Ok(Self {
+            divisors: (0..half)
+                .map(|index| {
+                    config
+                        .rope_parameters
+                        .rope_theta
+                        .powf(2. * index as f64 / rotary_dim as f64) as f32
+                })
+                .collect(),
+            axes: (0..half)
+                .map(|index| {
+                    if index < section[1] * 3 && index % 3 == 1 {
+                        1
+                    } else if index < section[2] * 3 && index % 3 == 2 {
+                        2
+                    } else {
+                        0
+                    }
+                })
+                .collect(),
+            rotary_dim,
+        })
+    }
+
+    fn tables(
+        &self,
+        positions: &[[u32; 3]],
+        dtype: DType,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        let half = self.rotary_dim / 2;
+        let length = positions.len();
+        let mut frequencies = Vec::with_capacity(length * half);
+        for position in positions {
+            for index in 0..half {
+                frequencies.push(position[self.axes[index]] as f32 / self.divisors[index]);
+            }
+        }
+        let phase = Tensor::from_vec(frequencies, (1, length, 1, half), device)?;
+        let cos = phase.cos()?;
+        let sin = phase.sin()?;
+        Ok((
+            Tensor::cat(&[&cos, &cos], D::Minus1)?.to_dtype(dtype)?,
+            Tensor::cat(&[&sin, &sin], D::Minus1)?.to_dtype(dtype)?,
+        ))
+    }
+}
+
+/// The f32 kernel stages `(BQ + BK) * head_dim` floats in threadgroup memory, which passes
+/// the 32 KB limit at head dimension 256; f16 and bf16 stage half as much.
+#[cfg(feature = "metal")]
+fn supports_metal_sdpa(dtype: DType, head_dim: usize) -> bool {
+    matches!(dtype, DType::F16 | DType::BF16) || head_dim <= 128
+}
+
 fn linear(input: usize, output: usize, vb: VarBuilder) -> Result<Linear> {
     Ok(Linear::new(vb.get((output, input), "weight")?, None))
 }
 
 struct RmsNorm {
-    weight: Tensor,
+    alpha: Tensor,
     eps: f64,
 }
 
 impl RmsNorm {
     fn load(width: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let weight = vb.get(width, "weight")?;
-        Ok(Self { weight, eps })
+        let alpha = (&weight.to_dtype(DType::F32)? + 1.)?;
+        Ok(Self { alpha, eps })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let dtype = x.dtype();
         let x = x.to_dtype(DType::F32)?;
+        #[cfg(feature = "metal")]
+        if x.device().is_metal() && x.is_contiguous() {
+            return candle_nn::ops::rms_norm(&x, &self.alpha, self.eps as f32)?.to_dtype(dtype);
+        }
         let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
         let scale = (variance + self.eps)?.sqrt()?.recip()?;
         x.broadcast_mul(&scale)?
-            .broadcast_mul(&(&self.weight.to_dtype(DType::F32)? + 1.)?)?
+            .broadcast_mul(&self.alpha)?
             .to_dtype(dtype)
     }
 }
@@ -139,7 +230,13 @@ impl Mlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        (x.apply(&self.gate)?.silu()? * x.apply(&self.up)?)?.apply(&self.down)
+        let gate = x.apply(&self.gate)?;
+        let up = x.apply(&self.up)?;
+        #[cfg(feature = "metal")]
+        if x.device().is_metal() {
+            return crate::kernels::metal::swiglu(&gate, &up)?.apply(&self.down);
+        }
+        (gate.silu()? * up)?.apply(&self.down)
     }
 }
 
@@ -154,8 +251,6 @@ struct FullAttention {
     kv_heads: usize,
     head_dim: usize,
     rotary_dim: usize,
-    rope_theta: f64,
-    mrope_section: [usize; 3],
     implementation: AttentionImplementation,
 }
 
@@ -167,12 +262,6 @@ impl FullAttention {
     ) -> Result<Self> {
         let rotary_dim =
             (config.head_dim as f64 * config.rope_parameters.partial_rotary_factor) as usize;
-        if !rotary_dim.is_multiple_of(2) {
-            candle_core::bail!("Qwen3.5 rotary dimension must be even")
-        }
-        if config.rope_parameters.mrope_section.iter().sum::<usize>() != rotary_dim / 2 {
-            candle_core::bail!("Qwen3.5 mRoPE sections do not match the rotary dimension")
-        }
         Ok(Self {
             q: linear(
                 config.hidden_size,
@@ -200,45 +289,17 @@ impl FullAttention {
             kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
             rotary_dim,
-            rope_theta: config.rope_parameters.rope_theta,
-            mrope_section: config.rope_parameters.mrope_section,
             implementation,
         })
     }
 
-    fn rotary(&self, x: &Tensor, positions: &[[u32; 3]]) -> Result<Tensor> {
-        let (_, length, _, _) = x.dims4()?;
+    fn rotary(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let half = self.rotary_dim / 2;
-        if positions.len() != length {
-            candle_core::bail!("Qwen3.5 position count does not match sequence length")
-        }
-        let frequencies: Vec<f32> = positions
-            .iter()
-            .flat_map(|position| {
-                (0..half).map(move |index| {
-                    let axis = if index < self.mrope_section[1] * 3 && index % 3 == 1 {
-                        1
-                    } else if index < self.mrope_section[2] * 3 && index % 3 == 2 {
-                        2
-                    } else {
-                        0
-                    };
-                    position[axis] as f32
-                        / self
-                            .rope_theta
-                            .powf(2. * index as f64 / self.rotary_dim as f64)
-                            as f32
-                })
-            })
-            .collect();
-        let phase = Tensor::from_vec(frequencies, (1, length, 1, half), x.device())?;
-        let cos = Tensor::cat(&[&phase.cos()?, &phase.cos()?], D::Minus1)?.to_dtype(x.dtype())?;
-        let sin = Tensor::cat(&[&phase.sin()?, &phase.sin()?], D::Minus1)?.to_dtype(x.dtype())?;
         let active = x.narrow(D::Minus1, 0, self.rotary_dim)?;
         let first = active.narrow(D::Minus1, 0, half)?;
         let second = active.narrow(D::Minus1, half, half)?;
         let rotated = Tensor::cat(&[&second.neg()?, &first], D::Minus1)?;
-        let active = (active.broadcast_mul(&cos)? + rotated.broadcast_mul(&sin)?)?;
+        let active = (active.broadcast_mul(cos)? + rotated.broadcast_mul(sin)?)?;
         Tensor::cat(
             &[
                 &active,
@@ -248,14 +309,15 @@ impl FullAttention {
         )
     }
 
-    fn forward(&self, x: &Tensor, positions: &[[u32; 3]]) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, shared: &Shared) -> Result<Tensor> {
         let (batch, length, _) = x.dims3()?;
         let qg = x
             .apply(&self.q)?
             .reshape((batch, length, self.heads, 2, self.head_dim))?;
         let q = self.rotary(
             &self.q_norm.forward(&qg.narrow(3, 0, 1)?.squeeze(3)?)?,
-            positions,
+            &shared.cos,
+            &shared.sin,
         )?;
         let gate = sigmoid(&qg.narrow(3, 1, 1)?.squeeze(3)?.reshape((
             batch,
@@ -269,21 +331,28 @@ impl FullAttention {
                 self.kv_heads,
                 self.head_dim,
             ))?)?,
-            positions,
+            &shared.cos,
+            &shared.sin,
         )?;
         let v = x
             .apply(&self.v)?
             .reshape((batch, length, self.kv_heads, self.head_dim))?;
         let scale = (self.head_dim as f32).powf(-0.5);
         #[cfg(feature = "metal")]
-        // BF16 Metal SDPA produced non-finite values for Clef's 256-wide heads.
-        if x.device().is_metal() && x.dtype() != DType::BF16 {
+        if x.device().is_metal() && supports_metal_sdpa(x.dtype(), self.head_dim) {
+            // An explicit additive mask, not `do_causal`: candle's in-kernel causal path
+            // returns non-finite values for f16 and bf16 at head dimensions of 128 or more.
+            let mask = shared
+                .causal
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::Msg("missing Qwen3.5 causal mask".into()))?
+                .broadcast_as((batch, self.heads, length, length))?;
             let attention = candle_nn::ops::sdpa(
                 &q.transpose(1, 2)?.contiguous()?,
                 &k.transpose(1, 2)?.contiguous()?,
                 &v.transpose(1, 2)?.contiguous()?,
-                None,
-                true,
+                Some(&mask),
+                false,
                 scale,
                 1.0,
             )?
@@ -348,9 +417,11 @@ struct LinearAttention {
     b: Linear,
     a: Linear,
     conv: Tensor,
-    a_log: Tensor,
+    decay: Tensor,
     dt_bias: Tensor,
     norm: Tensor,
+    #[cfg(feature = "metal")]
+    norm_f32: Tensor,
     output: Linear,
     key_heads: usize,
     value_heads: usize,
@@ -358,6 +429,8 @@ struct LinearAttention {
     value_dim: usize,
     kernel: usize,
     eps: f64,
+    /// Set when the Metal kernels can take q and k un-expanded.
+    grouped_qk: bool,
 }
 
 impl LinearAttention {
@@ -389,9 +462,19 @@ impl LinearAttention {
                 ),
                 "conv1d.weight",
             )?,
-            a_log: vb.get(config.linear_num_value_heads, "A_log")?,
-            dt_bias: vb.get(config.linear_num_value_heads, "dt_bias")?,
+            decay: vb
+                .get(config.linear_num_value_heads, "A_log")?
+                .to_dtype(DType::F32)?
+                .exp()?
+                .neg()?,
+            dt_bias: vb
+                .get(config.linear_num_value_heads, "dt_bias")?
+                .to_dtype(DType::F32)?,
             norm: vb.get(config.linear_value_head_dim, "norm.weight")?,
+            #[cfg(feature = "metal")]
+            norm_f32: vb
+                .get(config.linear_value_head_dim, "norm.weight")?
+                .to_dtype(DType::F32)?,
             output: linear(value_width, config.hidden_size, vb.pp("out_proj"))?,
             key_heads: config.linear_num_key_heads,
             value_heads: config.linear_num_value_heads,
@@ -399,30 +482,58 @@ impl LinearAttention {
             value_dim: config.linear_value_head_dim,
             kernel: config.linear_conv_kernel_dim,
             eps: config.rms_norm_eps,
+            grouped_qk: vb.device().is_metal()
+                && config.linear_key_head_dim == 128
+                && config.linear_value_head_dim == 128,
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (batch, length, _) = x.dims3()?;
-        let key_width = self.key_heads * self.key_dim;
         let value_width = self.value_heads * self.value_dim;
+        let mixed = self.project_and_mix(x)?;
+        #[cfg(feature = "metal")]
+        if self.grouped_qk && x.dtype() == DType::BF16 {
+            let packed = crate::kernels::metal::pack_delta_inputs_bf16(
+                &mixed,
+                &x.apply(&self.b)?,
+                &x.apply(&self.a)?,
+                &self.dt_bias,
+                &self.decay,
+                self.key_heads,
+                self.value_heads,
+                (self.key_dim as f64).powf(-0.5) as f32,
+            )?;
+            let output = crate::kernels::metal::delta_rule_packed(&packed, self.value_dim)?;
+            return self.finish_delta(x, output, batch, length, value_width);
+        }
+        let (q, k, v, g, beta) = self.delta_inputs(x, &mixed, batch, length)?;
+        let output = self.delta_rule(&q, &k, &v, &g, &beta)?;
+        self.finish_delta(x, output, batch, length, value_width)
+    }
+
+    fn project_and_mix(&self, x: &Tensor) -> Result<Tensor> {
         let projected = x.apply(&self.qkv)?;
         #[cfg(feature = "cuda")]
-        let mixed = if x.device().is_cuda() && matches!(x.dtype(), DType::BF16 | DType::F32) {
-            cuda_conv_silu(&projected, &self.conv)?
-        } else {
-            causal_conv_silu(&projected, &self.conv, self.kernel)?
-        };
+        if x.device().is_cuda() && matches!(x.dtype(), DType::BF16 | DType::F32) {
+            return cuda_conv_silu(&projected, &self.conv);
+        }
         #[cfg(feature = "metal")]
-        let mixed = if x.device().is_metal()
-            && matches!(x.dtype(), DType::BF16 | DType::F16 | DType::F32)
-        {
-            crate::kernels::metal::conv_silu(&projected, &self.conv)?
-        } else {
-            causal_conv_silu(&projected, &self.conv, self.kernel)?
-        };
-        #[cfg(not(any(feature = "cuda", feature = "metal")))]
-        let mixed = causal_conv_silu(&projected, &self.conv, self.kernel)?;
+        if x.device().is_metal() && matches!(x.dtype(), DType::BF16 | DType::F16 | DType::F32) {
+            return crate::kernels::metal::conv_silu(&projected, &self.conv);
+        }
+        causal_conv_silu(&projected, &self.conv, self.kernel)
+    }
+
+    fn delta_inputs(
+        &self,
+        x: &Tensor,
+        mixed: &Tensor,
+        batch: usize,
+        length: usize,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+        let key_width = self.key_heads * self.key_dim;
+        let value_width = self.value_heads * self.value_dim;
         let q = mixed.narrow(D::Minus1, 0, key_width)?.reshape((
             batch,
             length,
@@ -444,12 +555,8 @@ impl LinearAttention {
                 .broadcast_as((batch, length, self.key_heads, repeat, self.key_dim))?
                 .reshape((batch, length, self.value_heads, self.key_dim))
         };
-        #[cfg(feature = "metal")]
-        let grouped_qk = x.device().is_metal() && self.key_dim == 128 && self.value_dim == 128;
-        #[cfg(not(feature = "metal"))]
-        let grouped_qk = false;
-        let q = if grouped_qk { q } else { expand(q)? };
-        let k = if grouped_qk { k } else { expand(k)? };
+        let q = if self.grouped_qk { q } else { expand(q)? };
+        let k = if self.grouped_qk { k } else { expand(k)? };
         let l2 = |xs: Tensor| -> Result<Tensor> {
             let denom = (xs.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?;
             xs.broadcast_div(&denom)
@@ -459,25 +566,32 @@ impl LinearAttention {
         let v = v.to_dtype(DType::F32)?;
         let beta = sigmoid(&x.apply(&self.b)?.to_dtype(DType::F32)?)?;
         let a = x.apply(&self.a)?.to_dtype(DType::F32)?;
-        let a_log = self.a_log.to_dtype(DType::F32)?.exp()?.neg()?;
-        let gate_input = a.broadcast_add(&self.dt_bias.to_dtype(DType::F32)?)?;
+        let gate_input = a.broadcast_add(&self.dt_bias)?;
         let softplus = (gate_input.relu()? + (gate_input.abs()?.neg()?.exp()? + 1.)?.log()?)?;
-        let g = softplus.broadcast_mul(&a_log)?;
-        let q = q.transpose(1, 2)?;
-        let k = k.transpose(1, 2)?;
-        let v = v.transpose(1, 2)?;
-        let beta = beta.transpose(1, 2)?;
-        let g = g.transpose(1, 2)?;
+        let g = softplus.broadcast_mul(&self.decay)?;
+        Ok((
+            q.transpose(1, 2)?,
+            k.transpose(1, 2)?,
+            v.transpose(1, 2)?,
+            g.transpose(1, 2)?,
+            beta.transpose(1, 2)?,
+        ))
+    }
+
+    fn delta_rule(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+    ) -> Result<Tensor> {
         #[cfg(feature = "metal")]
-        let output = if grouped_qk {
-            let packed = crate::kernels::metal::pack_delta_f32(&q, &k, &v, &g, &beta)?;
-            crate::kernels::metal::delta_rule_packed(&packed, self.value_dim)?
-        } else {
-            chunked_delta_rule(&q, &k, &v, &g, &beta)?
-        };
-        #[cfg(not(feature = "metal"))]
-        let output = chunked_delta_rule(&q, &k, &v, &g, &beta)?;
-        self.finish_delta(x, output, batch, length, value_width)
+        if self.grouped_qk {
+            let packed = crate::kernels::metal::pack_delta_f32(q, k, v, g, beta)?;
+            return crate::kernels::metal::delta_rule_packed(&packed, self.value_dim);
+        }
+        chunked_delta_rule(q, k, v, g, beta)
     }
 
     fn finish_delta(
@@ -495,13 +609,11 @@ impl LinearAttention {
         #[cfg(feature = "metal")]
         if x.device().is_metal() && x.dtype() == DType::BF16 && self.value_dim == 128 {
             let denominator = (variance + self.eps)?.sqrt()?;
-            let gate_silu = gate.to_dtype(DType::F32)?.silu()?;
-            let norm = self.norm.to_dtype(DType::F32)?;
             return crate::kernels::metal::post_finalize_bf16(
                 &output,
                 &denominator,
-                &gate_silu,
-                &norm,
+                &gate,
+                &self.norm_f32,
             )?
             .reshape((batch, length, value_width))?
             .apply(&self.output);
@@ -817,10 +929,10 @@ impl Layer {
         })
     }
 
-    fn forward(&self, x: &Tensor, positions: &[[u32; 3]]) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, shared: &Shared) -> Result<Tensor> {
         let normalized = self.input_norm.forward(x)?;
         let mixed = match &self.mixer {
-            Mixer::Full(layer) => layer.forward(&normalized, positions)?,
+            Mixer::Full(layer) => layer.forward(&normalized, shared)?,
             Mixer::Linear(layer) => layer.forward(&normalized)?,
         };
         let x = (x + mixed)?;
@@ -832,6 +944,7 @@ pub struct Decoder {
     embedding: Embedding,
     layers: Vec<Layer>,
     norm: RmsNorm,
+    rope: RopeParams,
 }
 
 impl Decoder {
@@ -856,6 +969,7 @@ impl Decoder {
             embedding,
             layers,
             norm,
+            rope: RopeParams::new(config)?,
         })
     }
 
@@ -870,17 +984,282 @@ impl Decoder {
     }
 
     pub fn forward_embeds(&self, embeds: &Tensor, positions: &[[u32; 3]]) -> Result<Tensor> {
+        let length = embeds.dim(1)?;
+        if positions.len() != length {
+            candle_core::bail!("Qwen3.5 position count does not match sequence length")
+        }
+        let (cos, sin) = self
+            .rope
+            .tables(positions, embeds.dtype(), embeds.device())?;
+        let shared = Shared {
+            #[cfg(feature = "metal")]
+            causal: self.causal_mask(embeds)?,
+            cos,
+            sin,
+        };
         let mut x = embeds.clone();
         for layer in &self.layers {
-            x = layer.forward(&x, positions)?;
+            x = layer.forward(&x, &shared)?;
         }
         self.norm.forward(&x)
+    }
+
+    #[cfg(feature = "metal")]
+    fn causal_mask(&self, embeds: &Tensor) -> Result<Option<Tensor>> {
+        let length = embeds.dim(1)?;
+        let uses_sdpa = embeds.device().is_metal()
+            && self.layers.iter().any(|layer| match &layer.mixer {
+                Mixer::Full(layer) => supports_metal_sdpa(embeds.dtype(), layer.head_dim),
+                Mixer::Linear(_) => false,
+            });
+        if !uses_sdpa {
+            return Ok(None);
+        }
+        let rows = Tensor::arange(0u32, length as u32, embeds.device())?.reshape((length, 1))?;
+        let columns = Tensor::arange(0u32, length as u32, embeds.device())?.reshape((1, length))?;
+        let future = columns.broadcast_gt(&rows)?.to_dtype(embeds.dtype())?;
+        Ok(Some(
+            (future * ATTENTION_MASK_VALUE)?.reshape((1, 1, length, length))?,
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+        let dtype = x.dtype();
+        let x = x.to_dtype(DType::F32)?;
+        let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
+        let scale = (variance + eps)?.sqrt()?.recip()?;
+        x.broadcast_mul(&scale)?
+            .broadcast_mul(&(&weight.to_dtype(DType::F32)? + 1.)?)?
+            .to_dtype(dtype)
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fused_post_finalize_matches_the_op_sequence() -> Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        let (batch, length, heads, width) = (2usize, 13usize, 32usize, 128usize);
+        let spread = |count: usize, offset: f64, scale: f64| -> Result<Tensor> {
+            Tensor::arange(0u32, count as u32, &device)?
+                .to_dtype(DType::F32)?
+                .affine(scale, offset)?
+                .sin()
+        };
+        let output = spread(batch * heads * length * width, 0.0, 0.0011)?
+            .reshape((batch, heads, length, width))?
+            .transpose(1, 2)?;
+        assert!(
+            !output.is_contiguous(),
+            "the strided path is the one in production"
+        );
+        let gate = spread(batch * length * heads * width, 0.6, 0.0007)?
+            .reshape((batch, length, heads, width))?
+            .to_dtype(DType::BF16)?;
+        let norm = spread(width, 1.3, 0.01)?;
+        let variance = output.sqr()?.mean_keepdim(D::Minus1)?;
+        let denominator = (variance + 1e-6)?.sqrt()?;
+
+        let expected = output
+            .broadcast_div(&denominator)?
+            .broadcast_mul(&norm)?
+            .broadcast_mul(&gate.to_dtype(DType::F32)?.silu()?)?
+            .to_dtype(DType::BF16)?;
+        let actual =
+            crate::kernels::metal::post_finalize_bf16(&output, &denominator, &gate, &norm)?;
+
+        assert_eq!(actual.dims(), expected.dims());
+        assert_eq!(actual.dtype(), DType::BF16);
+        let expected = expected
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let actual = actual
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let difference = expected
+            .iter()
+            .zip(actual)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0f32, f32::max);
+        assert!(difference <= 1e-3, "maximum difference was {difference}");
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fused_swiglu_matches_candle() -> Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        let count = 4096 * 7;
+        let values: Vec<f32> = (0..count)
+            .map(|index| ((index * 97 % 1601) as f32 - 800.0) / 73.0)
+            .collect();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let gate = Tensor::from_vec(values.clone(), (7, 4096), &device)?.to_dtype(dtype)?;
+            let up = gate.affine(-0.5, 0.25)?;
+            let expected = (gate.silu()? * up.clone())?;
+            let actual = crate::kernels::metal::swiglu(&gate, &up)?;
+
+            assert_eq!(actual.dims(), expected.dims());
+            assert_eq!(actual.dtype(), dtype);
+            let expected = expected
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let actual = actual
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let difference = expected
+                .iter()
+                .zip(actual)
+                .map(|(left, right)| (left - right).abs())
+                .fold(0f32, f32::max);
+            let tolerance = match dtype {
+                DType::F32 => 1e-5,
+                DType::F16 => 1e-1,
+                _ => 5e-1,
+            };
+            assert!(
+                difference <= tolerance,
+                "{dtype:?}: maximum difference was {difference}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fused_delta_inputs_match_the_op_sequence() -> Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        let (batch, length) = (2usize, 37usize);
+        let (key_heads, value_heads, dim) = (16usize, 32usize, 128usize);
+        let key_width = key_heads * dim;
+        let mixed_width = 2 * key_width + value_heads * dim;
+
+        let spread = |count: usize, offset: f64| -> Result<Tensor> {
+            Tensor::arange(0u32, count as u32, &device)?
+                .to_dtype(DType::F32)?
+                .affine(0.0007, offset)?
+                .sin()
+        };
+        let mixed = spread(batch * length * mixed_width, 0.0)?
+            .reshape((batch, length, mixed_width))?
+            .to_dtype(DType::BF16)?;
+        let beta_projection = spread(batch * length * value_heads, 0.3)?
+            .reshape((batch, length, value_heads))?
+            .to_dtype(DType::BF16)?;
+        let gate_projection = spread(batch * length * value_heads, 0.8)?
+            .reshape((batch, length, value_heads))?
+            .to_dtype(DType::BF16)?;
+        let dt_bias = spread(value_heads, 1.1)?;
+        let decay = spread(value_heads, 1.7)?.neg()?.exp()?.neg()?;
+        let query_scale = (dim as f64).powf(-0.5);
+
+        let reshape_keys =
+            |tensor: Tensor| -> Result<Tensor> { tensor.reshape((batch, length, key_heads, dim)) };
+        let q = reshape_keys(mixed.narrow(D::Minus1, 0, key_width)?)?;
+        let k = reshape_keys(mixed.narrow(D::Minus1, key_width, key_width)?)?;
+        let v = mixed
+            .narrow(D::Minus1, 2 * key_width, value_heads * dim)?
+            .reshape((batch, length, value_heads, dim))?;
+        let l2 = |xs: Tensor| -> Result<Tensor> {
+            let denom = (xs.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?;
+            xs.broadcast_div(&denom)
+        };
+        let q = (l2(q.to_dtype(DType::F32)?)? * query_scale)?;
+        let k = l2(k.to_dtype(DType::F32)?)?;
+        let v = v.to_dtype(DType::F32)?;
+        let beta = sigmoid(&beta_projection.to_dtype(DType::F32)?)?;
+        let gate_input = gate_projection
+            .to_dtype(DType::F32)?
+            .broadcast_add(&dt_bias)?;
+        let softplus = (gate_input.relu()? + (gate_input.abs()?.neg()?.exp()? + 1.)?.log()?)?;
+        let g = softplus.broadcast_mul(&decay)?;
+        let expected = crate::kernels::metal::pack_delta_f32(
+            &q.transpose(1, 2)?,
+            &k.transpose(1, 2)?,
+            &v.transpose(1, 2)?,
+            &g.transpose(1, 2)?,
+            &beta.transpose(1, 2)?,
+        )?;
+
+        let actual = crate::kernels::metal::pack_delta_inputs_bf16(
+            &mixed,
+            &beta_projection,
+            &gate_projection,
+            &dt_bias,
+            &decay,
+            key_heads,
+            value_heads,
+            query_scale as f32,
+        )?;
+
+        assert_eq!(actual.dims(), expected.dims());
+        let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+        let actual = actual.flatten_all()?.to_vec1::<f32>()?;
+        let difference = expected
+            .iter()
+            .zip(actual)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0f32, f32::max);
+        assert!(difference <= 1e-6, "maximum difference was {difference}");
+        Ok(())
+    }
+
+    #[test]
+    fn rms_norm_matches_the_open_coded_reference() -> Result<()> {
+        let device = {
+            #[cfg(feature = "metal")]
+            {
+                candle_core::Device::new_metal(0)?
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                candle_core::Device::Cpu
+            }
+        };
+        let width = 4096;
+        let weight = Tensor::arange(0u32, width as u32, &device)?
+            .to_dtype(DType::F32)?
+            .affine(2.0 / width as f64, -1.0)?;
+        let values: Vec<f32> = (0..3 * width)
+            .map(|index| ((index * 71 % 503) as f32 - 251.0) / 37.0)
+            .collect();
+
+        for dtype in [DType::F32, DType::BF16] {
+            let x = Tensor::from_vec(values.clone(), (1, 3, width), &device)?.to_dtype(dtype)?;
+            let weight = weight.to_dtype(dtype)?;
+            let norm = RmsNorm {
+                alpha: (&weight.to_dtype(DType::F32)? + 1.)?,
+                eps: 1e-6,
+            };
+            let expected = reference_rms_norm(&x, &weight, 1e-6)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let actual = norm
+                .forward(&x)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let difference = expected
+                .iter()
+                .zip(actual)
+                .map(|(left, right)| (left - right).abs())
+                .fold(0f32, f32::max);
+            let tolerance = if dtype == DType::F32 { 1e-5 } else { 1e-2 };
+            assert!(
+                difference <= tolerance,
+                "{dtype:?}: maximum difference was {difference}"
+            );
+        }
+        Ok(())
+    }
 
     #[cfg(feature = "cuda")]
     #[test]

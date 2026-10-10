@@ -92,6 +92,36 @@ impl HeadLayer {
         })
     }
 
+    fn attention_fn(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f64,
+        mask: &Tensor,
+        lengths: &[usize],
+    ) -> candle_core::Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if q.device().is_metal() {
+            // `sdpa` reads the mask through its strides, so the broadcast view is enough.
+            let (batch, _, length, _) = q.dims4()?;
+            let mask = mask.broadcast_as((batch, self.heads, length, length))?;
+            return candle_nn::ops::sdpa(q, k, v, Some(&mask), false, scale as f32, 1.0);
+        }
+        crate::archs::modernbert::scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale,
+            AttentionOptions {
+                mask: Some(mask),
+                implementation: self.attention,
+                lengths,
+                window: None,
+            },
+        )
+    }
+
     fn forward(
         &self,
         xs: &Tensor,
@@ -111,42 +141,8 @@ impl HeadLayer {
         let v = qkv.get(2)?;
         let scale = (size as f64).powf(-0.5);
 
-        #[cfg(feature = "metal")]
-        let attention = if xs.device().is_metal() {
-            let mask = mask
-                .broadcast_as((batch, self.heads, length, length))?
-                .contiguous()?;
-            candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
-        } else {
-            crate::archs::modernbert::scaled_dot_product_attention(
-                &q,
-                &k,
-                &v,
-                scale,
-                AttentionOptions {
-                    mask: Some(mask),
-                    implementation: self.attention,
-                    lengths,
-                    window: None,
-                },
-            )?
-        };
-        #[cfg(not(feature = "metal"))]
-        let attention = crate::archs::modernbert::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            scale,
-            AttentionOptions {
-                mask: Some(mask),
-                implementation: self.attention,
-                lengths,
-                window: None,
-            },
-        )?;
-        let attention = attention
-            .transpose(1, 2)?
-            .reshape((batch, length, hidden))?
+        let attention = self.attention_fn(&q, &k, &v, scale, mask, lengths)?;
+        let attention = crate::archs::modernbert::merge_heads(&attention, batch, length, hidden)?
             .apply(&self.projection)?
             .to_dtype(xs.dtype())?;
         let xs = (xs + attention)?;
@@ -931,6 +927,59 @@ mod tests {
         assert_eq!(argmax(&[0.5, 0.5]), 0);
     }
 
+    fn decision_request() -> anyhow::Result<DecisionRequest> {
+        Ok(serde_json::from_value(json!({
+            "state": {
+                "message": "I was charged twice for invoice 4411. Please refund me today.",
+                "account_tier": "enterprise"
+            },
+            "questions": {
+                "route": {
+                    "type": "choice",
+                    "instructions": "Where should this ticket go?",
+                    "criteria": {
+                        "billing": "payments, refunds, invoices",
+                        "bug": "the product is broken",
+                        "account": "login or access"
+                    }
+                },
+                "urgency": {
+                    "type": "score",
+                    "instructions": "How urgent is this message?",
+                    "criteria": [
+                        "routine, no rush",
+                        "today",
+                        "urgent",
+                        "critical, about to churn"
+                    ]
+                },
+                "escalate": {
+                    "type": "noul",
+                    "instructions": "Escalate to a human immediately?"
+                }
+            }
+        }))?)
+    }
+
+    fn scored(model: &Laya, prepared: &RequestItems, logits: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        prepared
+            .items
+            .iter()
+            .zip(logits)
+            .map(|(item, logits)| {
+                let bucket = bucket(item.question.kind, logits.len());
+                let temperature = model
+                    .config
+                    .temperature_by_options
+                    .get(&bucket)
+                    .copied()
+                    .unwrap_or(model.config.temperature[item.question.kind])
+                    .clamp(0.5, 5.0);
+                probability(logits, temperature)
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn fp32_logits_and_probabilities() -> anyhow::Result<()> {
         let models = [
@@ -959,56 +1008,11 @@ mod tests {
                 None,
                 AttentionImplementation::Eager,
             )?;
-            let request: DecisionRequest = serde_json::from_value(json!({
-                "state": {
-                    "message": "I was charged twice for invoice 4411. Please refund me today.",
-                    "account_tier": "enterprise"
-                },
-                "questions": {
-                    "route": {
-                        "type": "choice",
-                        "instructions": "Where should this ticket go?",
-                        "criteria": {
-                            "billing": "payments, refunds, invoices",
-                            "bug": "the product is broken",
-                            "account": "login or access"
-                        }
-                    },
-                    "urgency": {
-                        "type": "score",
-                        "instructions": "How urgent is this message?",
-                        "criteria": [
-                            "routine, no rush",
-                            "today",
-                            "urgent",
-                            "critical, about to churn"
-                        ]
-                    },
-                    "escalate": {
-                        "type": "noul",
-                        "instructions": "Escalate to a human immediately?"
-                    }
-                }
-            }))?;
+            let request = decision_request()?;
 
             let prepared = model.prepare(request).expect("prepare the test request");
             let logits = model.forward(std::slice::from_ref(&prepared))?;
-            let probabilities: Vec<_> = prepared
-                .items
-                .iter()
-                .zip(&logits)
-                .map(|(item, logits)| {
-                    let bucket = bucket(item.question.kind, logits.len());
-                    let temperature = model
-                        .config
-                        .temperature_by_options
-                        .get(&bucket)
-                        .copied()
-                        .unwrap_or(model.config.temperature[item.question.kind])
-                        .clamp(0.5, 5.0);
-                    probability(logits, temperature)
-                })
-                .collect();
+            let probabilities = scored(&model, &prepared, &logits);
 
             insta::assert_yaml_snapshot!(format!("{snapshot}_fp32_logits"), logits, {
                 "[][]" => insta::rounded_redaction(3),

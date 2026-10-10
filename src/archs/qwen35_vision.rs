@@ -55,7 +55,13 @@ impl Block {
         })
     }
 
-    fn attend(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, lengths: &[usize]) -> Result<Tensor> {
+    fn attention_fn(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        lengths: &[usize],
+    ) -> Result<Tensor> {
         let tokens = x.dim(0)?;
         let parts = x
             .apply(&self.qkv)?
@@ -155,7 +161,7 @@ impl Block {
     }
 
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, lengths: &[usize]) -> Result<Tensor> {
-        let mixed = self.attend(&x.apply(&self.norm1)?, cos, sin, lengths)?;
+        let mixed = self.attention_fn(&x.apply(&self.norm1)?, cos, sin, lengths)?;
         let x = (x + mixed)?;
         &x + x
             .apply(&self.norm2)?

@@ -9,9 +9,7 @@ use candle_core::cuda_backend::{
 #[cfg(feature = "cuda")]
 use candle_core::{CpuStorage, CudaStorage, CustomOp1, CustomOp3, Layout, Shape};
 use candle_core::{D, DType, Device, Result, Tensor};
-use candle_nn::{
-    Embedding, LayerNorm, Linear, Module, VarBuilder, embedding, layer_norm_no_bias, ops::softmax,
-};
+use candle_nn::{Embedding, Init, LayerNorm, Linear, Module, VarBuilder, embedding, ops::softmax};
 #[cfg(feature = "cuda")]
 use half::{bf16, f16};
 use serde::Deserialize;
@@ -63,16 +61,19 @@ struct RotaryEmbedding {
 }
 
 impl RotaryEmbedding {
-    fn new(dtype: DType, config: &Config, rope_theta: f64, device: &Device) -> Result<Self> {
+    /// Build the rotary tables, always in f32: they are indexed by position, and f16
+    /// represents integers exactly only to 2048 and bf16 to 256, against a
+    /// `max_position_embeddings` of 8192.
+    fn new(config: &Config, rope_theta: f64, device: &Device) -> Result<Self> {
         let dim = config.hidden_size / config.num_attention_heads;
         let inv_freq: Vec<_> = (0..dim)
             .step_by(2)
             .map(|index| 1f32 / rope_theta.powf(index as f64 / dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?.to_dtype(dtype)?;
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?;
         let positions = Tensor::arange(0u32, config.max_position_embeddings as u32, device)?
-            .to_dtype(dtype)?
+            .to_dtype(DType::F32)?
             .reshape((config.max_position_embeddings, 1))?;
         let frequencies = positions.matmul(&inv_freq)?;
         Ok(Self {
@@ -99,6 +100,15 @@ impl RotaryEmbedding {
         Ok((q, k))
     }
 
+    fn apply_split(&self, qkv: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let qkv = qkv.permute((2, 0, 3, 1, 4))?;
+        let q = qkv.get(0)?;
+        let k = qkv.get(1)?;
+        let v = qkv.get(2)?;
+        let (q, k) = self.apply(&q, &k)?;
+        Ok((q, k, v))
+    }
+
     #[cfg(feature = "cuda")]
     fn apply_qkv(&self, qkv: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let output = qkv.apply_op3_no_bwd(&self.cos, &self.sin, &RopeQkv)?;
@@ -107,6 +117,20 @@ impl RotaryEmbedding {
             output.get(1)?.transpose(1, 2)?,
             output.get(2)?.transpose(1, 2)?,
         ))
+    }
+
+    /// The fused kernel needs f32 rotary tables; anything else keeps the unfused path.
+    #[cfg(feature = "metal")]
+    fn supports_fused_qkv(&self, dtype: DType) -> bool {
+        self.cos.dtype() == DType::F32
+            && self.cos.device().is_metal()
+            && matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
+    }
+
+    #[cfg(feature = "metal")]
+    fn apply_qkv_metal(&self, qkv: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let output = crate::kernels::metal::rope_qkv(qkv, &self.cos, &self.sin)?;
+        Ok((output.get(0)?, output.get(1)?, output.get(2)?))
     }
 }
 
@@ -161,58 +185,56 @@ impl Attention {
             .to_dtype(self.compute_dtype)?
             .apply(&self.qkv)?
             .reshape((batch, length, 3, self.heads, self.head_size))?;
+        let (q, k, v) = self.split_qkv(&qkv)?;
+        let scale = (self.head_size as f64).powf(-0.5);
+        let attention = self.attention_fn(&q, &k, &v, scale, mask, lengths, window)?;
+        merge_heads(&attention, batch, length, hidden)?.apply(&self.projection)
+    }
+
+    fn split_qkv(&self, qkv: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         #[cfg(feature = "cuda")]
-        let fused_rope = xs.device().is_cuda()
+        if qkv.device().is_cuda()
             && self.implementation != AttentionImplementation::Eager
             && matches!(qkv.dtype(), DType::F16 | DType::BF16)
-            && self.rotary.cos.dtype() == DType::F32;
-        #[cfg(feature = "cuda")]
-        let (q, k, v) = if fused_rope {
-            self.rotary.apply_qkv(&qkv)?
-        } else {
-            let qkv = qkv.permute((2, 0, 3, 1, 4))?;
-            let q = qkv.get(0)?;
-            let k = qkv.get(1)?;
-            let v = qkv.get(2)?;
-            let (q, k) = self.rotary.apply(&q, &k)?;
-            (q, k, v)
-        };
-        #[cfg(not(feature = "cuda"))]
-        let (q, k, v) = {
-            let qkv = qkv.permute((2, 0, 3, 1, 4))?;
-            let q = qkv.get(0)?;
-            let k = qkv.get(1)?;
-            let v = qkv.get(2)?;
-            let (q, k) = self.rotary.apply(&q, &k)?;
-            (q, k, v)
-        };
-        let scale = (self.head_size as f64).powf(-0.5);
-
+            && self.rotary.cos.dtype() == DType::F32
+        {
+            return self.rotary.apply_qkv(qkv);
+        }
         #[cfg(feature = "metal")]
-        let attention = if xs.device().is_metal() {
+        if qkv.device().is_metal() && self.rotary.supports_fused_qkv(qkv.dtype()) {
+            return self.rotary.apply_qkv_metal(qkv);
+        }
+        self.rotary.apply_split(qkv)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_fn(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f64,
+        mask: Option<&Tensor>,
+        lengths: &[usize],
+        window: Option<usize>,
+    ) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if q.device().is_metal() {
+            let (batch, _, length, _) = q.dims4()?;
+            if let (Some(window), Some(mask)) = (window, mask)
+                && length >= METAL_WINDOWED_MIN_LENGTH
+            {
+                return metal_windowed_sdpa(q, k, v, mask, scale as f32, window, self.heads);
+            }
             let mask = mask
                 .map(|mask| mask.broadcast_as((batch, self.heads, length, length)))
                 .transpose()?;
-            candle_nn::ops::sdpa(&q, &k, &v, mask.as_ref(), false, scale as f32, 1.0)?
-        } else {
-            scaled_dot_product_attention(
-                &q,
-                &k,
-                &v,
-                scale,
-                AttentionOptions {
-                    mask,
-                    implementation: self.implementation,
-                    lengths,
-                    window,
-                },
-            )?
-        };
-        #[cfg(not(feature = "metal"))]
-        let attention = scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
+            return candle_nn::ops::sdpa(q, k, v, mask.as_ref(), false, scale as f32, 1.0);
+        }
+        scaled_dot_product_attention(
+            q,
+            k,
+            v,
             scale,
             AttentionOptions {
                 mask,
@@ -220,13 +242,65 @@ impl Attention {
                 lengths,
                 window,
             },
-        )?;
-
-        attention
-            .transpose(1, 2)?
-            .reshape((batch, length, hidden))?
-            .apply(&self.projection)
+        )
     }
+}
+
+pub(crate) fn merge_heads(
+    attention: &Tensor,
+    batch: usize,
+    length: usize,
+    hidden: usize,
+) -> Result<Tensor> {
+    #[cfg(feature = "metal")]
+    if attention.device().is_metal() {
+        return crate::kernels::metal::merge_heads(attention);
+    }
+    attention.transpose(1, 2)?.reshape((batch, length, hidden))
+}
+
+/// Below this the band is most of the score matrix, so chunking does not pay.
+#[cfg(feature = "metal")]
+const METAL_WINDOWED_MIN_LENGTH: usize = 768;
+
+/// Chunked band attention. The mask slice must be copied contiguous: candle's `sdpa`
+/// passes the mask buffer without its layout's start offset, so a narrowed view would be
+/// read from row 0.
+#[cfg(feature = "metal")]
+fn metal_windowed_sdpa(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: &Tensor,
+    scale: f32,
+    window: usize,
+    heads: usize,
+) -> Result<Tensor> {
+    const BLOCK: usize = 128;
+
+    let (batch, _, length, _) = q.dims4()?;
+    let mut blocks = Vec::with_capacity(length.div_ceil(BLOCK));
+    for query_start in (0..length).step_by(BLOCK) {
+        let query_length = BLOCK.min(length - query_start);
+        let key_start = query_start.saturating_sub(window);
+        let key_end = (query_start + query_length + window).min(length);
+        let key_length = key_end - key_start;
+        let block_mask = mask
+            .narrow(D::Minus2, query_start, query_length)?
+            .narrow(D::Minus1, key_start, key_length)?
+            .contiguous()?
+            .broadcast_as((batch, heads, query_length, key_length))?;
+        blocks.push(candle_nn::ops::sdpa(
+            &q.narrow(2, query_start, query_length)?,
+            &k.narrow(2, key_start, key_length)?,
+            &v.narrow(2, key_start, key_length)?,
+            Some(&block_mask),
+            false,
+            scale,
+            1.0,
+        )?);
+    }
+    Tensor::cat(&blocks, 2)
 }
 
 pub(crate) struct AttentionOptions<'a> {
@@ -449,6 +523,10 @@ impl Module for Mlp {
         #[cfg(feature = "cuda")]
         if projected.device().is_cuda() {
             return geglu(&projected)?.apply(&self.output);
+        }
+        #[cfg(feature = "metal")]
+        if projected.device().is_metal() {
+            return crate::kernels::metal::geglu(&projected)?.apply(&self.output);
         }
         let parts = projected.chunk(2, D::Minus1)?;
         (&parts[0].gelu_erf()? * &parts[1])?.apply(&self.output)
@@ -742,8 +820,8 @@ mod cuda_tests {
 struct Layer {
     attention: Attention,
     mlp: Mlp,
-    attention_norm: Option<LayerNorm>,
-    mlp_norm: LayerNorm,
+    attention_norm: Option<Norm>,
+    mlp_norm: Norm,
     uses_local_attention: bool,
 }
 
@@ -765,17 +843,13 @@ impl Layer {
                 implementation,
             )?,
             mlp: Mlp::load(vb.pp("mlp"), config, compute_dtype)?,
-            attention_norm: layer_norm_no_bias(
+            attention_norm: Norm::load(
                 config.hidden_size,
                 config.layer_norm_eps,
                 vb.pp("attn_norm"),
             )
             .ok(),
-            mlp_norm: layer_norm_no_bias(
-                config.hidden_size,
-                config.layer_norm_eps,
-                vb.pp("mlp_norm"),
-            )?,
+            mlp_norm: Norm::load(config.hidden_size, config.layer_norm_eps, vb.pp("mlp_norm"))?,
             uses_local_attention,
         })
     }
@@ -792,13 +866,10 @@ impl Layer {
             Some(norm) => xs.apply(norm)?,
             None => xs.clone(),
         };
-        let mask = match (self.uses_local_attention, local_mask, global_mask) {
-            (true, Some(local_mask), Some(global_mask)) => {
-                Some(global_mask.broadcast_add(local_mask)?)
-            }
-            (true, Some(local_mask), None) => Some(local_mask.clone()),
-            (false, _, global_mask) => global_mask.cloned(),
-            (true, None, _) => None,
+        let mask = if self.uses_local_attention {
+            local_mask.cloned()
+        } else {
+            global_mask.cloned()
         };
         let attention = self
             .attention
@@ -818,9 +889,9 @@ impl Layer {
 
 pub struct Encoder {
     embeddings: Embedding,
-    norm: LayerNorm,
+    norm: Norm,
     layers: Vec<Layer>,
-    final_norm: LayerNorm,
+    final_norm: Norm,
     local_attention_size: usize,
     implementation: AttentionImplementation,
     dtype: DType,
@@ -835,13 +906,11 @@ impl Encoder {
         implementation: AttentionImplementation,
     ) -> Result<Self> {
         let global_rotary = Arc::new(RotaryEmbedding::new(
-            vb.dtype(),
             config,
             config.rope_parameters["full_attention"].rope_theta,
             vb.device(),
         )?);
         let local_rotary = Arc::new(RotaryEmbedding::new(
-            vb.dtype(),
             config,
             config.rope_parameters["sliding_attention"].rope_theta,
             vb.device(),
@@ -868,13 +937,13 @@ impl Encoder {
                 config.hidden_size,
                 vb.pp("model.embeddings.tok_embeddings"),
             )?,
-            norm: layer_norm_no_bias(
+            norm: Norm::load(
                 config.hidden_size,
                 config.layer_norm_eps,
                 vb.pp("model.embeddings.norm"),
             )?,
             layers,
-            final_norm: layer_norm_no_bias(
+            final_norm: Norm::load(
                 config.hidden_size,
                 config.layer_norm_eps,
                 vb.pp("model.final_norm"),
@@ -901,6 +970,10 @@ impl Encoder {
         let local_mask = uses_eager_masks
             .then(|| self.local_mask(length, ids.device()))
             .transpose()?;
+        let local_mask = match (&local_mask, &global_mask) {
+            (Some(local), Some(global)) => Some(global.broadcast_add(local)?),
+            _ => local_mask,
+        };
         let local_window = self.local_attention_size / 2;
         let mut xs = ids.apply(&self.embeddings)?.apply(&self.norm)?;
         for layer in &self.layers {
@@ -926,6 +999,37 @@ impl Encoder {
         let mask = local_attention_mask(length, self.local_attention_size / 2, self.dtype, device)?;
         masks.insert(length, mask.clone());
         Ok(mask)
+    }
+}
+
+/// A bias-free layer norm, chosen once at load from the weight's device.
+enum Norm {
+    #[cfg(feature = "metal")]
+    FusedMetal {
+        weight: Tensor,
+        eps: f64,
+    },
+    Default(LayerNorm),
+}
+
+impl Norm {
+    fn load(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+        let weight = vb.get_with_hints(size, "weight", Init::Const(1.0))?;
+        #[cfg(feature = "metal")]
+        if weight.device().is_metal() {
+            return Ok(Self::FusedMetal { weight, eps });
+        }
+        Ok(Self::Default(LayerNorm::new_no_bias(weight, eps)))
+    }
+}
+
+impl Module for Norm {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::FusedMetal { weight, eps } => crate::kernels::metal::layer_norm(xs, weight, *eps),
+            Self::Default(norm) => norm.forward(xs),
+        }
     }
 }
 
@@ -975,6 +1079,331 @@ fn local_attention_mask(
 mod tests {
     use super::*;
     use candle_core::IndexOp;
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_windowed_attention_matches_dense_attention() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let (batch, heads, length, dim) = (2usize, 16usize, 800usize, 64usize);
+        let window = 64;
+        let tensor = |offset: f64| {
+            Tensor::arange(0u32, (batch * heads * length * dim) as u32, &device)
+                .and_then(|t| t.to_dtype(DType::F32))
+                .and_then(|t| t.affine(0.0007, offset))
+                .and_then(|t| t.sin())
+                .and_then(|t| t.reshape((batch, heads, length, dim)))
+        };
+        let scale = (dim as f64).powf(-0.5) as f32;
+
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let q = tensor(0.0)?.to_dtype(dtype)?;
+            let k = tensor(0.4)?.to_dtype(dtype)?;
+            let v = tensor(0.9)?.to_dtype(dtype)?;
+
+            let band = local_attention_mask(length, window, dtype, &device)?;
+            let padding = Tensor::ones((batch, length), DType::F32, &device)?;
+            let combined = global_attention_mask(&padding, length, dtype)?.broadcast_add(&band)?;
+
+            for mask in [&band, &combined] {
+                let dense = candle_nn::ops::sdpa(
+                    &q,
+                    &k,
+                    &v,
+                    Some(&mask.broadcast_as((batch, heads, length, length))?),
+                    false,
+                    scale,
+                    1.0,
+                )?;
+                let windowed = metal_windowed_sdpa(&q, &k, &v, mask, scale, window, heads)?;
+
+                assert_eq!(windowed.dims(), dense.dims());
+                assert_eq!(windowed.dtype(), dtype);
+                let dense = dense
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let windowed = windowed
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                assert!(
+                    windowed.iter().all(|value| value.is_finite()),
+                    "{dtype:?}: windowed attention produced non-finite values"
+                );
+                let difference = dense
+                    .iter()
+                    .zip(windowed)
+                    .map(|(left, right)| (left - right).abs())
+                    .fold(0f32, f32::max);
+                let tolerance = match dtype {
+                    DType::F32 => 1e-5,
+                    DType::F16 => 2e-3,
+                    _ => 2e-2,
+                };
+                assert!(
+                    difference <= tolerance,
+                    "{dtype:?}: maximum difference was {difference}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fused_metal_merge_heads_matches_candle() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let (batch, heads, length, dim) = (3usize, 16usize, 37usize, 64usize);
+        let values: Vec<f32> = (0..batch * heads * length * dim)
+            .map(|index| ((index * 31 % 2039) as f32 - 1019.0) / 8.0)
+            .collect();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let attention = Tensor::from_vec(values.clone(), (batch, heads, length, dim), &device)?
+                .to_dtype(dtype)?;
+            let expected = attention
+                .transpose(1, 2)?
+                .reshape((batch, length, heads * dim))?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let actual = crate::kernels::metal::merge_heads(&attention)?;
+
+            assert_eq!(actual.dims(), [batch, length, heads * dim]);
+            assert_eq!(actual.dtype(), dtype);
+            assert!(actual.is_contiguous());
+            assert_eq!(
+                actual
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                expected,
+                "{dtype:?} must be exact"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fused_metal_rope_qkv_matches_candle() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let (batch, length, heads, dim) = (2usize, 37usize, 16usize, 64usize);
+        let rows = length + 11; // A longer table than the sequence, as the encoder builds.
+        let table = |offset: f64| {
+            Tensor::arange(0u32, (rows * dim / 2) as u32, &device)
+                .and_then(|t| t.to_dtype(DType::F32))
+                .and_then(|t| t.affine(0.013, offset))
+                .and_then(|t| t.sin())
+                .and_then(|t| t.reshape((rows, dim / 2)))
+        };
+        let rotary = RotaryEmbedding {
+            cos: table(0.0)?,
+            sin: table(0.7)?,
+        };
+        let values: Vec<f32> = (0..batch * length * 3 * heads * dim)
+            .map(|index| ((index * 53 % 211) as f32 - 105.0) / 37.0)
+            .collect();
+
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let qkv = Tensor::from_vec(values.clone(), (batch, length, 3, heads, dim), &device)?
+                .to_dtype(dtype)?;
+            let (expected_q, expected_k, expected_v) = rotary.apply_split(&qkv)?;
+            let (actual_q, actual_k, actual_v) = rotary.apply_qkv_metal(&qkv)?;
+
+            for tensor in [&actual_q, &actual_k, &actual_v] {
+                assert_eq!(tensor.dims(), [batch, heads, length, dim]);
+                assert!(tensor.is_contiguous());
+            }
+            let tolerance = match dtype {
+                DType::F32 => 1e-6,
+                DType::F16 => 1e-2,
+                _ => 1e-1,
+            };
+            for (actual, expected) in [
+                (actual_q, expected_q),
+                (actual_k, expected_k),
+                (actual_v, expected_v),
+            ] {
+                let actual = actual
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let expected = expected
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let difference = actual
+                    .iter()
+                    .zip(expected)
+                    .map(|(left, right)| (left - right).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    difference <= tolerance,
+                    "{dtype:?}: maximum difference was {difference}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fused_metal_geglu_matches_candle() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let rows = 97;
+        let inner = 2624;
+        let values: Vec<f32> = (0..rows * inner * 2)
+            .map(|index| ((index * 37 % 2003) as f32 - 1001.0) / 97.0)
+            .collect();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let input =
+                Tensor::from_vec(values.clone(), (rows, inner * 2), &device)?.to_dtype(dtype)?;
+            let parts = input.chunk(2, D::Minus1)?;
+            let expected = (&parts[0].gelu_erf()? * &parts[1])?;
+            let actual = crate::kernels::metal::geglu(&input)?;
+
+            assert_eq!(actual.dims(), expected.dims());
+            assert_eq!(actual.dtype(), dtype);
+            let expected = expected
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let actual = actual
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let tolerance = match dtype {
+                DType::F32 => 1e-5,
+                DType::F16 => 1e-1,
+                _ => 5e-1,
+            };
+            let difference = expected
+                .iter()
+                .zip(actual)
+                .map(|(left, right)| (left - right).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                difference <= tolerance,
+                "{dtype:?}: maximum difference was {difference}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Compared against the same normalisation in f32, not against a ULP bound: candle's
+    /// fused kernel is inside one dtype ULP too.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fused_metal_layer_norm_is_no_worse_than_the_fallback() -> Result<()> {
+        let device = Device::new_metal(0)?;
+        let hidden = 1024;
+        let rows = 64;
+        let values: Vec<f32> = (0..rows * hidden)
+            .map(|index| ((index * 37 % 997) as f32 - 498.0) / 137.0)
+            .collect();
+        let weight_f32 = Tensor::arange(0u32, hidden as u32, &device)?
+            .to_dtype(DType::F32)?
+            .affine(1.0 / hidden as f64, 0.5)?;
+        let flat = |tensor: Tensor| -> Result<Vec<f32>> {
+            tensor.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+        };
+        let worst = |truth: &[f32], candidate: &[f32]| {
+            truth
+                .iter()
+                .zip(candidate)
+                .map(|(left, right)| (left - right).abs())
+                .fold(0f32, f32::max)
+        };
+
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let xs =
+                Tensor::from_vec(values.clone(), (1, rows, hidden), &device)?.to_dtype(dtype)?;
+            let weight = weight_f32.to_dtype(dtype)?;
+
+            let truth = flat(
+                LayerNorm::new_no_bias(weight.to_dtype(DType::F32)?, 1e-5)
+                    .forward(&xs.to_dtype(DType::F32)?)?,
+            )?;
+            let fallback = flat(LayerNorm::new_no_bias(weight.clone(), 1e-5).forward(&xs)?)?;
+            let zero = Tensor::zeros(hidden, dtype, &device)?;
+            let candle_fused = flat(LayerNorm::new(weight.clone(), zero, 1e-5).forward(&xs)?)?;
+            let fused = crate::kernels::metal::layer_norm(&xs, &weight, 1e-5)?;
+            assert_eq!(fused.dims(), xs.dims());
+            assert_eq!(fused.dtype(), dtype);
+            let fused = flat(fused)?;
+
+            let ours = worst(&truth, &fused);
+            let theirs = worst(&truth, &candle_fused);
+            let reference = worst(&truth, &fallback);
+
+            assert!(
+                ours <= reference.max(1e-6) * 1.5,
+                "{dtype:?}: kernel is {ours} from f32, fallback is {reference}"
+            );
+            if dtype == DType::F32 {
+                assert!(
+                    ours < 1e-5,
+                    "f32 should differ only by reduction order: {ours}"
+                );
+                continue;
+            }
+            assert!(
+                ours < theirs,
+                "{dtype:?}: kernel is {ours} from f32, candle's fused path is {theirs}; being \
+                 closer than that is the whole point of this kernel"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rotary_tables_resolve_every_position() -> Result<()> {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "vocab_size": 50368,
+                "hidden_size": 1024,
+                "num_hidden_layers": 28,
+                "num_attention_heads": 16,
+                "intermediate_size": 2624,
+                "max_position_embeddings": 8192,
+                "layer_norm_eps": 1e-05,
+                "global_attn_every_n_layers": 3,
+                "local_attention": 128,
+                "rope_parameters": {
+                    "full_attention": { "rope_theta": 160000.0 },
+                    "sliding_attention": { "rope_theta": 10000.0 }
+                }
+            }"#,
+        )
+        .unwrap();
+        let rotary = RotaryEmbedding::new(&config, 160_000.0, &Device::Cpu)?;
+        assert_eq!(rotary.cos.dtype(), DType::F32);
+        assert_eq!(rotary.sin.dtype(), DType::F32);
+
+        for position in [1usize, 255, 257, 2047, 2049, 4095, 4097, 8190] {
+            let row = rotary
+                .sin
+                .narrow(0, position, 1)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let next = rotary
+                .sin
+                .narrow(0, position + 1, 1)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let difference = row
+                .iter()
+                .zip(next)
+                .map(|(left, right)| (left - right).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                difference > 1e-7,
+                "positions {position} and {} share a table row",
+                position + 1
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn local_attention_mask_only_exposes_nearby_tokens() -> Result<()> {
