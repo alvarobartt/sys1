@@ -425,6 +425,19 @@ mod tests {
             );
         }
 
+        let embedded = &json["components"]["schemas"]["MediaContent"];
+        assert_eq!(
+            embedded["required"],
+            serde_json::json!(["content_type", "base64"])
+        );
+        assert_eq!(embedded["properties"]["base64"]["type"], "string");
+        let required = json["components"]["schemas"]["SystemOneRequest"]["required"]
+            .as_array()
+            .unwrap();
+        for field in ["images", "videos"] {
+            assert!(!required.contains(&serde_json::json!(field)));
+        }
+
         let state = &json["components"]["schemas"]["SystemOneRequest"]["properties"]["state"];
         assert!(state.is_object());
         assert!(state.get("type").is_none());
@@ -754,8 +767,8 @@ mod tests {
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({
                             "state": "test",
-                            "images": [{"bytes": [1, 2, 3]}],
-                            "videos": [{"base64": "AA=="}],
+                            "images": [{"bytes": [1, 2, 3]}, {"content_type": "image/png", "base64": "AA=="}, "https://example.com/image.png", "AA=="],
+                            "videos": [{"base64": "AA=="}, {"content_type": "video/mp4", "base64": "AA=="}, "https://example.com/video.mp4", "AA=="],
                             "questions": {"q0": {"type": "noul"}}
                         }))
                         .unwrap(),
