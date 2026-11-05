@@ -2,7 +2,7 @@ use super::qwen35_text::VisionConfig;
 use crate::kernels::linear::{forward_compatible, matmul_compatible};
 use crate::models::AttentionImplementation;
 use candle_core::{D, DType, Result, Tensor};
-use candle_nn::{LayerNorm, Linear, VarBuilder, layer_norm, ops::softmax_last_dim};
+use candle_nn::{LayerNorm, Linear, VarBuilder, layer_norm};
 
 type PositionData = ([Vec<u32>; 4], [Vec<f32>; 4], Vec<f32>, Vec<usize>);
 
@@ -82,7 +82,7 @@ impl Block {
                     let ki = k.narrow(0, offset, length)?.transpose(0, 1)?.unsqueeze(0)?;
                     let vi = v.narrow(0, offset, length)?.transpose(0, 1)?.unsqueeze(0)?;
                     #[cfg(feature = "metal")]
-                    if x.device().is_metal() {
+                    if x.device().is_metal() && self.attention != AttentionImplementation::Eager {
                         outputs.push(
                             candle_nn::ops::sdpa(
                                 &qi.contiguous()?,
@@ -99,16 +99,15 @@ impl Block {
                         offset += length;
                         continue;
                     }
-                    let scores = (matmul_compatible(
-                        &qi.contiguous()?,
-                        &ki.transpose(D::Minus2, D::Minus1)?.contiguous()?,
-                    )? * scale as f64)?;
-                    let probs =
-                        softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(x.dtype())?;
                     outputs.push(
-                        matmul_compatible(&probs.contiguous()?, &vi.contiguous()?)?
-                            .squeeze(0)?
-                            .transpose(0, 1)?,
+                        super::qwen35_text::eager_attention(
+                            &qi.transpose(1, 2)?,
+                            &ki.transpose(1, 2)?,
+                            &vi.transpose(1, 2)?,
+                            scale,
+                            false,
+                        )?
+                        .squeeze(0)?,
                     );
                     offset += length;
                 }
