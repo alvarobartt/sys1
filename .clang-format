@@ -11,3 +11,4 @@ KeepEmptyLinesAtTheStartOfBlocks: false
 BreakStringLiterals: false
 ReflowComments: false
 SortIncludes: Never
+FixNamespaceComments: false

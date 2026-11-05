@@ -317,7 +317,7 @@ impl Decoder {
                 target_tokens,
                 "Direct QKV/Z layouts prepared in addition to all original layouts"
             );
-            return Ok(total);
+            Ok(total)
         }
         #[cfg(not(sys1_cuda_fused_ffn))]
         {

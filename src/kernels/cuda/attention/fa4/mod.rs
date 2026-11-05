@@ -169,6 +169,7 @@ fn eligible(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32, causal: bool) -> Res
     Ok([q, k, v].iter().all(|t| t.layout().start_offset() % 8 == 0))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn varlen(
     q: &Tensor,
     k: &Tensor,

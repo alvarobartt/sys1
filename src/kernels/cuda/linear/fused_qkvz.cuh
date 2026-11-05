@@ -43,7 +43,7 @@ __device__ __forceinline__ void project(const E *input, const E *packed, E *qkv,
     epilogue(Op(typename Op::Params(1.f, 0.f)), output, accum);
 }
 
-} // namespace dual_qkvz
+}
 
 namespace dual_qkvz_narrow {
 using Tile = cutlass::gemm::GemmShape<128, 128, 32>;
@@ -90,7 +90,7 @@ __device__ __forceinline__ void project(const E *input, const E *packed, E *qkv,
     epilogue(Op(typename Op::Params(1.f, 0.f)), output, accum);
 }
 
-} // namespace dual_qkvz_narrow
+}
 
 extern "C" __global__ __launch_bounds__(256) void qkvz_wide_bf16(const __nv_bfloat16 *x,
     const __nv_bfloat16 *packed, __nv_bfloat16 *qkv, __nv_bfloat16 *z, int rows) {
