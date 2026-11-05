@@ -14,7 +14,7 @@ compile_error!("the `metal` feature is only supported when targeting macOS");
 compile_error!("the `cuda` feature is not supported when targeting macOS");
 
 pub mod api;
-pub(crate) mod archs;
+pub(crate) mod architectures;
 pub mod batching;
 mod device;
 pub mod hub;

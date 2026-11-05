@@ -3,20 +3,20 @@
 #include <math.h>
 
 template <bool Merged>
-__device__ __forceinline__ void qwen35_full_qkv_finish_impl(
-    const __nv_bfloat16 *qg, const __nv_bfloat16 *keys, const __nv_bfloat16 *values,
-    const __nv_bfloat16 *qw, const __nv_bfloat16 *kw, const __nv_bfloat16 *cosine,
-    const __nv_bfloat16 *sine, const __nv_bfloat16 *table, __nv_bfloat16 *output, int width,
-    int rotary, int heads, int kv_heads, int length, float epsilon) {
+__device__ __forceinline__ void qwen35_full_qkv_finish_impl(const __nv_bfloat16 *qg,
+    const __nv_bfloat16 *keys, const __nv_bfloat16 *values, const __nv_bfloat16 *qw,
+    const __nv_bfloat16 *kw, const __nv_bfloat16 *cosine, const __nv_bfloat16 *sine,
+    const __nv_bfloat16 *table, __nv_bfloat16 *output, int width, int rotary, int heads,
+    int kv_heads, int length, float epsilon) {
     const int head = blockIdx.x % (heads + kv_heads), token = blockIdx.x / (heads + kv_heads);
     const bool query = head < heads;
     const int h = query ? head : head - heads;
     const size_t qspan = size_t(heads) * width, kspan = size_t(kv_heads) * width;
     const size_t stride = Merged ? 2 * qspan + 2 * kspan : 2 * qspan;
     const __nv_bfloat16 *input = query
-                                     ? qg + token * stride + size_t(h) * 2 * width
-                                     : (Merged ? qg + token * stride + 2 * qspan + size_t(h) * width
-                                               : keys + token * kspan + size_t(h) * width);
+        ? qg + token * stride + size_t(h) * 2 * width
+        : (Merged ? qg + token * stride + 2 * qspan + size_t(h) * width
+                  : keys + token * kspan + size_t(h) * width);
     const __nv_bfloat16 *weight = query ? qw : kw;
     const size_t total_tokens = size_t(gridDim.x) / (heads + kv_heads);
     const size_t qcount = total_tokens * qspan, kcount = total_tokens * kspan;
@@ -52,7 +52,7 @@ __device__ __forceinline__ void qwen35_full_qkv_finish_impl(
             const __nv_bfloat16 rotated =
                 column < rotary / 2 ? __hneg(normalized[partner]) : normalized[partner];
             value = __hadd_rn(__hmul_rn(value, cosine[position * rotary + column]),
-                              __hmul_rn(rotated, sine[position * rotary + column]));
+                __hmul_rn(rotated, sine[position * rotary + column]));
         }
         destination[column] = value;
         if (query) {
@@ -65,10 +65,10 @@ __device__ __forceinline__ void qwen35_full_qkv_finish_impl(
     }
 }
 
-#define SYS1_FINISH_ARGS                                                                           \
-    const __nv_bfloat16 *qg, const __nv_bfloat16 *k, const __nv_bfloat16 *v,                       \
-        const __nv_bfloat16 *qw, const __nv_bfloat16 *kw, const __nv_bfloat16 *c,                  \
-        const __nv_bfloat16 *s, const __nv_bfloat16 *t, __nv_bfloat16 *o, int d, int r, int h,     \
+#define SYS1_FINISH_ARGS \
+    const __nv_bfloat16 *qg, const __nv_bfloat16 *k, const __nv_bfloat16 *v, \
+        const __nv_bfloat16 *qw, const __nv_bfloat16 *kw, const __nv_bfloat16 *c, \
+        const __nv_bfloat16 *s, const __nv_bfloat16 *t, __nv_bfloat16 *o, int d, int r, int h, \
         int kh, int l, float eps
 extern "C" __global__ void qwen35_full_qkv_finish_merged_bf16(SYS1_FINISH_ARGS) {
     qwen35_full_qkv_finish_impl<true>(qg, k, v, qw, kw, c, s, t, o, d, r, h, kh, l, eps);
@@ -78,11 +78,11 @@ extern "C" __global__ void qwen35_full_qkv_finish_separate_bf16(SYS1_FINISH_ARGS
 }
 #undef SYS1_FINISH_ARGS
 
-extern "C" __global__ void qwen35_full_finish_warp127(
-    const __nv_bfloat16 *qg, const __nv_bfloat16 *keys, const __nv_bfloat16 *values,
-    const __nv_bfloat16 *qw, const __nv_bfloat16 *kw, const __nv_bfloat16 *cosine,
-    const __nv_bfloat16 *sine, const __nv_bfloat16 *table, __nv_bfloat16 *output, int width,
-    int rotary, int heads, int kv_heads, int length, float epsilon) {
+extern "C" __global__ void qwen35_full_finish_warp127(const __nv_bfloat16 *qg,
+    const __nv_bfloat16 *keys, const __nv_bfloat16 *values, const __nv_bfloat16 *qw,
+    const __nv_bfloat16 *kw, const __nv_bfloat16 *cosine, const __nv_bfloat16 *sine,
+    const __nv_bfloat16 *table, __nv_bfloat16 *output, int width, int rotary, int heads,
+    int kv_heads, int length, float epsilon) {
     const int lane = threadIdx.x & 31;
     const int head = blockIdx.y * 4 + (threadIdx.x >> 5), token = blockIdx.x;
     if (head >= heads + kv_heads)

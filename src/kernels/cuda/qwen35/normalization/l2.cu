@@ -3,8 +3,8 @@
 #include <math.h>
 #include <mma.h>
 
-extern "C" __global__ void qwen35_l2_128_f32(const float *input, float *output, unsigned int rows,
-                                             float scale) {
+extern "C" __global__ void qwen35_l2_128_f32(
+    const float *input, float *output, unsigned int rows, float scale) {
     const unsigned int row = blockIdx.x * 4 + threadIdx.x / 32;
     const unsigned int lane = threadIdx.x & 31;
     if (row >= rows)

@@ -1250,3 +1250,170 @@ pub(crate) fn cuda_vstore_short_selected(
     Ok(blocks * tokens
         >= (sm_count as u128) * (resident[kind].div_ceil(2) as u128) * (longest as u128))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::architectures::qwen35_text::tests::supported_rotary_test_dtypes;
+
+    #[test]
+    fn right_sized_rmsnorm_launch_is_bitwise_equal_to_legacy() -> Result<()> {
+        let device = test_cuda_device()?;
+        for columns in [16, 32, 64, 128, 256, 512, 1024, 2560, 5120] {
+            let input = Tensor::from_vec(
+                (0..2 * 7 * columns)
+                    .map(|i| ((i * 17 % 1009) as f32 - 504.) * 0.003)
+                    .collect::<Vec<_>>(),
+                (2, 7, columns),
+                &device,
+            )?
+            .to_dtype(DType::BF16)?;
+            let weight = Tensor::from_vec(
+                (0..columns)
+                    .map(|i| ((i % 37) as f32 - 18.) * 0.002)
+                    .collect::<Vec<_>>(),
+                columns,
+                &device,
+            )?
+            .to_dtype(DType::BF16)?;
+            let bits = |tensor: Tensor| -> Result<Vec<u32>> {
+                Ok(tensor
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect())
+            };
+            assert_eq!(
+                bits(cuda_rms_norm_delta(&input, &weight, 1e-6)?)?,
+                bits(cuda_rms_norm_delta_with_block_size(
+                    &input, &weight, 1e-6, 1024
+                )?)?,
+                "RMSNorm launch changes values for width {columns}",
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_residual_rmsnorm_is_bitwise_equal_to_separate_kernels() -> Result<()> {
+        let device = test_cuda_device()?;
+
+        if !supported_rotary_test_dtypes(&device)?.contains(&DType::BF16) {
+            return Ok(());
+        }
+        for (rows, columns) in [(1, 64), (7, 4096), (33, 2560)] {
+            let values = |offset: usize| {
+                (0..rows * columns)
+                    .map(|i| ((i * 17 + offset) % 1009) as f32 * 0.003 - 1.5)
+                    .collect::<Vec<_>>()
+            };
+            let input =
+                Tensor::from_vec(values(0), (1, rows, columns), &device)?.to_dtype(DType::BF16)?;
+            let mixed = Tensor::from_vec(values(503), (1, rows, columns), &device)?
+                .to_dtype(DType::BF16)?;
+            let weight = Tensor::from_vec(
+                (0..columns)
+                    .map(|i| ((i % 37) as f32 - 18.) * 0.002)
+                    .collect(),
+                columns,
+                &device,
+            )?
+            .to_dtype(DType::BF16)?;
+            let expected_residual = (&input + &mixed)?;
+            let expected_normalized = cuda_rms_norm_delta(&expected_residual, &weight, 1e-6)?;
+            let (actual_residual, actual_normalized) =
+                cuda_residual_rms_norm_delta(&input, &mixed, &weight, 1e-6)?;
+            let bits = |tensor: Tensor| -> Result<Vec<u32>> {
+                Ok(tensor
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect())
+            };
+            assert_eq!(
+                bits(actual_residual)?,
+                bits(expected_residual)?,
+                "fused residual differs at rows={rows}, columns={columns}"
+            );
+            assert_eq!(
+                bits(actual_normalized)?,
+                bits(expected_normalized)?,
+                "fused RMSNorm differs at rows={rows}, columns={columns}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn post_finalize_cuda_matches_tensor_reference() {
+        let shape = (2, 3, 4, 128);
+        let count = shape.0 * shape.1 * shape.2 * shape.3;
+        let cpu = candle_core::Device::Cpu;
+        let input = Tensor::from_vec(
+            (0..count)
+                .map(|index| ((index * 17 % 101) as f32 - 50.) * 0.003)
+                .collect::<Vec<_>>(),
+            shape,
+            &cpu,
+        )
+        .unwrap();
+        let gate = Tensor::from_vec(
+            (0..count)
+                .map(|index| ((index * 11 % 67) as f32 - 33.) * 0.02)
+                .collect::<Vec<_>>(),
+            shape,
+            &cpu,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+        let norm = Tensor::from_vec(
+            (0..128)
+                .map(|index| 0.8 + (index % 13) as f32 * 0.01)
+                .collect::<Vec<_>>(),
+            128,
+            &cpu,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+        let epsilon = 1e-6;
+        let reference = gated_norm_reference(&input, &gate, &norm, epsilon, DType::BF16)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cuda = test_cuda_device().unwrap();
+        let actual = cuda_post_finalize_bf16(
+            &input.to_device(&cuda).unwrap(),
+            &gate.to_device(&cuda).unwrap(),
+            &norm.to_device(&cuda).unwrap(),
+            epsilon,
+        )
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+        let rtol = 1.6e-2f32;
+        let atol = 1e-5f32;
+        for (index, (expected, actual)) in reference.iter().zip(actual).enumerate() {
+            let error = (expected - actual).abs();
+            let allowed = atol + rtol * expected.abs();
+            assert!(
+                error <= allowed,
+                "Post-finalize mismatch at {index}: expected {expected}, got {actual}, error {error} > {allowed}"
+            );
+        }
+    }
+}

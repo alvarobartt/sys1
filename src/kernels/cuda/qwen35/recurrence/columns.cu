@@ -1,12 +1,9 @@
-
-
 #include <cuda_runtime.h>
 
 template <int Columns>
-__device__ __forceinline__ void
-packed_columns(const float *query, const float *key, const float *value, const float *decay_values,
-               const float *beta, float *output, const unsigned int *starts, int extent, int heads,
-               int key_heads, int value_dim) {
+__device__ __forceinline__ void packed_columns(const float *query, const float *key,
+    const float *value, const float *decay_values, const float *beta, float *output,
+    const unsigned int *starts, int extent, int heads, int key_heads, int value_dim) {
     const int head = blockIdx.x % heads, sequence = blockIdx.x / heads;
     const int begin = int(starts[sequence]);
     const int length = int(starts[sequence + 1]) - begin;
@@ -68,8 +65,8 @@ packed_columns(const float *query, const float *key, const float *value, const f
     }
 }
 
-extern "C" __global__ void qwen35_packed_delta_warp32_cols2_preexp_f32(
-    const float *q, const float *k, const float *v, const float *decay, const float *beta,
-    float *output, const unsigned int *starts, int extent, int heads, int key_heads, int width) {
+extern "C" __global__ void qwen35_packed_delta_warp32_cols2_preexp_f32(const float *q,
+    const float *k, const float *v, const float *decay, const float *beta, float *output,
+    const unsigned int *starts, int extent, int heads, int key_heads, int width) {
     packed_columns<2>(q, k, v, decay, beta, output, starts, extent, heads, key_heads, width);
 }

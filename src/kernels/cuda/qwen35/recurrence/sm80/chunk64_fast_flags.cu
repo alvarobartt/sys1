@@ -27,21 +27,20 @@ __device__ __forceinline__ void qwen35_c64flag_mma(float *c, const unsigned *a, 
 
 template <int Phase>
 __device__ __forceinline__ float qwen35_c64flag_a(int r, int k, const float *q, const float *key,
-                                                const float *w, const float *causal,
-                                                const float *decay, int instance, int begin,
-                                                int length, int qk_base, int qk_stride) {
+    const float *w, const float *causal, const float *decay, int instance, int begin, int length,
+    int qk_base, int qk_stride) {
     if constexpr (Phase == 0)
         return w[(instance * 64 + r) * 128 + k];
     if constexpr (Phase == 1)
         return begin + r < length
-                   ? __fmul_rn(decay[instance * 128 + r], q[qk_base + (begin + r) * qk_stride + k])
-                   : 0.f;
+            ? __fmul_rn(decay[instance * 128 + r], q[qk_base + (begin + r) * qk_stride + k])
+            : 0.f;
     if constexpr (Phase == 2)
         return causal[(instance * 64 + r) * 64 + k];
     if constexpr (Phase == 3)
-        return begin + k < length ? __fmul_rn(decay[instance * 128 + 64 + k],
-                                              key[qk_base + (begin + k) * qk_stride + r])
-                                  : 0.f;
+        return begin + k < length
+            ? __fmul_rn(decay[instance * 128 + 64 + k], key[qk_base + (begin + k) * qk_stride + r])
+            : 0.f;
     return 0.f;
 }
 
@@ -50,11 +49,10 @@ __device__ __forceinline__ int qwen35_c64flag_swizzle(int row, int col, int stri
 }
 
 template <int Phase, int N, bool ReuseB = false>
-__device__ __forceinline__ void
-qwen35_c64flag_product(const float *q, const float *key, const float *w, const float *causal,
-                     const float *decay, float *updates, float (&carry)[4], float (&out)[4],
-                     __half *ahalf, __half *alow, __half *bhalf, __half *blow, int *cached_b_unsafe,
-                     int instance, int begin, int length, int qk_base, int qk_stride) {
+__device__ __forceinline__ void qwen35_c64flag_product(const float *q, const float *key,
+    const float *w, const float *causal, const float *decay, float *updates, float (&carry)[4],
+    float (&out)[4], __half *ahalf, __half *alow, __half *bhalf, __half *blow, int *cached_b_unsafe,
+    int instance, int begin, int length, int qk_base, int qk_stride) {
     constexpr int Rows = Phase == 3 ? 128 : 64, Inner = Phase < 2 ? 128 : 64, S = N + 4;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, group = lane / 4, tid = lane % 4;
     const int r = (warp / (N / 8)) * 16, c = (warp % (N / 8)) * 8;
@@ -73,11 +71,10 @@ qwen35_c64flag_product(const float *q, const float *key, const float *w, const f
     }
     bool unsafe_a = false;
     for (int index = threadIdx.x; index < Rows * Inner; index += blockDim.x) {
-
         const int row = Phase == 3 ? index % Rows : index / Inner;
         const int col = Phase == 3 ? index / Rows : index % Inner;
-        const float x = qwen35_c64flag_a<Phase>(row, col, q, key, w, causal, decay, instance, begin,
-                                              length, qk_base, qk_stride);
+        const float x = qwen35_c64flag_a<Phase>(
+            row, col, q, key, w, causal, decay, instance, begin, length, qk_base, qk_stride);
         unsafe_a |= !(fabsf(x) <= 32768.f);
         const auto high = __float2half_rn(x);
         const int address = qwen35_c64flag_swizzle(row, col, Inner);
@@ -86,7 +83,6 @@ qwen35_c64flag_product(const float *q, const float *key, const float *w, const f
     }
     unsigned unsafe_b = 0;
     if constexpr (Phase == 0) {
-
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int row = r + group + (i / 2) * 8, col = c + tid * 2 + i % 2;
@@ -164,11 +160,10 @@ qwen35_c64flag_product(const float *q, const float *key, const float *w, const f
                 const float *original_b =
                     Phase < 2 ? reinterpret_cast<const float *>(ahalf) : updates;
                 for (int k = 0; k < Inner; ++k)
-                    value = __fadd_rn(
-                        value,
-                        __fmul_rn(qwen35_c64flag_a<Phase>(row, k, q, key, w, causal, decay, instance,
-                                                        begin, length, qk_base, qk_stride),
-                                  original_b[k * S + col]));
+                    value = __fadd_rn(value,
+                        __fmul_rn(qwen35_c64flag_a<Phase>(row, k, q, key, w, causal, decay,
+                                      instance, begin, length, qk_base, qk_stride),
+                            original_b[k * S + col]));
             } else {
                 value = __fadd_rn(initial, __fadd_rn(high[i], __fmul_rn(cross[i], 0x1p-12f)));
             }
@@ -188,11 +183,10 @@ qwen35_c64flag_product(const float *q, const float *key, const float *w, const f
 }
 
 template <int N>
-__device__ __forceinline__ void
-qwen35_c64flag_state_impl(const float *q, const float *key, const float *w, const float *u,
-                        const float *causal, const float *decay, float *output, int physical_start,
-                        int length, int head, int heads, int key_heads, int value_dim,
-                        int instance_base, int instance_stride) {
+__device__ __forceinline__ void qwen35_c64flag_state_impl(const float *q, const float *key,
+    const float *w, const float *u, const float *causal, const float *decay, float *output,
+    int physical_start, int length, int head, int heads, int key_heads, int value_dim,
+    int instance_base, int instance_stride) {
     constexpr int S = N + 4;
     extern __shared__ __align__(32) unsigned char qwen35_c64flag_storage[];
     auto *updates = reinterpret_cast<float *>(qwen35_c64flag_storage);
@@ -218,14 +212,11 @@ qwen35_c64flag_state_impl(const float *q, const float *key, const float *w, cons
         __syncthreads();
         float out[4] = {};
         qwen35_c64flag_product<0, N>(q, key, w, causal, decay, updates, carry, out, ahalf, alow,
-                                   bhalf, blow, cached_b_unsafe, instance, begin, length, qk_base,
-                                   qk_stride);
-        qwen35_c64flag_product<1, N, true>(q, key, w, causal, decay, updates, carry, out, ahalf, alow,
-                                         bhalf, blow, cached_b_unsafe, instance, begin, length,
-                                         qk_base, qk_stride);
+            bhalf, blow, cached_b_unsafe, instance, begin, length, qk_base, qk_stride);
+        qwen35_c64flag_product<1, N, true>(q, key, w, causal, decay, updates, carry, out, ahalf,
+            alow, bhalf, blow, cached_b_unsafe, instance, begin, length, qk_base, qk_stride);
         qwen35_c64flag_product<2, N>(q, key, w, causal, decay, updates, carry, out, ahalf, alow,
-                                   bhalf, blow, cached_b_unsafe, instance, begin, length, qk_base,
-                                   qk_stride);
+            bhalf, blow, cached_b_unsafe, instance, begin, length, qk_base, qk_stride);
         if (warp < (64 / 16) * (N / 8)) {
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
@@ -235,26 +226,24 @@ qwen35_c64flag_state_impl(const float *q, const float *key, const float *w, cons
                         out[i];
             }
         }
-        qwen35_c64flag_product<3, N, true>(q, key, w, causal, decay, updates, carry, out, ahalf, alow,
-                                         bhalf, blow, cached_b_unsafe, instance, begin, length,
-                                         qk_base, qk_stride);
+        qwen35_c64flag_product<3, N, true>(q, key, w, causal, decay, updates, carry, out, ahalf,
+            alow, bhalf, blow, cached_b_unsafe, instance, begin, length, qk_base, qk_stride);
     }
 }
 
-extern "C" __global__ __launch_bounds__(1024, 1) void qwen35_c64flag_uniform32_f32(
-    const float *q, const float *k, const float *g, const float *w, const float *u, const float *c,
-    const float *d, float *out, float *snapshots, int length, int heads, int kh, int vd) {
+extern "C" __global__ __launch_bounds__(1024, 1) void qwen35_c64flag_uniform32_f32(const float *q,
+    const float *k, const float *g, const float *w, const float *u, const float *c, const float *d,
+    float *out, float *snapshots, int length, int heads, int kh, int vd) {
     const int bh = blockIdx.x, chunks = (length + 63) / 64;
     qwen35_c64flag_state_impl<32>(q, k, w, u, c, d, out, (bh / heads) * length, length, bh % heads,
-                                heads, kh, vd, bh * chunks, 1);
+        heads, kh, vd, bh * chunks, 1);
 }
-extern "C" __global__ __launch_bounds__(1024, 1) void qwen35_c64flag_varlen32_f32(
-    const float *q, const float *k, const float *g, const float *w, const float *u, const float *c,
-    const float *d, float *out, float *snapshots, const unsigned *cumulative,
-    const unsigned *chunk_offsets, const unsigned *long_ids, int total_length, int heads, int kh,
-    int vd) {
+extern "C" __global__ __launch_bounds__(1024, 1) void qwen35_c64flag_varlen32_f32(const float *q,
+    const float *k, const float *g, const float *w, const float *u, const float *c, const float *d,
+    float *out, float *snapshots, const unsigned *cumulative, const unsigned *chunk_offsets,
+    const unsigned *long_ids, int total_length, int heads, int kh, int vd) {
     const int head = blockIdx.x % heads, seq = long_ids[blockIdx.x / heads],
               start = cumulative[seq];
     qwen35_c64flag_state_impl<32>(q, k, w, u, c, d, out, start, cumulative[seq + 1] - start, head,
-                                heads, kh, vd, int(chunk_offsets[seq]) * heads + head, heads);
+        heads, kh, vd, int(chunk_offsets[seq]) * heads + head, heads);
 }

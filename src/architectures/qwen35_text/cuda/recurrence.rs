@@ -3323,3 +3323,217 @@ pub(crate) fn cuda_vstore_gdn_uniform(
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::architectures::qwen35_text::tests::supported_rotary_test_dtypes;
+
+    #[test]
+    fn delta_cuda_matches_chunked_reference() {
+        let batch = 2;
+        let heads = 2;
+        let length = 290;
+        let key_dim = 128;
+        let value_dim = 16;
+        let values = |width: usize, factor: f32| {
+            (0..batch * heads * length * width)
+                .map(|index| ((index * 13 % 29) as f32 - 14.) * factor)
+                .collect::<Vec<_>>()
+        };
+        let cpu = candle_core::Device::Cpu;
+        let q = Tensor::from_vec(
+            values(key_dim, 0.001),
+            (batch, heads, length, key_dim),
+            &cpu,
+        )
+        .unwrap();
+        let k = Tensor::from_vec(
+            values(key_dim, 0.006),
+            (batch, heads, length, key_dim),
+            &cpu,
+        )
+        .unwrap();
+        let v = Tensor::from_vec(
+            values(value_dim, 0.008),
+            (batch, heads, length, value_dim),
+            &cpu,
+        )
+        .unwrap();
+        let g = Tensor::from_vec(
+            vec![-0.002f32; batch * heads * length],
+            (batch, heads, length),
+            &cpu,
+        )
+        .unwrap();
+        let beta = Tensor::from_vec(
+            vec![0.5f32; batch * heads * length],
+            (batch, heads, length),
+            &cpu,
+        )
+        .unwrap();
+        let reference = chunked_delta_rule(&q, &k, &v, &g, &beta)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cuda = test_cuda_device().unwrap();
+        let actual = cuda_delta_rule_token_major(
+            &q.transpose(1, 2).unwrap().to_device(&cuda).unwrap(),
+            &k.transpose(1, 2).unwrap().to_device(&cuda).unwrap(),
+            &v.transpose(1, 2).unwrap().to_device(&cuda).unwrap(),
+            &g.transpose(1, 2).unwrap().to_device(&cuda).unwrap(),
+            &beta.transpose(1, 2).unwrap().to_device(&cuda).unwrap(),
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+        let rtol = 1.3e-6f32;
+        let atol = 1e-5f32;
+        for (index, (expected, actual)) in reference.iter().zip(actual).enumerate() {
+            let error = (expected - actual).abs();
+            let allowed = atol + rtol * expected.abs();
+            assert!(
+                error <= allowed,
+                "Delta-rule mismatch at {index}: expected {expected}, got {actual}, error {error} > {allowed}"
+            );
+        }
+    }
+
+    #[test]
+    fn subwarp16_cuda_is_bitwise_equal_to_uncached_recurrence() -> Result<()> {
+        let device = test_cuda_device()?;
+        for (batch, length, value_dim) in [
+            (1usize, 17usize, 128usize),
+            (2, 290, 128),
+            (1, 1024, 128),
+            (1, 17, 7),
+        ] {
+            let key_heads = 2usize;
+            let heads = 4usize;
+            let key_dim = 128usize;
+            let data = |count: usize, factor: f32| {
+                (0..count)
+                    .map(|i| ((i * 13 % 29) as f32 - 14.) * factor)
+                    .collect::<Vec<_>>()
+            };
+            let q = Tensor::from_vec(
+                data(batch * length * key_heads * key_dim, 0.001),
+                (batch, length, key_heads, key_dim),
+                &device,
+            )?;
+            let k = Tensor::from_vec(
+                data(batch * length * key_heads * key_dim, 0.006),
+                (batch, length, key_heads, key_dim),
+                &device,
+            )?;
+            let v = Tensor::from_vec(
+                data(batch * length * heads * value_dim, 0.008),
+                (batch, length, heads, value_dim),
+                &device,
+            )?;
+            let gate = Tensor::from_vec(
+                (0..batch * length * heads)
+                    .map(|i| -0.001 * (1 + (i % 29)) as f32)
+                    .collect::<Vec<_>>(),
+                (batch, length, heads),
+                &device,
+            )?;
+            let beta = Tensor::from_vec(
+                vec![0.5f32; batch * length * heads],
+                (batch, length, heads),
+                &device,
+            )?;
+            let old = cuda_delta_rule_token_major_impl(&q, &k, &v, &gate, &beta, false)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let new = cuda_delta_rule_token_major(&q, &k, &v, &gate, &beta)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert_eq!(old.len(), new.len());
+            for (i, (a, b)) in old.iter().zip(&new).enumerate() {
+                assert!(a.is_finite() && b.is_finite());
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "subwarp delta mismatch at {batch}/{length}/{i}"
+                );
+            }
+        }
+        println!("SUBWARP_DELTA_PARITY exact_recurrence=true grouped_heads=true batch_shapes=3");
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_delta_cuda_is_bitwise_equal_to_expanded_preparation() {
+        let device = test_cuda_device().unwrap();
+        for (batch, length, key_heads, heads, value_dim) in
+            [(1, 1, 1, 4, 5), (2, 33, 2, 8, 16), (2, 290, 4, 16, 128)]
+        {
+            for dtype in supported_rotary_test_dtypes(&device).unwrap() {
+                let input = |width: usize, factor: f32, count_heads: usize| {
+                    Tensor::from_vec(
+                        (0..batch * length * count_heads * width)
+                            .map(|i| ((i * 17 % 101) as f32 - 50.) * factor)
+                            .collect::<Vec<_>>(),
+                        (batch, length, count_heads, width),
+                        &device,
+                    )
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+                };
+                let expand = |x: &Tensor| {
+                    x.unsqueeze(3)
+                        .unwrap()
+                        .broadcast_as((batch, length, key_heads, heads / key_heads, 128))
+                        .unwrap()
+                        .reshape((batch, length, heads, 128))
+                        .unwrap()
+                };
+                let normalize = |x: &Tensor, scale: f64| {
+                    let x = x.to_dtype(DType::F32).unwrap();
+                    let denominator = (x.sqr().unwrap().sum_keepdim(D::Minus1).unwrap() + 1e-6)
+                        .unwrap()
+                        .sqrt()
+                        .unwrap();
+                    (x.broadcast_div(&denominator).unwrap() * scale).unwrap()
+                };
+                let raw_q = input(128, 0.003, key_heads);
+                let raw_k = input(128, 0.007, key_heads);
+                let q = normalize(&raw_q, 128f64.powf(-0.5));
+                let k = normalize(&raw_k, 1.);
+                let old_q = normalize(&expand(&raw_q), 128f64.powf(-0.5));
+                let old_k = normalize(&expand(&raw_k), 1.);
+                let read = |x: &Tensor| x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+                let assert_bits = |a: &Tensor, b: &Tensor| {
+                    let a = read(a);
+                    let b = read(b);
+                    assert_eq!(a.len(), b.len());
+                    for (i, (a, b)) in a.iter().zip(&b).enumerate() {
+                        assert!(a.is_finite() && b.is_finite());
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{dtype:?} batch={batch} length={length} heads={heads} value_dim={value_dim} element={i}"
+                        );
+                    }
+                };
+                assert_bits(&expand(&q), &old_q);
+                assert_bits(&expand(&k), &old_k);
+                let v = input(value_dim, 0.008, heads).to_dtype(DType::F32).unwrap();
+                let gate = Tensor::full(-0.002f32, (batch, length, heads), &device).unwrap();
+                let beta = Tensor::full(0.5f32, (batch, length, heads), &device).unwrap();
+                let grouped = cuda_delta_rule_token_major(&q, &k, &v, &gate, &beta).unwrap();
+                let expanded =
+                    cuda_delta_rule_token_major(&old_q, &old_k, &v, &gate, &beta).unwrap();
+                assert_bits(&grouped, &expanded);
+            }
+        }
+    }
+}

@@ -1,11 +1,9 @@
 #include <cuda_bf16.h>
 #include <math.h>
 
-extern "C" __global__ void
-qwen35_online_attention_shared_bf16(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
-                                    const __nv_bfloat16 *v, __nv_bfloat16 *output, int query_heads,
-                                    int queries, int keys, int heads, int kv_heads, int width,
-                                    float scale, int causal) {
+extern "C" __global__ void qwen35_online_attention_shared_bf16(const __nv_bfloat16 *q,
+    const __nv_bfloat16 *k, const __nv_bfloat16 *v, __nv_bfloat16 *output, int query_heads,
+    int queries, int keys, int heads, int kv_heads, int width, float scale, int causal) {
     const int lane = threadIdx.x & 31;
     const int item = blockIdx.x * 4 + threadIdx.x / 32;
 
@@ -41,8 +39,8 @@ qwen35_online_attention_shared_bf16(const __nv_bfloat16 *q, const __nv_bfloat16 
 #pragma unroll
             for (int channel = 0; channel < 8; ++channel) {
                 if (channel < channels)
-                    score = __fmaf_rn(query[channel], float(shared_k[offset + lane + channel * 32]),
-                                      score);
+                    score = __fmaf_rn(
+                        query[channel], float(shared_k[offset + lane + channel * 32]), score);
             }
 #pragma unroll
             for (int step = 16; step > 0; step >>= 1)
@@ -63,7 +61,7 @@ qwen35_online_attention_shared_bf16(const __nv_bfloat16 *q, const __nv_bfloat16 
                 if (channel < channels)
                     acc[channel] =
                         __fmaf_rn(probability, float(shared_v[offset + lane + channel * 32]),
-                                  __fmul_rn(acc[channel], alpha));
+                            __fmul_rn(acc[channel], alpha));
             }
         }
         __syncthreads();

@@ -528,3 +528,63 @@ pub(crate) static CONV_LOOKUP_CALLS: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 pub(crate) static CONV_PREPARED_QV_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conv_cuda_matches_candle_across_batches_and_padding() {
+        let (batch, length, channels, kernel) = (2, 7, 31, 4);
+        let cpu = candle_core::Device::Cpu;
+        let projected = Tensor::from_vec(
+            (0..batch * length * channels)
+                .map(|index| ((index * 17 % 41) as f32 - 20.) * 0.04)
+                .collect::<Vec<_>>(),
+            (batch, length, channels),
+            &cpu,
+        )
+        .unwrap();
+        let weights = Tensor::from_vec(
+            (0..channels * kernel)
+                .map(|index| ((index * 11 % 23) as f32 - 11.) * 0.02)
+                .collect::<Vec<_>>(),
+            (channels, 1, kernel),
+            &cpu,
+        )
+        .unwrap();
+        let cuda = test_cuda_device().unwrap();
+        for dtype in [DType::BF16, DType::F32] {
+            let projected = projected.to_dtype(dtype).unwrap();
+            let weights = weights.to_dtype(dtype).unwrap();
+            let expected = causal_conv_silu(&projected, &weights, kernel)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let actual = cuda_conv_silu(
+                &projected.to_device(&cuda).unwrap(),
+                &weights.to_device(&cuda).unwrap(),
+            )
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+            let max_error = expected
+                .iter()
+                .zip(actual)
+                .map(|(expected, actual)| (expected - actual).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max_error < 0.001,
+                "{dtype:?} convolution error: {max_error}"
+            );
+        }
+    }
+}

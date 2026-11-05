@@ -8,11 +8,10 @@ __device__ __forceinline__ int qwen35_c64vstoreguard_half_index(int row, int col
 }
 
 template <int Mode>
-__device__ __forceinline__ void
-qwen35_c64vstoreguard_gram(const float *query, const float *key, const float *beta,
-                         const float *prefix, bool &key_unsafe, int physical_start, int begin,
-                         int length, int head, int heads, int kh, int key_heads, __half *ahalf,
-                         __half *alow, __half *bhalf, __half *blow, float *out) {
+__device__ __forceinline__ void qwen35_c64vstoreguard_gram(const float *query, const float *key,
+    const float *beta, const float *prefix, bool &key_unsafe, int physical_start, int begin,
+    int length, int head, int heads, int kh, int key_heads, __half *ahalf, __half *alow,
+    __half *bhalf, __half *blow, float *out) {
     constexpr int C = 64, K = 128;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, group = lane / 4, tid = lane % 4;
     const int col = (warp % 8) * 8;
@@ -24,11 +23,10 @@ qwen35_c64vstoreguard_gram(const float *query, const float *key, const float *be
             const int t = i / 64, d = i % 64, token = begin + t;
             const int offset = ((physical_start + token) * key_heads + kh) * K + slice + d;
             const float kval = token < length ? key[offset] : 0.f;
-            const float lhs =
-                Mode == 0 ? (token < length
-                                 ? __fmul_rn(kval, beta[(physical_start + token) * heads + head])
-                                 : 0.f)
-                          : (token < length ? query[offset] : 0.f);
+            const float lhs = Mode == 0
+                ? (token < length ? __fmul_rn(kval, beta[(physical_start + token) * heads + head])
+                                  : 0.f)
+                : (token < length ? query[offset] : 0.f);
             key_unsafe |= !(fabsf(kval) <= 32768.f);
             unsafe |= !(fabsf(kval) <= 32768.f) || !(fabsf(lhs) <= 32768.f);
             const auto a = __float2half_rn(lhs), b = __float2half_rn(kval);
@@ -73,10 +71,9 @@ qwen35_c64vstoreguard_gram(const float *query, const float *key, const float *be
                 if (token < length && previous < length) {
                     for (int d = 0; d < K; ++d) {
                         const int offset = ((physical_start + token) * key_heads + kh) * K + d;
-                        const float lhs =
-                            Mode == 0 ? __fmul_rn(key[offset],
-                                                  beta[(physical_start + token) * heads + head])
-                                      : query[offset];
+                        const float lhs = Mode == 0
+                            ? __fmul_rn(key[offset], beta[(physical_start + token) * heads + head])
+                            : query[offset];
                         dot = __fmaf_rn(
                             lhs, key[((physical_start + previous) * key_heads + kh) * K + d], dot);
                     }
@@ -95,8 +92,8 @@ qwen35_c64vstoreguard_gram(const float *query, const float *key, const float *be
 }
 
 template <int Eighth>
-__device__ __forceinline__ void qwen35_c64vstoreguard_rhs_phase(float (&rhs)[8][4],
-                                                              const float *lower, int lane) {
+__device__ __forceinline__ void qwen35_c64vstoreguard_rhs_phase(
+    float (&rhs)[8][4], const float *lower, int lane) {
 #pragma unroll 1
     for (int j = Eighth * 8; j < (Eighth + 1) * 8; ++j) {
         float coefficient[8];
@@ -105,14 +102,14 @@ __device__ __forceinline__ void qwen35_c64vstoreguard_rhs_phase(float (&rhs)[8][
         if constexpr (Eighth < 4) {
             asm volatile("ld.shared.v4.f32 {%0,%1,%2,%3}, [%4];"
                          : "=f"(coefficient[0]), "=f"(coefficient[1]), "=f"(coefficient[2]),
-                           "=f"(coefficient[3])
+                         "=f"(coefficient[3])
                          : "r"(address)
                          : "memory");
         }
         if constexpr (Eighth < 6) {
             asm volatile("ld.shared.v4.f32 {%0,%1,%2,%3}, [%4];"
                          : "=f"(coefficient[4]), "=f"(coefficient[5]), "=f"(coefficient[6]),
-                           "=f"(coefficient[7])
+                         "=f"(coefficient[7])
                          : "r"(address + 128)
                          : "memory");
         } else if constexpr (Eighth == 6) {
@@ -135,12 +132,10 @@ __device__ __forceinline__ void qwen35_c64vstoreguard_rhs_phase(float (&rhs)[8][
     }
 }
 
-__device__ __forceinline__ void
-qwen35_c64vstoreguard_prepare(const float *query, const float *key, const __nv_bfloat16 *value,
-                            const float *gate, const float *beta, float *w, float *u, float *causal,
-                            float *decays, float *first_zero, int physical_start, int begin,
-                            int length, int head, int heads, int key_heads, int value_dim,
-                            int instance) {
+__device__ __forceinline__ void qwen35_c64vstoreguard_prepare(const float *query, const float *key,
+    const __nv_bfloat16 *value, const float *gate, const float *beta, float *w, float *u,
+    float *causal, float *decays, float *first_zero, int physical_start, int begin, int length,
+    int head, int heads, int key_heads, int value_dim, int instance) {
     constexpr int C = 64, K = 128, S = 129;
     extern __shared__ __align__(32) unsigned char qwen35_c64vstoreguard_storage[];
     auto *ahalf = reinterpret_cast<__half *>(qwen35_c64vstoreguard_storage);
@@ -177,12 +172,11 @@ qwen35_c64vstoreguard_prepare(const float *query, const float *key, const __nv_b
         decays[instance * 128 + 64 + t] = expf(__fsub_rn(prefix[63], prefix[t]));
     }
     bool key_unsafe = false;
-    qwen35_c64vstoreguard_gram<0>(query, key, beta, prefix, key_unsafe, physical_start, begin, length,
-                                head, heads, kh, key_heads, ahalf, alow, bhalf, blow, lower);
+    qwen35_c64vstoreguard_gram<0>(query, key, beta, prefix, key_unsafe, physical_start, begin,
+        length, head, heads, kh, key_heads, ahalf, alow, bhalf, blow, lower);
 
-    qwen35_c64vstoreguard_gram<1>(query, key, beta, prefix, key_unsafe, physical_start, begin, length,
-                                head, heads, kh, key_heads, ahalf, alow, bhalf, blow,
-                                causal + instance * C * C);
+    qwen35_c64vstoreguard_gram<1>(query, key, beta, prefix, key_unsafe, physical_start, begin,
+        length, head, heads, kh, key_heads, ahalf, alow, bhalf, blow, causal + instance * C * C);
     const int lane = threadIdx.x & 7,
               first_column = (threadIdx.x / 32) * 16 + ((threadIdx.x & 31) / 8) * 4;
     float rhs[8][4];
@@ -198,11 +192,10 @@ qwen35_c64vstoreguard_prepare(const float *query, const float *key, const __nv_b
                     token < length ? key[((physical_start + token) * key_heads + kh) * K + d] : 0.f;
                 rhs[part][column] = __fmul_rn(__fmul_rn(kval, beta_value), decay);
             } else {
-                const float val =
-                    token < length && d < value_dim
-                        ? __bfloat162float(
-                              value[((physical_start + token) * heads + head) * value_dim + d])
-                        : 0.f;
+                const float val = token < length && d < value_dim
+                    ? __bfloat162float(
+                          value[((physical_start + token) * heads + head) * value_dim + d])
+                    : 0.f;
                 rhs[part][column] = __fmul_rn(val, beta_value);
             }
         }
@@ -264,7 +257,7 @@ extern "C" __global__ __launch_bounds__(512, 2) void qwen35_c64vstoreguard_unifo
               chunk = instance % chunks;
     const int batch = bh / heads, head = bh % heads;
     qwen35_c64vstoreguard_prepare(q, k, v, g, b, w, u, c, d, first_zero, batch * length, chunk * 64,
-                                length, head, heads, key_heads, vd, instance);
+        length, head, heads, key_heads, vd, instance);
 }
 extern "C" __global__ __launch_bounds__(512, 2) void qwen35_c64vstoreguard_varlen_prepare_f32(
     const float *q, const float *k, const __nv_bfloat16 *v, const float *g, const float *b,
@@ -283,5 +276,5 @@ extern "C" __global__ __launch_bounds__(512, 2) void qwen35_c64vstoreguard_varle
     const int start = cumulative[lo], length = cumulative[lo + 1] - start,
               begin = (global_chunk - int(chunks[lo])) * 64;
     qwen35_c64vstoreguard_prepare(q, k, v, g, b, w, u, c, d, first_zero, start, begin, length, head,
-                                heads, key_heads, vd, global_chunk * heads + head);
+        heads, key_heads, vd, global_chunk * heads + head);
 }

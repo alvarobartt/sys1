@@ -2,8 +2,7 @@
 #include <math.h>
 template <typename T>
 __device__ void qwen35_packed_conv(const T *input, const T *weights, T *output,
-                                 const unsigned int *starts, int count, int length, int channels,
-                                 int kernel) {
+    const unsigned int *starts, int count, int length, int channels, int kernel) {
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= count)
         return;
@@ -16,7 +15,7 @@ __device__ void qwen35_packed_conv(const T *input, const T *weights, T *output,
         const int source_token = token + tap - kernel + 1;
         if (source_token >= begin) {
             const float product = __fmul_rn(float(input[source_token * channels + channel]),
-                                            float(weights[channel * kernel + tap]));
+                float(weights[channel * kernel + tap]));
             value = __fadd_rn(value, product);
         }
     }
@@ -25,21 +24,17 @@ __device__ void qwen35_packed_conv(const T *input, const T *weights, T *output,
     output[index] = T(x / (1.f + expf(-x)));
 }
 extern "C" __global__ void qwen35_packed_conv_bf16(const __nv_bfloat16 *x, const __nv_bfloat16 *w,
-                                                 __nv_bfloat16 *out, const unsigned int *starts,
-                                                 int count, int length, int channels, int kernel) {
+    __nv_bfloat16 *out, const unsigned int *starts, int count, int length, int channels,
+    int kernel) {
     qwen35_packed_conv(x, w, out, starts, count, length, channels, kernel);
 }
 extern "C" __global__ void qwen35_packed_conv_f32(const float *x, const float *w, float *out,
-                                                const unsigned int *starts, int count, int length,
-                                                int channels, int kernel) {
+    const unsigned int *starts, int count, int length, int channels, int kernel) {
     qwen35_packed_conv(x, w, out, starts, count, length, channels, kernel);
 }
 extern "C" __global__ void qwen35_packed_delta_subwarp16_f32(const float *query, const float *key,
-                                                           const float *value, const float *gate,
-                                                           const float *beta, float *output,
-                                                           const unsigned int *cu_seqlens,
-                                                           int total_length, int heads,
-                                                           int key_heads, int value_dim) {
+    const float *value, const float *gate, const float *beta, float *output,
+    const unsigned int *cu_seqlens, int total_length, int heads, int key_heads, int value_dim) {
     const int batch_head = blockIdx.x;
     const int head = batch_head % heads;
     const int batch = batch_head / heads;

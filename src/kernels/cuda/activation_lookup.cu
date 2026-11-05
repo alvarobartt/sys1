@@ -15,17 +15,16 @@ extern "C" __global__ void build_activation_lookup_bf16(__nv_bfloat16 *table) {
 #include <cstdint>
 
 template <int V>
-__device__ __forceinline__ void
-activation_vector_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *up,
-                            const __nv_bfloat16 *table, __nv_bfloat16 *output, unsigned int count,
-                            int mode) {
+__device__ __forceinline__ void activation_vector_impl(const __nv_bfloat16 *input,
+    const __nv_bfloat16 *up, const __nv_bfloat16 *table, __nv_bfloat16 *output, unsigned int count,
+    int mode) {
     const size_t first = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * V;
     if (first >= count)
         return;
     constexpr uintptr_t Mask = V * 2 - 1;
     const bool aligned = ((reinterpret_cast<uintptr_t>(input) | reinterpret_cast<uintptr_t>(up) |
-                           reinterpret_cast<uintptr_t>(output)) &
-                          Mask) == 0;
+                              reinterpret_cast<uintptr_t>(output)) &
+                             Mask) == 0;
     if (aligned && first + V <= count) {
         alignas(16) unsigned short xv[V], uv[V], yv[V];
         if constexpr (V == 8) {
@@ -40,10 +39,9 @@ activation_vector_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *up,
 #pragma unroll
         for (int p = 0; p < V; ++p) {
             const __nv_bfloat16 activated = table[unsigned(xv[p]) + (mode == 1 ? 65536u : 0u)];
-            yv[p] = __bfloat16_as_ushort(
-                mode == 2
+            yv[p] = __bfloat16_as_ushort(mode == 2
                     ? __float2bfloat16_rn(__fmul_rn(__bfloat162float(activated),
-                                                    __bfloat162float(__ushort_as_bfloat16(uv[p]))))
+                          __bfloat162float(__ushort_as_bfloat16(uv[p]))))
                     : activated);
         }
         if constexpr (V == 8)
@@ -57,17 +55,15 @@ activation_vector_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *up,
             if (i < count) {
                 const unsigned index = __bfloat16_as_ushort(input[i]) + (mode == 1 ? 65536u : 0u);
                 const __nv_bfloat16 activated = table[index];
-                output[i] = mode == 2 ? __float2bfloat16_rn(__fmul_rn(__bfloat162float(activated),
-                                                                      __bfloat162float(up[i])))
+                output[i] = mode == 2 ? __float2bfloat16_rn(__fmul_rn(
+                                            __bfloat162float(activated), __bfloat162float(up[i])))
                                       : activated;
             }
         }
     }
 }
 
-extern "C" __global__ void activation_lookup_bf16(const __nv_bfloat16 *x,
-                                                       const __nv_bfloat16 *u,
-                                                       const __nv_bfloat16 *table, __nv_bfloat16 *y,
-                                                       unsigned n, int mode) {
+extern "C" __global__ void activation_lookup_bf16(const __nv_bfloat16 *x, const __nv_bfloat16 *u,
+    const __nv_bfloat16 *table, __nv_bfloat16 *y, unsigned n, int mode) {
     activation_vector_impl<8>(x, u, table, y, n, mode);
 }

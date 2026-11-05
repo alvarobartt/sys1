@@ -20,16 +20,14 @@ struct WideSwizzle : Swizzle {
 using Shape = cutlass::gemm::GemmShape<128, 256, 32>;
 using Warp = cutlass::gemm::GemmShape<64, 64, 32>;
 using Op = cutlass::epilogue::thread::LinearCombination<E, 8, float, float>;
-using Default =
-    cutlass::gemm::kernel::DefaultGemm<E, Row, 8, E, Column, 8, E, Row, float,
-                                       cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80, Shape,
-                                       Warp, cutlass::gemm::GemmShape<16, 8, 16>, Op, Swizzle, 3,
-                                       false, cutlass::arch::OpMultiplyAdd>;
-using Mma = Default::Mma;
-using ProductDefault = cutlass::gemm::kernel::DefaultGemm<
-    E, Row, 8, E, Row, 8, E, Row, float, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
-    cutlass::gemm::GemmShape<128, 128, 32>, cutlass::gemm::GemmShape<64, 32, 32>,
+using Default = cutlass::gemm::kernel::DefaultGemm<E, Row, 8, E, Column, 8, E, Row, float,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80, Shape, Warp,
     cutlass::gemm::GemmShape<16, 8, 16>, Op, Swizzle, 3, false, cutlass::arch::OpMultiplyAdd>;
+using Mma = Default::Mma;
+using ProductDefault = cutlass::gemm::kernel::DefaultGemm<E, Row, 8, E, Row, 8, E, Row, float,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80, cutlass::gemm::GemmShape<128, 128, 32>,
+    cutlass::gemm::GemmShape<64, 32, 32>, cutlass::gemm::GemmShape<16, 8, 16>, Op, Swizzle, 3,
+    false, cutlass::arch::OpMultiplyAdd>;
 using ProductEpi = typename ProductDefault::Epilogue;
 constexpr int Threads = Mma::WarpCount::kCount * 32;
 union alignas(16) Shared {
@@ -38,10 +36,9 @@ union alignas(16) Shared {
 };
 
 template <bool Debug>
-__device__ __forceinline__ void
-fused_gate_up_body(const E *gate_weight, const E *up_weight, const E *x,
-                   const __nv_bfloat16 *lookup, __nv_bfloat16 *output, __nv_bfloat16 *debug_gate,
-                   __nv_bfloat16 *debug_up, int rows, int n, int k) {
+__device__ __forceinline__ void fused_gate_up_body(const E *gate_weight, const E *up_weight,
+    const E *x, const __nv_bfloat16 *lookup, __nv_bfloat16 *output, __nv_bfloat16 *debug_gate,
+    __nv_bfloat16 *debug_up, int rows, int n, int k) {
     extern __shared__ __align__(16) unsigned char buffer[];
     auto &shared = *reinterpret_cast<Shared *>(buffer);
     const cutlass::gemm::GemmCoord tiled((rows + 127) / 128, n / 128, 1);
@@ -57,9 +54,9 @@ fused_gate_up_body(const E *gate_weight, const E *up_weight, const E *x,
 
     using Map = typename Mma::IteratorB::ThreadMap;
     static_assert(Map::Delta::kStrided == 8 && Map::Iterations::kStrided == 4,
-                  "direct paired mapping requires four accesses within a32-feature group");
+        "direct paired mapping requires four accesses within a32-feature group");
     static_assert(Map::Iterations::kContiguous == 1 && Threads == 256,
-                  "qualified vector/thread geometry only");
+        "qualified vector/thread geometry only");
     const int j = Map::initial_offset(threadIdx.x).strided();
     const E *selected = (j % 64) < 32 ? gate_weight : up_weight;
     const int original_feature = (j / 64) * 32 + j % 32;
@@ -73,7 +70,7 @@ fused_gate_up_body(const E *gate_weight, const E *up_weight, const E *x,
     __syncthreads();
     using ProductFragment = typename ProductDefault::Mma::FragmentC;
     static_assert(Mma::FragmentC::kElements == 128 && ProductFragment::kElements == 64,
-                  "paired MMA ownership");
+        "paired MMA ownership");
     ProductFragment products;
     const int warp_m = warp % Mma::WarpCount::kM, warp_n = warp / Mma::WarpCount::kM;
 #pragma unroll
@@ -95,22 +92,22 @@ fused_gate_up_body(const E *gate_weight, const E *up_weight, const E *x,
     }
     using Destination = typename ProductEpi::OutputTileIterator;
     typename Destination::Params params{Row(n)};
-    Destination destination(params, reinterpret_cast<E *>(output), {rows, n}, threadIdx.x,
-                            {token_base, feature_base});
+    Destination destination(
+        params, reinterpret_cast<E *>(output), {rows, n}, threadIdx.x, {token_base, feature_base});
     ProductEpi epi(shared.end, threadIdx.x, warp, lane);
     epi(Op(typename Op::Params(1.f, 0.f)), destination, products);
 }
 
 static_assert(sizeof(Shared) == 73728, "Rust dynamic shared memory must match native layout");
-extern "C" __global__ __launch_bounds__(Threads) void direct_ffn_bf16(
-    const E *gate_weight, const E *up_weight, const E *input, const __nv_bfloat16 *table,
-    __nv_bfloat16 *output, int rows, int n, int k) {
-    fused_gate_up_body<false>(gate_weight, up_weight, input, table, output, nullptr, nullptr, rows,
-                              n, k);
+extern "C" __global__ __launch_bounds__(Threads) void direct_ffn_bf16(const E *gate_weight,
+    const E *up_weight, const E *input, const __nv_bfloat16 *table, __nv_bfloat16 *output, int rows,
+    int n, int k) {
+    fused_gate_up_body<false>(
+        gate_weight, up_weight, input, table, output, nullptr, nullptr, rows, n, k);
 }
 
-extern "C" __global__ __launch_bounds__(Threads) void direct_ffn_debug_bf16(
-    const E *gate_weight, const E *up_weight, const E *input, const __nv_bfloat16 *table,
-    __nv_bfloat16 *output, __nv_bfloat16 *gate, __nv_bfloat16 *up, int rows, int n, int k) {
+extern "C" __global__ __launch_bounds__(Threads) void direct_ffn_debug_bf16(const E *gate_weight,
+    const E *up_weight, const E *input, const __nv_bfloat16 *table, __nv_bfloat16 *output,
+    __nv_bfloat16 *gate, __nv_bfloat16 *up, int rows, int n, int k) {
     fused_gate_up_body<true>(gate_weight, up_weight, input, table, output, gate, up, rows, n, k);
 }

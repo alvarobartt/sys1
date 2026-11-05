@@ -4,9 +4,7 @@
 #include <mma.h>
 
 extern "C" __global__ void qwen35_post_finalize_bf16(const float *input, const __nv_bfloat16 *gate,
-                                                     const __nv_bfloat16 *norm,
-                                                     __nv_bfloat16 *output, int columns,
-                                                     float epsilon) {
+    const __nv_bfloat16 *norm, __nv_bfloat16 *output, int columns, float epsilon) {
     const int row = blockIdx.x;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;

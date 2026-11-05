@@ -12,9 +12,7 @@ __device__ __forceinline__ float qwen35_warp_sum(float value) {
 }
 
 extern "C" __global__ void qwen35_rms_norm_delta_bf16(const __nv_bfloat16 *input,
-                                                      const __nv_bfloat16 *delta_weight,
-                                                      __nv_bfloat16 *output, int columns,
-                                                      float epsilon) {
+    const __nv_bfloat16 *delta_weight, __nv_bfloat16 *output, int columns, float epsilon) {
     const int row = blockIdx.x;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -38,10 +36,9 @@ extern "C" __global__ void qwen35_rms_norm_delta_bf16(const __nv_bfloat16 *input
     }
 }
 
-extern "C" __global__ void
-qwen35_residual_rms_norm_delta_bf16(const __nv_bfloat16 *input, const __nv_bfloat16 *mixed,
-                                    const __nv_bfloat16 *delta_weight, __nv_bfloat16 *residual,
-                                    __nv_bfloat16 *normalized, int columns, float epsilon) {
+extern "C" __global__ void qwen35_residual_rms_norm_delta_bf16(const __nv_bfloat16 *input,
+    const __nv_bfloat16 *mixed, const __nv_bfloat16 *delta_weight, __nv_bfloat16 *residual,
+    __nv_bfloat16 *normalized, int columns, float epsilon) {
     const int row = blockIdx.x;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;

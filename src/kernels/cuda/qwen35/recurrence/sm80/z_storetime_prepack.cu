@@ -1,10 +1,9 @@
-
 #include <stdint.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <math.h>
-__device__ __forceinline__ void qwen35_store15_half_mma16816(float *c, const unsigned *a,
-                                                           const unsigned *b) {
+__device__ __forceinline__ void qwen35_store15_half_mma16816(
+    float *c, const unsigned *a, const unsigned *b) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
@@ -38,11 +37,10 @@ __device__ __forceinline__ int qwen35_store15_swizzle(int row, int col, int stri
     return row * stride + (col ^ ((row & 7) * 8));
 }
 
-__device__ __forceinline__ void
-qwen35_c64storepack15_gram(const float *query, const float *key, const float *beta,
-                         const float *prefix, int physical_start, int begin, int length, int head,
-                         int heads, int kh, int key_heads, __half *storage, float *lower,
-                         float *causal, __half *packed, unsigned *flags) {
+__device__ __forceinline__ void qwen35_c64storepack15_gram(const float *query, const float *key,
+    const float *beta, const float *prefix, int physical_start, int begin, int length, int head,
+    int heads, int kh, int key_heads, __half *storage, float *lower, float *causal, __half *packed,
+    unsigned *flags) {
     constexpr int C = 64, K = 128;
     __half *ak = storage;
     __half *aq = ak + C * K;
@@ -61,8 +59,8 @@ qwen35_c64storepack15_gram(const float *query, const float *key, const float *be
             keys = (reinterpret_cast<uintptr_t>(kp) & 15u) ? make_float4(kp[0], kp[1], kp[2], kp[3])
                                                            : *reinterpret_cast<const float4 *>(kp);
             queries = (reinterpret_cast<uintptr_t>(qp) & 15u)
-                          ? make_float4(qp[0], qp[1], qp[2], qp[3])
-                          : *reinterpret_cast<const float4 *>(qp);
+                ? make_float4(qp[0], qp[1], qp[2], qp[3])
+                : *reinterpret_cast<const float4 *>(qp);
             beta_value = beta[(physical_start + token) * heads + head];
         }
         const float kvals[4] = {keys.x, keys.y, keys.z, keys.w};
@@ -156,8 +154,8 @@ qwen35_c64storepack15_gram(const float *query, const float *key, const float *be
 }
 
 template <int Eighth>
-__device__ __forceinline__ void qwen35_c64storepack15_rhs_phase(float (&rhs)[8][4],
-                                                              const float *lower, int lane) {
+__device__ __forceinline__ void qwen35_c64storepack15_rhs_phase(
+    float (&rhs)[8][4], const float *lower, int lane) {
 #pragma unroll 1
     for (int j = Eighth * 8; j < (Eighth + 1) * 8; ++j) {
         float coefficient[8];
@@ -166,14 +164,14 @@ __device__ __forceinline__ void qwen35_c64storepack15_rhs_phase(float (&rhs)[8][
         if constexpr (Eighth < 4) {
             asm volatile("ld.shared.v4.f32 {%0,%1,%2,%3}, [%4];"
                          : "=f"(coefficient[0]), "=f"(coefficient[1]), "=f"(coefficient[2]),
-                           "=f"(coefficient[3])
+                         "=f"(coefficient[3])
                          : "r"(address)
                          : "memory");
         }
         if constexpr (Eighth < 6) {
             asm volatile("ld.shared.v4.f32 {%0,%1,%2,%3}, [%4];"
                          : "=f"(coefficient[4]), "=f"(coefficient[5]), "=f"(coefficient[6]),
-                           "=f"(coefficient[7])
+                         "=f"(coefficient[7])
                          : "r"(address + 128)
                          : "memory");
         } else if constexpr (Eighth == 6) {
@@ -207,12 +205,10 @@ __device__ __forceinline__ void half4_75(__half *p, const float (&v)[4]) {
         h[j] = __half_as_ushort(__float2half_rn(v[j]));
     *reinterpret_cast<uint2 *>(p) = make_uint2(h[0] | (h[1] << 16), h[2] | (h[3] << 16));
 }
-__device__ __forceinline__ void
-qwen35_c64storepack15_prepare(const float *query, const float *key, const float *value,
-                            const float *gate, const float *beta, float *w, float *u, float *causal,
-                            float *decays, int physical_start, int begin, int length, int head,
-                            int heads, int key_heads, int value_dim, int instance, __half *packed,
-                            unsigned *flags) {
+__device__ __forceinline__ void qwen35_c64storepack15_prepare(const float *query, const float *key,
+    const float *value, const float *gate, const float *beta, float *w, float *u, float *causal,
+    float *decays, int physical_start, int begin, int length, int head, int heads, int key_heads,
+    int value_dim, int instance, __half *packed, unsigned *flags) {
     constexpr int C = 64, K = 128, S = 129;
     extern __shared__ __align__(32) unsigned char qwen35_c64storepack15_storage[];
     auto *ahalf = reinterpret_cast<__half *>(qwen35_c64storepack15_storage);
@@ -253,7 +249,7 @@ qwen35_c64storepack15_prepare(const float *query, const float *key, const float 
         decays[instance * 128 + 64 + t] = expf(__fsub_rn(prefix[63], prefix[t]));
     }
     qwen35_c64storepack15_gram(query, key, beta, prefix, physical_start, begin, length, head, heads,
-                             kh, key_heads, ahalf, lower, causal + instance * C * C, packed, flags);
+        kh, key_heads, ahalf, lower, causal + instance * C * C, packed, flags);
     const int lane = threadIdx.x & 7,
               first_column = (threadIdx.x / 32) * 16 + ((threadIdx.x & 31) / 8) * 4;
 
@@ -268,17 +264,17 @@ qwen35_c64storepack15_prepare(const float *query, const float *key, const float 
         float4 values = make_float4(0.f, 0.f, 0.f, 0.f);
         const bool key_field = load_column < 128;
         if (token < length && (key_field || col < value_dim)) {
-            const float *pointer =
-                key_field ? key + ((physical_start + token) * key_heads + kh) * K + col
-                          : value + ((physical_start + token) * heads + head) * value_dim + col;
+            const float *pointer = key_field
+                ? key + ((physical_start + token) * key_heads + kh) * K + col
+                : value + ((physical_start + token) * heads + head) * value_dim + col;
             if (key_field || col + 3 < value_dim) {
                 values = (reinterpret_cast<uintptr_t>(pointer) & 15u)
-                             ? make_float4(pointer[0], pointer[1], pointer[2], pointer[3])
-                             : *reinterpret_cast<const float4 *>(pointer);
+                    ? make_float4(pointer[0], pointer[1], pointer[2], pointer[3])
+                    : *reinterpret_cast<const float4 *>(pointer);
             } else {
-                values = make_float4(
-                    col < value_dim ? pointer[0] : 0.f, col + 1 < value_dim ? pointer[1] : 0.f,
-                    col + 2 < value_dim ? pointer[2] : 0.f, col + 3 < value_dim ? pointer[3] : 0.f);
+                values = make_float4(col < value_dim ? pointer[0] : 0.f,
+                    col + 1 < value_dim ? pointer[1] : 0.f, col + 2 < value_dim ? pointer[2] : 0.f,
+                    col + 3 < value_dim ? pointer[3] : 0.f);
             }
         }
         const float beta_value = betas[row];
@@ -352,8 +348,8 @@ qwen35_c64storepack15_prepare(const float *query, const float *key, const float 
                     qs[j] = begin + t < length ? __fmul_rn(dq, qs[j]) : 0.f;
                     ks[j] = begin + t < length ? __fmul_rn(dk, ks[j]) : 0.f;
                     pack_unsafe |= (!(fabsf(x[j]) <= 32768.f) ? 1u : 0u) |
-                                   (!(fabsf(qs[j]) <= 32768.f) ? 2u : 0u) |
-                                   (!(fabsf(ks[j]) <= 32768.f) ? 8u : 0u);
+                        (!(fabsf(qs[j]) <= 32768.f) ? 2u : 0u) |
+                        (!(fabsf(ks[j]) <= 32768.f) ? 8u : 0u);
                 }
                 const int offset = qwen35_store15_swizzle(t, d, 128);
                 half4_75(packed + offset, x);
@@ -395,8 +391,8 @@ extern "C" __global__ __launch_bounds__(512, 2) void qwen35_c64storepack15_unifo
     const int chunks = (length + 63) / 64, instance = blockIdx.x, bh = instance / chunks,
               chunk = instance % chunks;
     const int batch = bh / heads, head = bh % heads;
-    qwen35_c64storepack15_prepare(q, k, v, g, b, w, u, c, d, batch * length, chunk * 64, length, head,
-                                heads, key_heads, vd, instance, packed, flags);
+    qwen35_c64storepack15_prepare(q, k, v, g, b, w, u, c, d, batch * length, chunk * 64, length,
+        head, heads, key_heads, vd, instance, packed, flags);
 }
 extern "C" __global__ __launch_bounds__(512, 2) void qwen35_c64storepack15_varlen_prepare_f32(
     const float *q, const float *k, const float *v, const float *g, const float *b, float *w,
@@ -415,5 +411,5 @@ extern "C" __global__ __launch_bounds__(512, 2) void qwen35_c64storepack15_varle
     const int start = cumulative[lo], length = cumulative[lo + 1] - start,
               begin = (global_chunk - int(chunks[lo])) * 64;
     qwen35_c64storepack15_prepare(q, k, v, g, b, w, u, c, d, start, begin, length, head, heads,
-                                key_heads, vd, global_chunk * heads + head, packed, flags);
+        key_heads, vd, global_chunk * heads + head, packed, flags);
 }

@@ -1,10 +1,9 @@
 #include <cuda_bf16.h>
 #include <math.h>
 
-extern "C" __global__ void span_means_bf16(const __nv_bfloat16 *source,
-                                                const unsigned int *ids, const unsigned int *spans,
-                                                __nv_bfloat16 *output, unsigned int source_rows,
-                                                unsigned int columns, int lexical) {
+extern "C" __global__ void span_means_bf16(const __nv_bfloat16 *source, const unsigned int *ids,
+    const unsigned int *spans, __nv_bfloat16 *output, unsigned int source_rows,
+    unsigned int columns, int lexical) {
     __shared__ float partial[1024];
     const unsigned int start = spans[blockIdx.y * 3];
     const unsigned int length = spans[blockIdx.y * 3 + 1];
@@ -18,8 +17,8 @@ extern "C" __global__ void span_means_bf16(const __nv_bfloat16 *source,
             const unsigned long long source_row = lexical ? ids[token] : token;
 
             const float value = source_row < source_rows
-                                    ? __bfloat162float(source[source_row * columns + column])
-                                    : NAN;
+                ? __bfloat162float(source[source_row * columns + column])
+                : NAN;
             sum = __fadd_rn(sum, value);
         }
     }

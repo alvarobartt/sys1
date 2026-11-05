@@ -2,11 +2,9 @@
 #include <math.h>
 
 template <bool Packed>
-__device__ __forceinline__ void
-qwen35_delta_reuse(const float *query, const float *key, const float *value,
-                 const float *gate, const float *beta, float *output,
-                 const unsigned int *starts, int extent, int heads,
-                 int key_heads, int value_dim) {
+__device__ __forceinline__ void qwen35_delta_reuse(const float *query, const float *key,
+    const float *value, const float *gate, const float *beta, float *output,
+    const unsigned int *starts, int extent, int heads, int key_heads, int value_dim) {
     constexpr int Columns = 2;
     const int head = blockIdx.x % heads, sequence = blockIdx.x / heads;
     const int begin = Packed ? int(starts[sequence]) : sequence * extent;
@@ -40,22 +38,26 @@ qwen35_delta_reuse(const float *query, const float *key, const float *value,
 #pragma unroll
                 for (int part = 0; part < 4; ++part) {
                     state[col][half][part] = __fmul_rn(state[col][half][part], decay);
-                    remembered[half] = __fmaf_rn(keys[half][part], state[col][half][part], remembered[half]);
+                    remembered[half] =
+                        __fmaf_rn(keys[half][part], state[col][half][part], remembered[half]);
                 }
             }
             float total = __fadd_rn(remembered[0], remembered[1]);
 #pragma unroll
             for (int step = 8; step > 0; step >>= 1)
                 total = __fadd_rn(total, __shfl_down_sync(mask, total, step, 16));
-            const float v = first + col < value_dim ? value[token_head * value_dim + first + col] : 0.f;
+            const float v =
+                first + col < value_dim ? value[token_head * value_dim + first + col] : 0.f;
             const float delta = __fmul_rn(__fsub_rn(v, __shfl_sync(mask, total, 0, 16)), weight);
             float answer[2] = {};
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
 #pragma unroll
                 for (int part = 0; part < 4; ++part) {
-                    state[col][half][part] = __fmaf_rn(keys[half][part], delta, state[col][half][part]);
-                    answer[half] = __fmaf_rn(queries[half][part], state[col][half][part], answer[half]);
+                    state[col][half][part] =
+                        __fmaf_rn(keys[half][part], delta, state[col][half][part]);
+                    answer[half] =
+                        __fmaf_rn(queries[half][part], state[col][half][part], answer[half]);
                 }
             }
             total = __fadd_rn(answer[0], answer[1]);
@@ -68,15 +70,15 @@ qwen35_delta_reuse(const float *query, const float *key, const float *value,
     }
 }
 
-extern "C" __global__ void qwen35_uniform_delta_reuse_f32(
-    const float *q, const float *k, const float *v, const float *decay,
-    const float *beta, float *output, int length, int heads, int key_heads, int width) {
-    qwen35_delta_reuse<false>(q, k, v, decay, beta, output, nullptr, length, heads, key_heads, width);
+extern "C" __global__ void qwen35_uniform_delta_reuse_f32(const float *q, const float *k,
+    const float *v, const float *decay, const float *beta, float *output, int length, int heads,
+    int key_heads, int width) {
+    qwen35_delta_reuse<false>(
+        q, k, v, decay, beta, output, nullptr, length, heads, key_heads, width);
 }
 
-extern "C" __global__ void qwen35_packed_delta_reuse_f32(
-    const float *q, const float *k, const float *v, const float *gate,
-    const float *beta, float *output, const unsigned int *starts,
+extern "C" __global__ void qwen35_packed_delta_reuse_f32(const float *q, const float *k,
+    const float *v, const float *gate, const float *beta, float *output, const unsigned int *starts,
     int extent, int heads, int key_heads, int width) {
     qwen35_delta_reuse<true>(q, k, v, gate, beta, output, starts, extent, heads, key_heads, width);
 }

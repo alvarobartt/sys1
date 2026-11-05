@@ -9,11 +9,10 @@ __device__ __forceinline__ float qwen35_fullnr_warp_sum(float value) {
     return value;
 }
 
-extern "C" __global__ void
-qwen35_full_norm_rope_bf16(const __nv_bfloat16 *input, const __nv_bfloat16 *delta_weight,
-                         const __nv_bfloat16 *cosine, const __nv_bfloat16 *sine,
-                         __nv_bfloat16 *output, int width, int rotary, int heads, int length,
-                         int row_stride, float epsilon) {
+extern "C" __global__ void qwen35_full_norm_rope_bf16(const __nv_bfloat16 *input,
+    const __nv_bfloat16 *delta_weight, const __nv_bfloat16 *cosine, const __nv_bfloat16 *sine,
+    __nv_bfloat16 *output, int width, int rotary, int heads, int length, int row_stride,
+    float epsilon) {
     const int row = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int position = (row / heads) % length;
     float sum = 0.f;
@@ -31,9 +30,8 @@ qwen35_full_norm_rope_bf16(const __nv_bfloat16 *input, const __nv_bfloat16 *delt
     sum = qwen35_fullnr_warp_sum(sum);
     const float scale = rsqrtf(sum / float(width) + epsilon);
     for (int column = threadIdx.x; column < width; column += blockDim.x) {
-
         normalized[column] = __nv_bfloat16(scale * float(input[size_t(row) * row_stride + column]) *
-                                           (1.f + float(delta_weight[column])));
+            (1.f + float(delta_weight[column])));
     }
     __syncthreads();
     for (int column = threadIdx.x; column < width; column += blockDim.x) {
@@ -44,7 +42,7 @@ qwen35_full_norm_rope_bf16(const __nv_bfloat16 *input, const __nv_bfloat16 *delt
                 column < rotary / 2 ? __hneg(normalized[partner]) : normalized[partner];
 
             value = __hadd_rn(__hmul_rn(value, cosine[position * rotary + column]),
-                              __hmul_rn(rotated, sine[position * rotary + column]));
+                __hmul_rn(rotated, sine[position * rotary + column]));
         }
         output[size_t(row) * width + column] = value;
     }

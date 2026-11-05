@@ -6,10 +6,10 @@ __device__ __forceinline__ float post_strided_warp_sum(float value) {
     }
     return value;
 }
-extern "C" __global__ void qwen35_post_finalize_strided(
-    const float *input, const __nv_bfloat16 *gate, const __nv_bfloat16 *norm, __nv_bfloat16 *output,
-    int columns, float epsilon, unsigned long long length, unsigned long long heads,
-    unsigned long long stride_b, unsigned long long stride_t, unsigned long long stride_h) {
+extern "C" __global__ void qwen35_post_finalize_strided(const float *input,
+    const __nv_bfloat16 *gate, const __nv_bfloat16 *norm, __nv_bfloat16 *output, int columns,
+    float epsilon, unsigned long long length, unsigned long long heads, unsigned long long stride_b,
+    unsigned long long stride_t, unsigned long long stride_h) {
     const int row = blockIdx.x;
     const unsigned long long h = row % heads;
     const unsigned long long token = (row / heads) % length;

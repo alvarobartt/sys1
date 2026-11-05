@@ -24,11 +24,9 @@ __device__ __forceinline__ void qwen35_hrms_store4(__nv_bfloat16 *p, const __nv_
     *reinterpret_cast<uint2 *>(p) = make_uint2(lo, hi);
 }
 template <bool Fused>
-__device__ __forceinline__ void
-qwen35_hrms_vec4_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *mixed,
-                    const __nv_bfloat16 *weight, __nv_bfloat16 *residual, __nv_bfloat16 *output,
-                    int columns, float epsilon) {
-
+__device__ __forceinline__ void qwen35_hrms_vec4_impl(const __nv_bfloat16 *input,
+    const __nv_bfloat16 *mixed, const __nv_bfloat16 *weight, __nv_bfloat16 *residual,
+    __nv_bfloat16 *output, int columns, float epsilon) {
     const size_t base = size_t(blockIdx.x) * columns;
     __shared__ float warp_sums[32];
     float sums[4] = {};
@@ -77,11 +75,9 @@ qwen35_hrms_vec4_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *mixed,
         qwen35_hrms_store4(output + base + col, y);
     }
 }
-extern "C" __global__ __launch_bounds__(256) void qwen35_hidden_rms_vec4_bf16(const __nv_bfloat16 *x,
-                                                                            const __nv_bfloat16 *w,
-                                                                            __nv_bfloat16 *output,
-                                                                            int columns,
-                                                                            float epsilon) {
+extern "C" __global__ __launch_bounds__(256) void qwen35_hidden_rms_vec4_bf16(
+    const __nv_bfloat16 *x, const __nv_bfloat16 *w, __nv_bfloat16 *output, int columns,
+    float epsilon) {
     qwen35_hrms_vec4_impl<false>(x, nullptr, w, nullptr, output, columns, epsilon);
 }
 extern "C" __global__ __launch_bounds__(256) void qwen35_hidden_residual_rms_vec4_bf16(

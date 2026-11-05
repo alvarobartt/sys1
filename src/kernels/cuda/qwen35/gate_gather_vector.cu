@@ -5,10 +5,8 @@
 #include <math.h>
 #include "qwen35/projection_shared.cuh"
 
-__device__ __forceinline__ float qwen35_gate_gathervector_guard_recompute(const __nv_bfloat16 *x,
-                                                                        const __nv_bfloat16 *w,
-                                                                        int row, int col,
-                                                                        int inner) {
+__device__ __forceinline__ float qwen35_gate_gathervector_guard_recompute(
+    const __nv_bfloat16 *x, const __nv_bfloat16 *w, int row, int col, int inner) {
     const int lane = threadIdx.x & 31;
     float running = 0.f, correction = 0.f;
     bool exceptional = false;
@@ -17,7 +15,7 @@ __device__ __forceinline__ float qwen35_gate_gathervector_guard_recompute(const 
         const float product = __fmul_rn(a, b), updated = __fadd_rn(running, product);
         const float virtual_product = __fsub_rn(updated, running);
         const float error = __fadd_rn(__fsub_rn(running, __fsub_rn(updated, virtual_product)),
-                                      __fsub_rn(product, virtual_product));
+            __fsub_rn(product, virtual_product));
         correction = __fadd_rn(correction, error);
         running = updated;
         exceptional |= a != 0.f && b != 0.f && fabsf(product) < FLT_MIN;
@@ -36,11 +34,10 @@ __device__ __forceinline__ float qwen35_gate_gathervector_guard_recompute(const 
 }
 
 template <int TileRows>
-__device__ __forceinline__ void qwen35_gate_gathervector_small_impl(
-    const __nv_bfloat16 *input, const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows,
-    int inner, int columns, const __nv_bfloat16 *bias = nullptr,
-    const unsigned *tile_starts = nullptr, const unsigned *tile_ends = nullptr,
-    const unsigned *gather_ids = nullptr) {
+__device__ __forceinline__ void qwen35_gate_gathervector_small_impl(const __nv_bfloat16 *input,
+    const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows, int inner, int columns,
+    const __nv_bfloat16 *bias = nullptr, const unsigned *tile_starts = nullptr,
+    const unsigned *tile_ends = nullptr, const unsigned *gather_ids = nullptr) {
     const int first_row = tile_starts ? int(tile_starts[blockIdx.x]) : int(blockIdx.x) * TileRows;
     if (tile_ends)
         rows = int(tile_ends[blockIdx.x]);
@@ -74,8 +71,7 @@ __device__ __forceinline__ void qwen35_gate_gathervector_small_impl(
         wmma::fill_fragment(absolute[group], 0.f);
         wmma::fill_fragment(correction[group], 0.f);
     }
-    const bool vector_copy =
-        inner == 4096 && columns == 64 &&
+    const bool vector_copy = inner == 4096 && columns == 64 &&
         ((reinterpret_cast<uintptr_t>(input) | reinterpret_cast<uintptr_t>(weight)) & 15u) == 0;
     for (int first_k = 0; first_k < inner; first_k += 64) {
         if (vector_copy) {
@@ -83,10 +79,9 @@ __device__ __forceinline__ void qwen35_gate_gathervector_small_impl(
             const int logical = first_row + ar;
             const int physical =
                 logical < rows ? (gather_ids ? int(gather_ids[logical]) : logical) : 0;
-            const uint4 a =
-                logical < rows
-                    ? *reinterpret_cast<const uint4 *>(input + physical * 4096 + first_k + ac)
-                    : make_uint4(0, 0, 0, 0);
+            const uint4 a = logical < rows
+                ? *reinterpret_cast<const uint4 *>(input + physical * 4096 + first_k + ac)
+                : make_uint4(0, 0, 0, 0);
             *reinterpret_cast<uint4 *>(tile_a + ar * SharedStride + ac) = a;
             const unsigned words_a[4] = {a.x, a.y, a.z, a.w};
 #pragma unroll
@@ -116,10 +111,9 @@ __device__ __forceinline__ void qwen35_gate_gathervector_small_impl(
                 const int row = first_row + index / 64;
                 const int k = first_k + index % 64;
                 const int shared_index = (index / 64) * SharedStride + index % 64;
-                tile_a[shared_index] =
-                    row < rows && k < inner
-                        ? input[(gather_ids ? int(gather_ids[row]) : row) * inner + k]
-                        : __float2bfloat16_rn(0.f);
+                tile_a[shared_index] = row < rows && k < inner
+                    ? input[(gather_ids ? int(gather_ids[row]) : row) * inner + k]
+                    : __float2bfloat16_rn(0.f);
                 exceptional |= qwen35_projection_exceptional_operand(tile_a[shared_index]);
             }
             for (int index = threadIdx.x; index < 4096; index += Threads) {
@@ -137,12 +131,12 @@ __device__ __forceinline__ void qwen35_gate_gathervector_small_impl(
             for (int group = 0; group < Groups; ++group) {
                 wmma::fill_fragment(c[group], 0.f);
             }
-            wmma::load_matrix_sync(b, tile_b + warp_column * 16 * SharedStride + offset,
-                                   SharedStride);
+            wmma::load_matrix_sync(
+                b, tile_b + warp_column * 16 * SharedStride + offset, SharedStride);
 #pragma unroll
             for (int group = 0; group < Groups; ++group) {
-                wmma::load_matrix_sync(
-                    a, tile_a + (group * WarpRows + warp_row * 16) * SharedStride + offset,
+                wmma::load_matrix_sync(a,
+                    tile_a + (group * WarpRows + warp_row * 16) * SharedStride + offset,
                     SharedStride);
                 wmma::mma_sync(c[group], a, b, c[group]);
 #pragma unroll
@@ -162,7 +156,7 @@ __device__ __forceinline__ void qwen35_gate_gathervector_small_impl(
                     const float virtual_partial = __fsub_rn(sum, running[group].x[i]);
                     const float error =
                         __fadd_rn(__fsub_rn(running[group].x[i], __fsub_rn(sum, virtual_partial)),
-                                  __fsub_rn(partial, virtual_partial));
+                            __fsub_rn(partial, virtual_partial));
                     correction[group].x[i] = __fadd_rn(correction[group].x[i], error);
                     running[group].x[i] = sum;
                 }
@@ -192,7 +186,7 @@ __device__ __forceinline__ void qwen35_gate_gathervector_small_impl(
                 double sum = 0.;
                 for (int k = 0; k < inner; ++k)
                     sum = __fma_rn(double(float(input[physical * inner + k])),
-                                   double(float(weight[column * inner + k])), sum);
+                        double(float(weight[column * inner + k])), sum);
                 value = __double2float_rn(sum);
             }
 
@@ -250,9 +244,8 @@ __device__ __forceinline__ void qwen35_gate_gathervector_small_impl(
 }
 
 extern "C" __global__ void qwen35_gate_gathervector_small_32(const __nv_bfloat16 *x,
-                                                           const __nv_bfloat16 *w,
-                                                           __nv_bfloat16 *out, int rows, int inner,
-                                                           int columns, const unsigned *ids) {
-    qwen35_gate_gathervector_small_impl<32>(x, w, out, rows, inner, columns, nullptr, nullptr,
-                                          nullptr, ids);
+    const __nv_bfloat16 *w, __nv_bfloat16 *out, int rows, int inner, int columns,
+    const unsigned *ids) {
+    qwen35_gate_gathervector_small_impl<32>(
+        x, w, out, rows, inner, columns, nullptr, nullptr, nullptr, ids);
 }

@@ -16,8 +16,8 @@ template <> inline ushort write_value<ushort>(float value) { return f32_to_bf16(
 
 template <typename T>
 void conv_silu(device const T *input, device const T *weights, device T *output,
-               constant uint &count, constant uint &length, constant uint &channels,
-               constant uint &taps, uint index) {
+    constant uint &count, constant uint &length, constant uint &channels, constant uint &taps,
+    uint index) {
     if (index >= count)
         return;
     uint channel = index % channels;
@@ -37,13 +37,13 @@ void conv_silu(device const T *input, device const T *weights, device T *output,
     output[index] = write_value<T>(x / (1.f + exp(-x)));
 }
 
-#define CONV_KERNEL(NAME, TYPE)                                                                    \
-    kernel void NAME(device const TYPE *input [[buffer(0)]],                                       \
-                     device const TYPE *weights [[buffer(1)]], device TYPE *output [[buffer(2)]],  \
-                     constant uint &count [[buffer(3)]], constant uint &length [[buffer(4)]],      \
-                     constant uint &channels [[buffer(5)]], constant uint &taps [[buffer(6)]],     \
-                     uint index [[thread_position_in_grid]]) {                                     \
-        conv_silu(input, weights, output, count, length, channels, taps, index);                   \
+#define CONV_KERNEL(NAME, TYPE) \
+    kernel void NAME(device const TYPE *input [[buffer(0)]], \
+        device const TYPE *weights [[buffer(1)]], device TYPE *output [[buffer(2)]], \
+        constant uint &count [[buffer(3)]], constant uint &length [[buffer(4)]], \
+        constant uint &channels [[buffer(5)]], constant uint &taps [[buffer(6)]], \
+        uint index [[thread_position_in_grid]]) { \
+        conv_silu(input, weights, output, count, length, channels, taps, index); \
     }
 CONV_KERNEL(qwen35_conv_f32, float)
 CONV_KERNEL(qwen35_conv_f16, half)
@@ -51,12 +51,9 @@ CONV_KERNEL(qwen35_conv_bf16, ushort)
 
 // A SIMD group owns one value column; each lane keeps four state entries.
 kernel void qwen35_delta_f32(device const float *input [[buffer(0)]],
-                             device float *output [[buffer(1)]],
-                             constant uint &length [[buffer(2)]],
-                             constant uint &value_dim [[buffer(3)]],
-                             uint2 group [[threadgroup_position_in_grid]],
-                             uint tid [[thread_index_in_threadgroup]],
-                             uint lane [[thread_index_in_simdgroup]]) {
+    device float *output [[buffer(1)]], constant uint &length [[buffer(2)]],
+    constant uint &value_dim [[buffer(3)]], uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     uint column = group.y * 4 + tid / 32;
     if (column >= value_dim)
         return;
@@ -85,14 +82,14 @@ kernel void qwen35_delta_f32(device const float *input [[buffer(0)]],
     }
 }
 
-kernel void qwen35_pack_delta_f32(
-    device const float *q [[buffer(0)]], device const float *k [[buffer(1)]],
-    device const float *v [[buffer(2)]], device const float *g [[buffer(3)]],
-    device const float *beta [[buffer(4)]], device float *packed [[buffer(5)]],
-    constant uint4 &dims [[buffer(6)]], constant uint4 &q_stride [[buffer(7)]],
-    constant uint4 &k_stride [[buffer(8)]], constant uint4 &v_stride [[buffer(9)]],
-    constant uint4 &g_stride [[buffer(10)]], constant uint4 &beta_stride [[buffer(11)]],
-    uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+kernel void qwen35_pack_delta_f32(device const float *q [[buffer(0)]],
+    device const float *k [[buffer(1)]], device const float *v [[buffer(2)]],
+    device const float *g [[buffer(3)]], device const float *beta [[buffer(4)]],
+    device float *packed [[buffer(5)]], constant uint4 &dims [[buffer(6)]],
+    constant uint4 &q_stride [[buffer(7)]], constant uint4 &k_stride [[buffer(8)]],
+    constant uint4 &v_stride [[buffer(9)]], constant uint4 &g_stride [[buffer(10)]],
+    constant uint4 &beta_stride [[buffer(11)]], uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
     uint length = dims.z;
     uint heads = dims.y;
     uint token = row % length;
@@ -114,11 +111,11 @@ kernel void qwen35_pack_delta_f32(
     }
 }
 
-kernel void qwen35_post_finalize_bf16(
-    device const float *input [[buffer(0)]], device const float *denominator [[buffer(1)]],
-    device const ushort *gate [[buffer(2)]], device const float *norm [[buffer(3)]],
-    device ushort *output [[buffer(4)]], constant uint4 &dims [[buffer(5)]],
-    constant uint4 &strides [[buffer(6)]], uint index [[thread_position_in_grid]]) {
+kernel void qwen35_post_finalize_bf16(device const float *input [[buffer(0)]],
+    device const float *denominator [[buffer(1)]], device const ushort *gate [[buffer(2)]],
+    device const float *norm [[buffer(3)]], device ushort *output [[buffer(4)]],
+    constant uint4 &dims [[buffer(5)]], constant uint4 &strides [[buffer(6)]],
+    uint index [[thread_position_in_grid]]) {
     uint count = dims.x * dims.y * dims.z * dims.w;
     if (index >= count)
         return;
@@ -136,8 +133,8 @@ kernel void qwen35_post_finalize_bf16(
     output[index] = f32_to_bf16(value);
 }
 
-kernel void qwen35_pack_delta_inputs_bf16(
-    device const ushort *mixed [[buffer(0)]], device const ushort *beta_projection [[buffer(1)]],
+kernel void qwen35_pack_delta_inputs_bf16(device const ushort *mixed [[buffer(0)]],
+    device const ushort *beta_projection [[buffer(1)]],
     device const ushort *gate_projection [[buffer(2)]], device const float *dt_bias [[buffer(3)]],
     device const float *decay [[buffer(4)]], device float *output [[buffer(5)]],
     constant uint4 &dims [[buffer(6)]], constant uint2 &widths [[buffer(7)]],
@@ -191,8 +188,8 @@ kernel void qwen35_pack_delta_inputs_bf16(
 }
 
 template <typename T>
-void swiglu(device const T *gate, device const T *up, device T *output, constant uint &count,
-            uint index) {
+void swiglu(
+    device const T *gate, device const T *up, device T *output, constant uint &count, uint index) {
     if (index >= count)
         return;
     float raw = read_value(gate[index]);
@@ -200,11 +197,11 @@ void swiglu(device const T *gate, device const T *up, device T *output, constant
     output[index] = write_value<T>(read_value(activated) * read_value(up[index]));
 }
 
-#define SWIGLU_KERNEL(NAME, TYPE)                                                                  \
-    kernel void NAME(device const TYPE *gate [[buffer(0)]], device const TYPE *up [[buffer(1)]],   \
-                     device TYPE *output [[buffer(2)]], constant uint &count [[buffer(3)]],        \
-                     uint index [[thread_position_in_grid]]) {                                     \
-        swiglu(gate, up, output, count, index);                                                    \
+#define SWIGLU_KERNEL(NAME, TYPE) \
+    kernel void NAME(device const TYPE *gate [[buffer(0)]], device const TYPE *up [[buffer(1)]], \
+        device TYPE *output [[buffer(2)]], constant uint &count [[buffer(3)]], \
+        uint index [[thread_position_in_grid]]) { \
+        swiglu(gate, up, output, count, index); \
     }
 SWIGLU_KERNEL(qwen35_swiglu_f32, float)
 SWIGLU_KERNEL(qwen35_swiglu_f16, half)

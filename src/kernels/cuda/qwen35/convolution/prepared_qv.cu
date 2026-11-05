@@ -5,12 +5,11 @@
 #include <cuda_fp16.h>
 
 template <bool Packed, bool PrepareK = false>
-__device__ __forceinline__ void
-qwen35_convcast_qv_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weights, float *query,
-                      float *key, float *value, const unsigned *starts, unsigned int rows,
-                      int key_heads, int value_heads, float scale, int length, int kernel,
-                      const __nv_bfloat16 *table, __half *qhalf, __half *khalf, __half *vhalf,
-                      float limit, unsigned *qv_bad) {
+__device__ __forceinline__ void qwen35_convcast_qv_impl(const __nv_bfloat16 *mixed,
+    const __nv_bfloat16 *weights, float *query, float *key, float *value, const unsigned *starts,
+    unsigned int rows, int key_heads, int value_heads, float scale, int length, int kernel,
+    const __nv_bfloat16 *table, __half *qhalf, __half *khalf, __half *vhalf, float limit,
+    unsigned *qv_bad) {
     const unsigned int row = blockIdx.x * 4 + threadIdx.x / 32;
     const unsigned int lane = threadIdx.x & 31;
     if (row >= rows)
@@ -22,10 +21,10 @@ qwen35_convcast_qv_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weights
     const unsigned int source = token * (2 * key_width + value_width) + head * 128 + lane * 4;
     const unsigned int target = row * 128 + lane * 4;
     float q[4], k[4];
-    qwen35_convlookup156_element4(mixed, weights, q, token, head * 128 + lane * 4, begin, channels,
-                                kernel, table);
-    qwen35_convlookup156_element4(mixed, weights, k, token, key_width + head * 128 + lane * 4, begin,
-                                channels, kernel, table);
+    qwen35_convlookup156_element4(
+        mixed, weights, q, token, head * 128 + lane * 4, begin, channels, kernel, table);
+    qwen35_convlookup156_element4(mixed, weights, k, token, key_width + head * 128 + lane * 4,
+        begin, channels, kernel, table);
     float qs = __fmul_rn(q[0], q[0]), ks = __fmul_rn(k[0], k[0]);
 #pragma unroll
     for (int j = 1; j < 4; ++j) {
@@ -88,8 +87,7 @@ qwen35_convcast_qv_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weights
     for (int j = lane * 4; j < repeat * 128; j += 128) {
         float out[4];
         qwen35_convlookup156_element4(mixed, weights, out, token,
-                                    2 * key_width + head * repeat * 128 + j, begin, channels,
-                                    kernel, table);
+            2 * key_width + head * repeat * 128 + j, begin, channels, kernel, table);
         *reinterpret_cast<float4 *>(value + vo + j) = make_float4(out[0], out[1], out[2], out[3]);
         unsigned hv[4];
 #pragma unroll
@@ -107,9 +105,8 @@ qwen35_convcast_qv_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weights
 }
 
 extern "C" __global__ void qwen35_convcast_gbeta_merge(const float *g, const float *beta,
-                                                     float *aligned_g, float *aligned_beta,
-                                                     uint64_t heads, const unsigned *producer_bad,
-                                                     unsigned *bad) {
+    float *aligned_g, float *aligned_beta, uint64_t heads, const unsigned *producer_bad,
+    unsigned *bad) {
     if (blockIdx.x == 0 && threadIdx.x == 0)
         atomicOr(bad, *producer_bad);
     bool invalid = false;
@@ -124,13 +121,10 @@ extern "C" __global__ void qwen35_convcast_gbeta_merge(const float *g, const flo
         atomicOr(bad, 4u);
 }
 
-extern "C" __global__ void qwen35_convcast_qkv_packed(const __nv_bfloat16 *x, const __nv_bfloat16 *w,
-                                                    float *q, float *k, float *v,
-                                                    const unsigned *starts, unsigned rows, int kh,
-                                                    int vh, float scale, int length, int kernel,
-                                                    const __nv_bfloat16 *table, __half *qhalf,
-                                                    __half *khalf, __half *vhalf, float limit,
-                                                    unsigned *qv_bad) {
+extern "C" __global__ void qwen35_convcast_qkv_packed(const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w, float *q, float *k, float *v, const unsigned *starts, unsigned rows,
+    int kh, int vh, float scale, int length, int kernel, const __nv_bfloat16 *table, __half *qhalf,
+    __half *khalf, __half *vhalf, float limit, unsigned *qv_bad) {
     qwen35_convcast_qv_impl<true, true>(x, w, q, k, v, starts, rows, kh, vh, scale, length, kernel,
-                                      table, qhalf, khalf, vhalf, limit, qv_bad);
+        table, qhalf, khalf, vhalf, limit, qv_bad);
 }

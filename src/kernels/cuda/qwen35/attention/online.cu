@@ -3,10 +3,9 @@
 #include <math.h>
 #include <mma.h>
 
-extern "C" __global__ void
-qwen35_online_attention_bf16(const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
-                             __nv_bfloat16 *output, int query_heads, int queries, int keys,
-                             int heads, int kv_heads, int width, float scale, int causal) {
+extern "C" __global__ void qwen35_online_attention_bf16(const __nv_bfloat16 *q,
+    const __nv_bfloat16 *k, const __nv_bfloat16 *v, __nv_bfloat16 *output, int query_heads,
+    int queries, int keys, int heads, int kv_heads, int width, float scale, int causal) {
     const int lane = threadIdx.x & 31;
     const int item = blockIdx.x * 4 + threadIdx.x / 32;
     if (item >= query_heads)
@@ -50,7 +49,7 @@ qwen35_online_attention_bf16(const __nv_bfloat16 *q, const __nv_bfloat16 *k, con
         for (int channel = 0; channel < 8; ++channel) {
             if (channel < channels)
                 acc[channel] = __fmaf_rn(probability, float(v[offset + lane + channel * 32]),
-                                         __fmul_rn(acc[channel], alpha));
+                    __fmul_rn(acc[channel], alpha));
         }
     }
     const float inverse = __shfl_sync(0xffffffff, lane == 0 ? __fdiv_rn(1.f, denominator) : 0.f, 0);

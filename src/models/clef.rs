@@ -1,11 +1,11 @@
 #[cfg(feature = "metal")]
-use crate::archs::metal::QwenDecoder as ModelDecoder;
+use crate::architectures::metal::QwenDecoder as ModelDecoder;
 #[cfg(not(feature = "metal"))]
-use crate::archs::qwen35_text::Decoder as ModelDecoder;
+use crate::architectures::qwen35_text::Decoder as ModelDecoder;
 
 use super::{AttentionImplementation, DecisionModel};
 use crate::{
-    archs::{qwen35_text as text, qwen35_vision as vision},
+    architectures::{qwen35_text as text, qwen35_vision as vision},
     device,
     schema::{ApiError, DecisionRequest, DecisionResponse, Usage},
     tokenizer,
@@ -1710,7 +1710,9 @@ mod clef_head {
                 if crate::kernels::cuda::head_blaslt::eligible(input, &self.0) {
                     return crate::kernels::cuda::head_blaslt::project(input, &self.0);
                 }
-                return crate::archs::qwen35_text::compensated_bf16_projection(input, &self.0);
+                return crate::architectures::qwen35_text::compensated_bf16_projection(
+                    input, &self.0,
+                );
             }
             crate::kernels::linear::forward(input, &self.0)
         }
@@ -2049,7 +2051,7 @@ mod clef_head {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::kernels::cuda::attention::flash_attn(&q, &k, &v, scale, false)?
             } else {
-                crate::archs::qwen35_text::attention_forward(
+                crate::architectures::qwen35_text::attention_forward(
                     &q,
                     &k,
                     &v,
@@ -2059,7 +2061,7 @@ mod clef_head {
                 )?
             };
             #[cfg(not(feature = "cuda"))]
-            let attended = crate::archs::qwen35_text::attention_forward(
+            let attended = crate::architectures::qwen35_text::attention_forward(
                 &q,
                 &k,
                 &v,
@@ -2550,7 +2552,10 @@ mod clef_head {
             #[cfg(feature = "cuda")]
             if values.device().is_cuda() && values.dtype() == DType::BF16 {
                 let projection = candle_nn::Linear::new(field.unsqueeze(0)?, None);
-                return crate::archs::qwen35_text::compensated_bf16_projection(values, &projection);
+                return crate::architectures::qwen35_text::compensated_bf16_projection(
+                    values,
+                    &projection,
+                );
             }
             crate::kernels::linear::matmul_compatible(values, &field.unsqueeze(1)?)
         }

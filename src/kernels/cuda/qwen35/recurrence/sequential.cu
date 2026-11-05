@@ -4,9 +4,8 @@
 #include <mma.h>
 
 extern "C" __global__ void qwen35_delta_f32(const float *query, const float *key,
-                                            const float *value, const float *gate,
-                                            const float *beta, float *output, int length, int heads,
-                                            int key_heads, int value_dim) {
+    const float *value, const float *gate, const float *beta, float *output, int length, int heads,
+    int key_heads, int value_dim) {
     const int batch_head = blockIdx.x;
     const int head = batch_head % heads;
     const int batch = batch_head / heads;
@@ -55,9 +54,8 @@ extern "C" __global__ void qwen35_delta_f32(const float *query, const float *key
 }
 
 extern "C" __global__ void qwen35_delta_subwarp16_f32(const float *query, const float *key,
-                                                      const float *value, const float *gate,
-                                                      const float *beta, float *output, int length,
-                                                      int heads, int key_heads, int value_dim) {
+    const float *value, const float *gate, const float *beta, float *output, int length, int heads,
+    int key_heads, int value_dim) {
     const int batch_head = blockIdx.x;
     const int head = batch_head % heads;
     const int batch = batch_head / heads;

@@ -3,10 +3,10 @@ mod batching;
 use super::AttentionImplementation;
 use super::DecisionModel;
 #[cfg(feature = "metal")]
-use crate::archs::metal::ModernBertEncoder;
+use crate::architectures::metal::ModernBertEncoder;
 #[cfg(not(feature = "metal"))]
-use crate::archs::modernbert::Encoder as ModernBertEncoder;
-use crate::archs::modernbert::{AttentionOptions, Config as ModernBertConfig};
+use crate::architectures::modernbert::Encoder as ModernBertEncoder;
+use crate::architectures::modernbert::{AttentionOptions, Config as ModernBertConfig};
 use crate::{
     device,
     schema::{ApiError, DecisionRequest, DecisionResponse, Usage},
@@ -134,7 +134,7 @@ impl HeadLayer {
                 .contiguous()?;
             candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
         } else {
-            crate::archs::modernbert::scaled_dot_product_attention(
+            crate::architectures::modernbert::scaled_dot_product_attention(
                 &q,
                 &k,
                 &v,
@@ -148,7 +148,7 @@ impl HeadLayer {
             )?
         };
         #[cfg(not(feature = "metal"))]
-        let attention = crate::archs::modernbert::scaled_dot_product_attention(
+        let attention = crate::architectures::modernbert::scaled_dot_product_attention(
             &q,
             &k,
             &v,
@@ -162,7 +162,7 @@ impl HeadLayer {
         )?;
         #[cfg(feature = "metal")]
         let attention = if attention.device().is_metal() {
-            crate::archs::modernbert::metal::merge_heads(&attention, batch, length, hidden)?
+            crate::architectures::modernbert::metal::merge_heads(&attention, batch, length, hidden)?
         } else {
             attention
                 .transpose(1, 2)?

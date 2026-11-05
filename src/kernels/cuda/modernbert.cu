@@ -2,8 +2,8 @@
 #include <cuda_fp16.h>
 #include <math.h>
 
-extern "C" __global__ void modernbert_projection_f16(const __half *input, const __half *weight,
-                                                     __half *output, int inner, int columns) {
+extern "C" __global__ void modernbert_projection_f16(
+    const __half *input, const __half *weight, __half *output, int inner, int columns) {
     const int row = blockIdx.x;
     const int lane = threadIdx.x & 31;
     const int column = blockIdx.y * 8 + (threadIdx.x >> 5);
@@ -18,17 +18,16 @@ extern "C" __global__ void modernbert_projection_f16(const __half *input, const 
         const float updated = __fadd_rn(running, product);
         const float virtual_product = __fsub_rn(updated, running);
         const float error = __fadd_rn(__fsub_rn(running, __fsub_rn(updated, virtual_product)),
-                                      __fsub_rn(product, virtual_product));
+            __fsub_rn(product, virtual_product));
         correction = __fadd_rn(correction, error);
         running = updated;
     }
     double sum = __dadd_rn(double(running), double(correction));
     if (__any_sync(0xffffffff, exceptional)) {
-
         sum = 0.;
         for (int k = lane; k < inner; k += 32) {
             sum = __fma_rn(double(float(input[row * inner + k])),
-                           double(float(weight[column * inner + k])), sum);
+                double(float(weight[column * inner + k])), sum);
         }
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -50,24 +49,24 @@ template <typename T> __device__ void geglu(const T *input, T *output, long long
     output[index] = T(float(activated) * float(input[offset + inner]));
 }
 
-extern "C" __global__ void modernbert_geglu_f32(const float *input, float *output, long long count,
-                                                int inner) {
+extern "C" __global__ void modernbert_geglu_f32(
+    const float *input, float *output, long long count, int inner) {
     geglu(input, output, count, inner);
 }
 
-extern "C" __global__ void modernbert_geglu_f16(const __half *input, __half *output,
-                                                long long count, int inner) {
+extern "C" __global__ void modernbert_geglu_f16(
+    const __half *input, __half *output, long long count, int inner) {
     geglu(input, output, count, inner);
 }
 
-extern "C" __global__ void modernbert_geglu_bf16(const __nv_bfloat16 *input, __nv_bfloat16 *output,
-                                                 long long count, int inner) {
+extern "C" __global__ void modernbert_geglu_bf16(
+    const __nv_bfloat16 *input, __nv_bfloat16 *output, long long count, int inner) {
     geglu(input, output, count, inner);
 }
 
 template <typename T>
 __device__ void rope_qkv(const T *input, const float *cos, const float *sin, T *output,
-                         long long pairs, int length, int heads, int dim) {
+    long long pairs, int length, int heads, int dim) {
     const long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= pairs)
         return;
@@ -99,15 +98,11 @@ __device__ void rope_qkv(const T *input, const float *cos, const float *sin, T *
 }
 
 extern "C" __global__ void modernbert_rope_qkv_f16(const __half *input, const float *cos,
-                                                   const float *sin, __half *output,
-                                                   long long pairs, int length, int heads,
-                                                   int dim) {
+    const float *sin, __half *output, long long pairs, int length, int heads, int dim) {
     rope_qkv(input, cos, sin, output, pairs, length, heads, dim);
 }
 
 extern "C" __global__ void modernbert_rope_qkv_bf16(const __nv_bfloat16 *input, const float *cos,
-                                                    const float *sin, __nv_bfloat16 *output,
-                                                    long long pairs, int length, int heads,
-                                                    int dim) {
+    const float *sin, __nv_bfloat16 *output, long long pairs, int length, int heads, int dim) {
     rope_qkv(input, cos, sin, output, pairs, length, heads, dim);
 }

@@ -7,13 +7,10 @@ __device__ __forceinline__ float qwen35_bfpostwarp_sum(float value) {
     return value;
 }
 
-extern "C" __global__ void qwen35_bfpostwarp128(const __nv_bfloat16 *input, const __nv_bfloat16 *gate,
-                                              const __nv_bfloat16 *norm, __nv_bfloat16 *output,
-                                              int columns, float epsilon, unsigned long long length,
-                                              unsigned long long heads, unsigned long long stride_b,
-                                              unsigned long long stride_t,
-                                              unsigned long long stride_h,
-                                              unsigned long long rows) {
+extern "C" __global__ void qwen35_bfpostwarp128(const __nv_bfloat16 *input,
+    const __nv_bfloat16 *gate, const __nv_bfloat16 *norm, __nv_bfloat16 *output, int columns,
+    float epsilon, unsigned long long length, unsigned long long heads, unsigned long long stride_b,
+    unsigned long long stride_t, unsigned long long stride_h, unsigned long long rows) {
     const unsigned long long row = (unsigned long long)blockIdx.x * 8 + threadIdx.x / 32;
     if (row >= rows)
         return;
@@ -50,12 +47,11 @@ extern "C" __global__ void qwen35_build_bfpost_silu_f32_lookup(float *table) {
     }
 }
 
-extern "C" __global__ void
-qwen35_bfpostwarp128_lookup(const __nv_bfloat16 *input, const __nv_bfloat16 *gate, const float *lut,
-                          const __nv_bfloat16 *norm, __nv_bfloat16 *output, int columns,
-                          float epsilon, unsigned long long length, unsigned long long heads,
-                          unsigned long long stride_b, unsigned long long stride_t,
-                          unsigned long long stride_h, unsigned long long rows) {
+extern "C" __global__ void qwen35_bfpostwarp128_lookup(const __nv_bfloat16 *input,
+    const __nv_bfloat16 *gate, const float *lut, const __nv_bfloat16 *norm, __nv_bfloat16 *output,
+    int columns, float epsilon, unsigned long long length, unsigned long long heads,
+    unsigned long long stride_b, unsigned long long stride_t, unsigned long long stride_h,
+    unsigned long long rows) {
     const unsigned long long row = (unsigned long long)blockIdx.x * 8 + threadIdx.x / 32;
     if (row >= rows)
         return;

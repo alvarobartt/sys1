@@ -1,13 +1,9 @@
-
-
 #include <cuda_runtime.h>
 
 template <int Columns>
-__device__ __forceinline__ void
-qwen35_prefetch_scalar_columns(const float *query, const float *key, const float *value,
-                             const float *decay_values, const float *beta, float *output,
-                             const unsigned int *starts, int extent, int heads, int key_heads,
-                             int value_dim) {
+__device__ __forceinline__ void qwen35_prefetch_scalar_columns(const float *query, const float *key,
+    const float *value, const float *decay_values, const float *beta, float *output,
+    const unsigned int *starts, int extent, int heads, int key_heads, int value_dim) {
     const int head = blockIdx.x % heads, sequence = blockIdx.x / heads;
     const int begin = int(starts[sequence]);
     const int length = int(starts[sequence + 1]) - begin;
@@ -71,8 +67,8 @@ qwen35_prefetch_scalar_columns(const float *query, const float *key, const float
 
 #if __CUDA_ARCH__ >= 800
 template <int Bytes>
-__device__ __forceinline__ void qwen35_prefetch_copy(void *destination, const void *source,
-                                                   bool valid) {
+__device__ __forceinline__ void qwen35_prefetch_copy(
+    void *destination, const void *source, bool valid) {
     const unsigned address = static_cast<unsigned>(__cvta_generic_to_shared(destination));
     const int available = valid ? Bytes : 0;
     asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;" ::"r"(address), "l"(source),
@@ -83,11 +79,10 @@ template <int Tile> struct __align__(16) Sys1PrefetchSlot {
     float query[Tile][128], key[Tile][128], value[Tile][8], decay[Tile], beta[Tile];
 };
 template <int Tile>
-__device__ __forceinline__ void
-qwen35_prefetch_stage(Sys1PrefetchSlot<Tile> &slot, const float *query, const float *key,
-                    const float *value, const float *decay, const float *beta, int begin, int first,
-                    int length, int head, int key_head, int heads, int key_heads,
-                    int first_column) {
+__device__ __forceinline__ void qwen35_prefetch_stage(Sys1PrefetchSlot<Tile> &slot,
+    const float *query, const float *key, const float *value, const float *decay, const float *beta,
+    int begin, int first, int length, int head, int key_head, int heads, int key_heads,
+    int first_column) {
     for (int i = threadIdx.x; i < Tile * 32; i += 128) {
         const int t = i / 32, k = (i % 32) * 4;
         const bool valid = first + t < length;
@@ -101,8 +96,7 @@ qwen35_prefetch_stage(Sys1PrefetchSlot<Tile> &slot, const float *query, const fl
         const bool valid = first + t < length;
         const int global_token = begin + (valid ? first + t : 0);
         qwen35_prefetch_copy<16>(&slot.value[t][col],
-                               value + (global_token * heads + head) * 128 + first_column + col,
-                               valid);
+            value + (global_token * heads + head) * 128 + first_column + col, valid);
     }
     if (threadIdx.x < Tile) {
         const int t = threadIdx.x;
@@ -114,10 +108,9 @@ qwen35_prefetch_stage(Sys1PrefetchSlot<Tile> &slot, const float *query, const fl
     asm volatile("cp.async.commit_group;" ::: "memory");
 }
 template <int Tile>
-__device__ __forceinline__ void
-qwen35_prefetch_body(Sys1PrefetchSlot<Tile> *slots, const float *query, const float *key,
-                   const float *value, const float *decay, const float *beta, float *output,
-                   const unsigned int *starts, int heads, int key_heads) {
+__device__ __forceinline__ void qwen35_prefetch_body(Sys1PrefetchSlot<Tile> *slots,
+    const float *query, const float *key, const float *value, const float *decay, const float *beta,
+    float *output, const unsigned int *starts, int heads, int key_heads) {
     const int head = blockIdx.x % heads, sequence = blockIdx.x / heads;
     const int begin = int(starts[sequence]), length = int(starts[sequence + 1]) - begin;
     const int lane = threadIdx.x & 31, first_column = blockIdx.y * 8;
@@ -125,15 +118,14 @@ qwen35_prefetch_body(Sys1PrefetchSlot<Tile> *slots, const float *query, const fl
     const int key_head = head / (heads / key_heads);
     float state[2][4] = {};
     qwen35_prefetch_stage<Tile>(slots[0], query, key, value, decay, beta, begin, 0, length, head,
-                              key_head, heads, key_heads, first_column);
+        key_head, heads, key_heads, first_column);
     asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
     for (int first = 0, bank = 0; first < length; first += Tile, bank ^= 1) {
         const bool next = first + Tile < length;
         if (next)
             qwen35_prefetch_stage<Tile>(slots[bank ^ 1], query, key, value, decay, beta, begin,
-                                      first + Tile, length, head, key_head, heads, key_heads,
-                                      first_column);
+                first + Tile, length, head, key_head, heads, key_heads, first_column);
         const int count = min(Tile, length - first);
         for (int t = 0; t < count; ++t) {
             const float d = slots[bank].decay[t], weight = slots[bank].beta[t];
@@ -188,9 +180,9 @@ qwen35_prefetch_body(Sys1PrefetchSlot<Tile> *slots, const float *query, const fl
     }
 }
 #endif
-extern "C" __global__ void qwen35_packed_delta_prefetch8_preexp_f32(
-    const float *q, const float *k, const float *v, const float *decay, const float *beta,
-    float *output, const unsigned int *starts, int extent, int heads, int key_heads, int width) {
+extern "C" __global__ void qwen35_packed_delta_prefetch8_preexp_f32(const float *q, const float *k,
+    const float *v, const float *decay, const float *beta, float *output,
+    const unsigned int *starts, int extent, int heads, int key_heads, int width) {
 #if __CUDA_ARCH__ >= 800
     if (width == 128) {
         __shared__ Sys1PrefetchSlot<8> slots[2];
@@ -198,17 +190,15 @@ extern "C" __global__ void qwen35_packed_delta_prefetch8_preexp_f32(
         return;
     }
 #endif
-    qwen35_prefetch_scalar_columns<2>(q, k, v, decay, beta, output, starts, extent, heads, key_heads,
-                                    width);
+    qwen35_prefetch_scalar_columns<2>(
+        q, k, v, decay, beta, output, starts, extent, heads, key_heads, width);
 }
 
 #include <stdint.h>
 
 __device__ __forceinline__ void qwen35_uniform_prefetch_scalar(const float *query, const float *key,
-                                                             const float *value, const float *decay,
-                                                             const float *beta, float *output,
-                                                             int length, int heads, int key_heads,
-                                                             int width) {
+    const float *value, const float *decay, const float *beta, float *output, int length, int heads,
+    int key_heads, int width) {
     const int bh = blockIdx.x, head = bh % heads, sequence = bh / heads, lane = threadIdx.x & 31;
     const int first = blockIdx.y * 8 + (threadIdx.x >> 5) * 2;
     if (first >= width)
@@ -239,8 +229,8 @@ __device__ __forceinline__ void qwen35_uniform_prefetch_scalar(const float *quer
 #pragma unroll
         for (int c = 0; c < 2; ++c)
             delta[c] = ((first + c < width ? value[th * width + first + c] : 0.f) -
-                        __shfl_sync(0xffffffff, remembered[c], 0)) *
-                       weight;
+                           __shfl_sync(0xffffffff, remembered[c], 0)) *
+                weight;
 #pragma unroll
         for (int p = 0; p < 4; ++p) {
 #pragma unroll
@@ -266,25 +256,22 @@ __device__ __forceinline__ void qwen35_uniform_prefetch_scalar(const float *quer
 
 #if __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void qwen35_uniform_prefetch_body(Sys1PrefetchSlot<8> *slots,
-                                                           const float *query, const float *key,
-                                                           const float *value, const float *decay,
-                                                           const float *beta, float *output,
-                                                           int length, int heads, int key_heads) {
+    const float *query, const float *key, const float *value, const float *decay, const float *beta,
+    float *output, int length, int heads, int key_heads) {
     const int bh = blockIdx.x, head = bh % heads, sequence = bh / heads, begin = sequence * length;
     const int lane = threadIdx.x & 31, first_column = blockIdx.y * 8,
               column = (threadIdx.x >> 5) * 2;
     const int key_head = head / (heads / key_heads);
     float state[2][4] = {};
     qwen35_prefetch_stage<8>(slots[0], query, key, value, decay, beta, begin, 0, length, head,
-                           key_head, heads, key_heads, first_column);
+        key_head, heads, key_heads, first_column);
     asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
     for (int first = 0, bank = 0; first < length; first += 8, bank ^= 1) {
         const bool next = first + 8 < length;
         if (next)
             qwen35_prefetch_stage<8>(slots[bank ^ 1], query, key, value, decay, beta, begin,
-                                   first + 8, length, head, key_head, heads, key_heads,
-                                   first_column);
+                first + 8, length, head, key_head, heads, key_heads, first_column);
         const int count = min(8, length - first);
         for (int t = 0; t < count; ++t) {
             const float d = slots[bank].decay[t], weight = slots[bank].beta[t];
@@ -340,15 +327,15 @@ __device__ __forceinline__ void qwen35_uniform_prefetch_body(Sys1PrefetchSlot<8>
 }
 #endif
 
-extern "C" __global__ void
-qwen35_uniform_delta_prefetch8_preexp_f32(const float *q, const float *k, const float *v,
-                                        const float *decay, const float *beta, float *output,
-                                        int length, int heads, int key_heads, int width) {
+extern "C" __global__ void qwen35_uniform_delta_prefetch8_preexp_f32(const float *q, const float *k,
+    const float *v, const float *decay, const float *beta, float *output, int length, int heads,
+    int key_heads, int width) {
 #if __CUDA_ARCH__ >= 800
 
-    if (width == 128 && ((reinterpret_cast<uintptr_t>(q) | reinterpret_cast<uintptr_t>(k) |
-                          reinterpret_cast<uintptr_t>(v)) &
-                         15u) == 0) {
+    if (width == 128 &&
+        ((reinterpret_cast<uintptr_t>(q) | reinterpret_cast<uintptr_t>(k) |
+             reinterpret_cast<uintptr_t>(v)) &
+            15u) == 0) {
         __shared__ Sys1PrefetchSlot<8> slots[2];
         qwen35_uniform_prefetch_body(slots, q, k, v, decay, beta, output, length, heads, key_heads);
         return;
@@ -362,11 +349,10 @@ template <int Tile> struct __align__(16) Sys1PrefetchColumns4Slot {
     float query[Tile][128], key[Tile][128], value[Tile][16], decay[Tile], beta[Tile];
 };
 template <int Tile>
-__device__ __forceinline__ void
-qwen35_prefetch_columns4_stage(Sys1PrefetchColumns4Slot<Tile> &slot, const float *query,
-                             const float *key, const float *value, const float *decay,
-                             const float *beta, int begin, int first, int length, int head,
-                             int key_head, int heads, int key_heads, int first_column) {
+__device__ __forceinline__ void qwen35_prefetch_columns4_stage(Sys1PrefetchColumns4Slot<Tile> &slot,
+    const float *query, const float *key, const float *value, const float *decay, const float *beta,
+    int begin, int first, int length, int head, int key_head, int heads, int key_heads,
+    int first_column) {
     for (int i = threadIdx.x; i < Tile * 32; i += 128) {
         const int t = i / 32, k = (i % 32) * 4;
         const bool valid = first + t < length;
@@ -380,8 +366,7 @@ qwen35_prefetch_columns4_stage(Sys1PrefetchColumns4Slot<Tile> &slot, const float
         const bool valid = first + t < length;
         const int global_token = begin + (valid ? first + t : 0);
         qwen35_prefetch_copy<16>(&slot.value[t][col],
-                               value + (global_token * heads + head) * 128 + first_column + col,
-                               valid);
+            value + (global_token * heads + head) * 128 + first_column + col, valid);
     }
     if (threadIdx.x < Tile) {
         const int t = threadIdx.x;
@@ -393,11 +378,9 @@ qwen35_prefetch_columns4_stage(Sys1PrefetchColumns4Slot<Tile> &slot, const float
     asm volatile("cp.async.commit_group;" ::: "memory");
 }
 template <int Tile>
-__device__ __forceinline__ void
-qwen35_prefetch_columns4_body(Sys1PrefetchColumns4Slot<Tile> *slots, const float *query,
-                            const float *key, const float *value, const float *decay,
-                            const float *beta, float *output, const unsigned int *starts, int heads,
-                            int key_heads) {
+__device__ __forceinline__ void qwen35_prefetch_columns4_body(Sys1PrefetchColumns4Slot<Tile> *slots,
+    const float *query, const float *key, const float *value, const float *decay, const float *beta,
+    float *output, const unsigned int *starts, int heads, int key_heads) {
     const int head = blockIdx.x % heads, sequence = blockIdx.x / heads;
     const int begin = int(starts[sequence]), length = int(starts[sequence + 1]) - begin;
     const int lane = threadIdx.x & 31, first_column = blockIdx.y * 16;
@@ -405,15 +388,14 @@ qwen35_prefetch_columns4_body(Sys1PrefetchColumns4Slot<Tile> *slots, const float
     const int key_head = head / (heads / key_heads);
     float state[4][4] = {};
     qwen35_prefetch_columns4_stage<Tile>(slots[0], query, key, value, decay, beta, begin, 0, length,
-                                       head, key_head, heads, key_heads, first_column);
+        head, key_head, heads, key_heads, first_column);
     asm volatile("cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
     for (int first = 0, bank = 0; first < length; first += Tile, bank ^= 1) {
         const bool next = first + Tile < length;
         if (next)
             qwen35_prefetch_columns4_stage<Tile>(slots[bank ^ 1], query, key, value, decay, beta,
-                                               begin, first + Tile, length, head, key_head, heads,
-                                               key_heads, first_column);
+                begin, first + Tile, length, head, key_head, heads, key_heads, first_column);
         const int count = min(Tile, length - first);
         for (int t = 0; t < count; ++t) {
             const float d = slots[bank].decay[t], weight = slots[bank].beta[t];
@@ -468,17 +450,17 @@ qwen35_prefetch_columns4_body(Sys1PrefetchColumns4Slot<Tile> *slots, const float
     }
 }
 #endif
-extern "C" __global__ void qwen35_packed_delta_prefetch8_columns4_preexp_f32(
-    const float *q, const float *k, const float *v, const float *decay, const float *beta,
-    float *output, const unsigned int *starts, int extent, int heads, int key_heads, int width) {
+extern "C" __global__ void qwen35_packed_delta_prefetch8_columns4_preexp_f32(const float *q,
+    const float *k, const float *v, const float *decay, const float *beta, float *output,
+    const unsigned int *starts, int extent, int heads, int key_heads, int width) {
 #if __CUDA_ARCH__ >= 800
     if (width == 128) {
         __shared__ Sys1PrefetchColumns4Slot<8> slots[2];
-        qwen35_prefetch_columns4_body<8>(slots, q, k, v, decay, beta, output, starts, heads,
-                                       key_heads);
+        qwen35_prefetch_columns4_body<8>(
+            slots, q, k, v, decay, beta, output, starts, heads, key_heads);
         return;
     }
 #endif
-    qwen35_prefetch_scalar_columns<4>(q, k, v, decay, beta, output, starts, extent, heads, key_heads,
-                                    width);
+    qwen35_prefetch_scalar_columns<4>(
+        q, k, v, decay, beta, output, starts, extent, heads, key_heads, width);
 }

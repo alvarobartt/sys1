@@ -2,9 +2,8 @@
 #include <cuda_bf16.h>
 #include <float.h>
 #include <math.h>
-extern "C" __global__ void qwen35_guarded_dgemm_weight(const __nv_bfloat16 *w, double *wide,
-                                                     double *absolute, unsigned *safe, int k,
-                                                     int n) {
+extern "C" __global__ void qwen35_guarded_dgemm_weight(
+    const __nv_bfloat16 *w, double *wide, double *absolute, unsigned *safe, int k, int n) {
     const int column = blockIdx.x * blockDim.x + threadIdx.x;
     if (column >= n)
         return;
@@ -14,16 +13,15 @@ extern "C" __global__ void qwen35_guarded_dgemm_weight(const __nv_bfloat16 *w, d
         const float value = float(w[column * k + i]);
         wide[column * k + i] = double(value);
         ok &= isfinite(value) &&
-              (value == 0.f || (fabsf(value) >= 0x1p-60f && fabsf(value) <= 0x1p60f));
+            (value == 0.f || (fabsf(value) >= 0x1p-60f && fabsf(value) <= 0x1p60f));
         sum = __dadd_ru(sum, fabs(double(value)));
     }
     absolute[column] = sum;
     safe[column] = ok;
 }
 
-extern "C" __global__ void qwen35_guarded_dgemm_input(const __nv_bfloat16 *x, double *wide,
-                                                    double *maximum, unsigned *safe, int rows,
-                                                    int k) {
+extern "C" __global__ void qwen35_guarded_dgemm_input(
+    const __nv_bfloat16 *x, double *wide, double *maximum, unsigned *safe, int rows, int k) {
     const int row = blockIdx.x, thread = threadIdx.x, lane = thread & 31, warp = thread >> 5;
 
     __shared__ double warp_maxima[8];
@@ -42,19 +40,18 @@ extern "C" __global__ void qwen35_guarded_dgemm_input(const __nv_bfloat16 *x, do
                 float(__ushort_as_bfloat16(static_cast<unsigned short>(pair >> 16)));
             *reinterpret_cast<double2 *>(output + i) = make_double2(double(first), double(second));
             ok &= isfinite(first) &&
-                  (first == 0.f || (fabsf(first) >= 0x1p-60f && fabsf(first) <= 0x1p60f));
+                (first == 0.f || (fabsf(first) >= 0x1p-60f && fabsf(first) <= 0x1p60f));
             ok &= isfinite(second) &&
-                  (second == 0.f || (fabsf(second) >= 0x1p-60f && fabsf(second) <= 0x1p60f));
+                (second == 0.f || (fabsf(second) >= 0x1p-60f && fabsf(second) <= 0x1p60f));
             m = fmax(m, fabs(double(first)));
             m = fmax(m, fabs(double(second)));
         }
     } else {
-
         for (int i = thread; i < k; i += 256) {
             const float value = float(input[i]);
             output[i] = double(value);
             ok &= isfinite(value) &&
-                  (value == 0.f || (fabsf(value) >= 0x1p-60f && fabsf(value) <= 0x1p60f));
+                (value == 0.f || (fabsf(value) >= 0x1p-60f && fabsf(value) <= 0x1p60f));
             m = fmax(m, fabs(double(value)));
         }
     }
@@ -82,9 +79,8 @@ extern "C" __global__ void qwen35_guarded_dgemm_input(const __nv_bfloat16 *x, do
     }
 }
 
-__device__ __forceinline__ __nv_bfloat16 qwen35_guarded_dgemm_round(double value,
-                                                                  const __nv_bfloat16 *bias,
-                                                                  int column, int has_bias) {
+__device__ __forceinline__ __nv_bfloat16 qwen35_guarded_dgemm_round(
+    double value, const __nv_bfloat16 *bias, int column, int has_bias) {
     float rounded = __double2float_rn(value);
     if (has_bias)
         rounded = __fadd_rn(rounded, float(bias[column]));
@@ -92,8 +88,8 @@ __device__ __forceinline__ __nv_bfloat16 qwen35_guarded_dgemm_round(double value
 }
 
 __device__ void qwen35_guarded_dgemm_fallback(const __nv_bfloat16 *x, const __nv_bfloat16 *w,
-                                            const __nv_bfloat16 *bias, __nv_bfloat16 *y, int row,
-                                            int column, int inner, int columns, int has_bias) {
+    const __nv_bfloat16 *bias, __nv_bfloat16 *y, int row, int column, int inner, int columns,
+    int has_bias) {
     const int lane = threadIdx.x & 31;
     float running = 0.f, correction = 0.f;
     bool exceptional = false;
@@ -102,18 +98,18 @@ __device__ void qwen35_guarded_dgemm_fallback(const __nv_bfloat16 *x, const __nv
         const float product = __fmul_rn(a, b), updated = __fadd_rn(running, product);
         const float virtual_product = __fsub_rn(updated, running);
         const float error = __fadd_rn(__fsub_rn(running, __fsub_rn(updated, virtual_product)),
-                                      __fsub_rn(product, virtual_product));
+            __fsub_rn(product, virtual_product));
         correction = __fadd_rn(correction, error);
         running = updated;
         exceptional |= !isfinite(product) || !isfinite(running) || !isfinite(correction) ||
-                       (a != 0.f && b != 0.f && fabsf(product) < FLT_MIN);
+            (a != 0.f && b != 0.f && fabsf(product) < FLT_MIN);
     }
     double sum = __dadd_rn(double(running), double(correction));
     if (__any_sync(0xffffffff, exceptional)) {
         sum = 0.;
         for (int i = lane; i < inner; i += 32)
-            sum = __fma_rn(double(float(x[row * inner + i])), double(float(w[column * inner + i])),
-                           sum);
+            sum = __fma_rn(
+                double(float(x[row * inner + i])), double(float(w[column * inner + i])), sum);
     }
     for (int step = 16; step; step >>= 1)
         sum = __dadd_rn(sum, __shfl_down_sync(0xffffffff, sum, step));
@@ -121,19 +117,15 @@ __device__ void qwen35_guarded_dgemm_fallback(const __nv_bfloat16 *x, const __nv
         y[row * columns + column] = qwen35_guarded_dgemm_round(sum, bias, column, has_bias);
 }
 
-extern "C" __global__ void qwen35_guarded_dgemm_finish(const __nv_bfloat16 *x, const __nv_bfloat16 *w,
-                                                     const __nv_bfloat16 *bias, const double *dot,
-                                                     const double *maximum, const double *absolute,
-                                                     const unsigned *safe_x, const unsigned *safe_w,
-                                                     __nv_bfloat16 *y, int rows, int inner,
-                                                     int columns, int has_bias, double coefficient,
-                                                     unsigned *counters) {
+extern "C" __global__ void qwen35_guarded_dgemm_finish(const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w, const __nv_bfloat16 *bias, const double *dot, const double *maximum,
+    const double *absolute, const unsigned *safe_x, const unsigned *safe_w, __nv_bfloat16 *y,
+    int rows, int inner, int columns, int has_bias, double coefficient, unsigned *counters) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     const int row = i / columns, column = i % columns;
     bool accepted = false;
     if (row < rows && safe_x[row] && safe_w[column] &&
         (!has_bias || isfinite(float(bias[column])))) {
-
         const double bound = __dmul_ru(maximum[row], absolute[column]);
         if (isfinite(bound) && bound > 0. && bound <= double(FLT_MAX) * 0x1p-6) {
             const double radius = __dmul_ru(coefficient, bound), center = dot[i];
@@ -152,8 +144,8 @@ extern "C" __global__ void qwen35_guarded_dgemm_finish(const __nv_bfloat16 *x, c
     while (mask) {
         const int lane = __ffs(mask) - 1;
         const unsigned id = __shfl_sync(0xffffffff, i, lane);
-        qwen35_guarded_dgemm_fallback(x, w, bias, y, id / columns, id % columns, inner, columns,
-                                    has_bias);
+        qwen35_guarded_dgemm_fallback(
+            x, w, bias, y, id / columns, id % columns, inner, columns, has_bias);
         mask &= mask - 1;
     }
 }

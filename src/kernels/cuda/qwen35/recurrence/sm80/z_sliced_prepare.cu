@@ -1,15 +1,12 @@
-
-
 __device__ __forceinline__ int qwen35_c64slice_half_index(int row, int col) {
     return row * 64 + (col ^ ((row & 7) * 8));
 }
 
 template <int Mode>
-__device__ __forceinline__ void
-qwen35_c64slice_gram(const float *query, const float *key, const float *beta, const float *prefix,
-                   bool &key_unsafe, int physical_start, int begin, int length, int head, int heads,
-                   int kh, int key_heads, __half *ahalf, __half *alow, __half *bhalf, __half *blow,
-                   float *out) {
+__device__ __forceinline__ void qwen35_c64slice_gram(const float *query, const float *key,
+    const float *beta, const float *prefix, bool &key_unsafe, int physical_start, int begin,
+    int length, int head, int heads, int kh, int key_heads, __half *ahalf, __half *alow,
+    __half *bhalf, __half *blow, float *out) {
     constexpr int C = 64, K = 128;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, group = lane / 4, tid = lane % 4;
     const int col = (warp % 8) * 8;
@@ -21,11 +18,10 @@ qwen35_c64slice_gram(const float *query, const float *key, const float *beta, co
             const int t = i / 64, d = i % 64, token = begin + t;
             const int offset = ((physical_start + token) * key_heads + kh) * K + slice + d;
             const float kval = token < length ? key[offset] : 0.f;
-            const float lhs =
-                Mode == 0 ? (token < length
-                                 ? __fmul_rn(kval, beta[(physical_start + token) * heads + head])
-                                 : 0.f)
-                          : (token < length ? query[offset] : 0.f);
+            const float lhs = Mode == 0
+                ? (token < length ? __fmul_rn(kval, beta[(physical_start + token) * heads + head])
+                                  : 0.f)
+                : (token < length ? query[offset] : 0.f);
             key_unsafe |= !(fabsf(kval) <= 32768.f);
             unsafe |= !(fabsf(kval) <= 32768.f) || !(fabsf(lhs) <= 32768.f);
             const auto a = __float2half_rn(lhs), b = __float2half_rn(kval);
@@ -70,10 +66,9 @@ qwen35_c64slice_gram(const float *query, const float *key, const float *beta, co
                 if (token < length && previous < length) {
                     for (int d = 0; d < K; ++d) {
                         const int offset = ((physical_start + token) * key_heads + kh) * K + d;
-                        const float lhs =
-                            Mode == 0 ? __fmul_rn(key[offset],
-                                                  beta[(physical_start + token) * heads + head])
-                                      : query[offset];
+                        const float lhs = Mode == 0
+                            ? __fmul_rn(key[offset], beta[(physical_start + token) * heads + head])
+                            : query[offset];
                         dot = __fmaf_rn(
                             lhs, key[((physical_start + previous) * key_heads + kh) * K + d], dot);
                     }
@@ -91,8 +86,8 @@ qwen35_c64slice_gram(const float *query, const float *key, const float *beta, co
 }
 
 template <int Quarter>
-__device__ __forceinline__ void qwen35_c64slice_rhs_phase(float (&rhs)[4][8], const float *lower,
-                                                        int lane) {
+__device__ __forceinline__ void qwen35_c64slice_rhs_phase(
+    float (&rhs)[4][8], const float *lower, int lane) {
 #pragma unroll 1
     for (int j = Quarter * 16; j < (Quarter + 1) * 16; ++j) {
         float coefficient[4];
@@ -112,11 +107,10 @@ __device__ __forceinline__ void qwen35_c64slice_rhs_phase(float (&rhs)[4][8], co
     }
 }
 
-__device__ __forceinline__ void
-qwen35_c64slice_prepare(const float *query, const float *key, const float *value, const float *gate,
-                      const float *beta, float *w, float *u, float *causal, float *decays,
-                      int physical_start, int begin, int length, int head, int heads, int key_heads,
-                      int value_dim, int instance) {
+__device__ __forceinline__ void qwen35_c64slice_prepare(const float *query, const float *key,
+    const float *value, const float *gate, const float *beta, float *w, float *u, float *causal,
+    float *decays, int physical_start, int begin, int length, int head, int heads, int key_heads,
+    int value_dim, int instance) {
     constexpr int C = 64, K = 128, S = 129;
     extern __shared__ __align__(32) unsigned char qwen35_c64slice_storage[];
     auto *ahalf = reinterpret_cast<__half *>(qwen35_c64slice_storage);
@@ -153,8 +147,8 @@ qwen35_c64slice_prepare(const float *query, const float *key, const float *value
         decays[instance * 128 + 64 + t] = expf(__fsub_rn(prefix[63], prefix[t]));
     }
     bool key_unsafe = false;
-    qwen35_c64slice_gram<0>(query, key, beta, prefix, key_unsafe, physical_start, begin, length, head,
-                          heads, kh, key_heads, ahalf, alow, bhalf, blow, lower);
+    qwen35_c64slice_gram<0>(query, key, beta, prefix, key_unsafe, physical_start, begin, length,
+        head, heads, kh, key_heads, ahalf, alow, bhalf, blow, lower);
     float saved[8];
 #pragma unroll
     for (int item = 0; item < 8; ++item) {
@@ -168,9 +162,8 @@ qwen35_c64slice_prepare(const float *query, const float *key, const float *value
         lower[qwen35_c64warp_lower_index(i / C, i % C)] = saved[item];
     }
 
-    qwen35_c64slice_gram<1>(query, key, beta, prefix, key_unsafe, physical_start, begin, length, head,
-                          heads, kh, key_heads, ahalf, alow, bhalf, blow,
-                          causal + instance * C * C);
+    qwen35_c64slice_gram<1>(query, key, beta, prefix, key_unsafe, physical_start, begin, length,
+        head, heads, kh, key_heads, ahalf, alow, bhalf, blow, causal + instance * C * C);
     const int lane = threadIdx.x & 15,
               first_column = (threadIdx.x / 32) * 16 + ((threadIdx.x & 31) / 16) * 8;
     float rhs[4][8];
@@ -186,10 +179,9 @@ qwen35_c64slice_prepare(const float *query, const float *key, const float *value
                     token < length ? key[((physical_start + token) * key_heads + kh) * K + d] : 0.f;
                 rhs[part][column] = __fmul_rn(__fmul_rn(kval, beta_value), decay);
             } else {
-                const float val =
-                    token < length && d < value_dim
-                        ? value[((physical_start + token) * heads + head) * value_dim + d]
-                        : 0.f;
+                const float val = token < length && d < value_dim
+                    ? value[((physical_start + token) * heads + head) * value_dim + d]
+                    : 0.f;
                 rhs[part][column] = __fmul_rn(val, beta_value);
             }
         }
@@ -230,7 +222,7 @@ extern "C" __global__ __launch_bounds__(512, 2) void qwen35_c64slice_uniform_pre
               chunk = instance % chunks;
     const int batch = bh / heads, head = bh % heads;
     qwen35_c64slice_prepare(q, k, v, g, b, w, u, c, d, batch * length, chunk * 64, length, head,
-                          heads, key_heads, vd, instance);
+        heads, key_heads, vd, instance);
 }
 extern "C" __global__ __launch_bounds__(512, 2) void qwen35_c64slice_varlen_prepare_f32(
     const float *q, const float *k, const float *v, const float *g, const float *b, float *w,
@@ -248,5 +240,5 @@ extern "C" __global__ __launch_bounds__(512, 2) void qwen35_c64slice_varlen_prep
     const int start = cumulative[lo], length = cumulative[lo + 1] - start,
               begin = (global_chunk - int(chunks[lo])) * 64;
     qwen35_c64slice_prepare(q, k, v, g, b, w, u, c, d, start, begin, length, head, heads, key_heads,
-                          vd, global_chunk * heads + head);
+        vd, global_chunk * heads + head);
 }

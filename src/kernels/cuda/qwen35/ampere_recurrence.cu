@@ -1,13 +1,9 @@
-
-
 #include <cuda_runtime.h>
 
 template <bool Packed>
-__device__ __forceinline__ void
-qwen35_ampere_warp32_delta(const float *query, const float *key, const float *value,
-                         const float *decay_values, const float *beta, float *output,
-                         const unsigned int *starts, int extent, int heads, int key_heads,
-                         int value_dim) {
+__device__ __forceinline__ void qwen35_ampere_warp32_delta(const float *query, const float *key,
+    const float *value, const float *decay_values, const float *beta, float *output,
+    const unsigned int *starts, int extent, int heads, int key_heads, int value_dim) {
     const int batch_head = blockIdx.x;
     const int head = batch_head % heads, sequence = batch_head / heads;
     const int begin = Packed ? int(starts[sequence]) : sequence * extent;
@@ -51,20 +47,15 @@ qwen35_ampere_warp32_delta(const float *query, const float *key, const float *va
 }
 
 extern "C" __global__ void qwen35_delta_warp32_preexp_f32(const float *q, const float *k,
-                                                        const float *v, const float *decay,
-                                                        const float *beta, float *output,
-                                                        int length, int heads, int key_heads,
-                                                        int value_dim) {
-    qwen35_ampere_warp32_delta<false>(q, k, v, decay, beta, output, nullptr, length, heads, key_heads,
-                                    value_dim);
+    const float *v, const float *decay, const float *beta, float *output, int length, int heads,
+    int key_heads, int value_dim) {
+    qwen35_ampere_warp32_delta<false>(
+        q, k, v, decay, beta, output, nullptr, length, heads, key_heads, value_dim);
 }
 
 extern "C" __global__ void qwen35_packed_delta_warp32_preexp_f32(const float *q, const float *k,
-                                                               const float *v, const float *decay,
-                                                               const float *beta, float *output,
-                                                               const unsigned int *starts,
-                                                               int total_length, int heads,
-                                                               int key_heads, int value_dim) {
-    qwen35_ampere_warp32_delta<true>(q, k, v, decay, beta, output, starts, total_length, heads,
-                                   key_heads, value_dim);
+    const float *v, const float *decay, const float *beta, float *output,
+    const unsigned int *starts, int total_length, int heads, int key_heads, int value_dim) {
+    qwen35_ampere_warp32_delta<true>(
+        q, k, v, decay, beta, output, starts, total_length, heads, key_heads, value_dim);
 }

@@ -3,17 +3,16 @@
 #include <math.h>
 #include <mma.h>
 
-extern "C" __global__ void qwen35_preexp_gate_f32(const float *gate, float *decay,
-                                                  unsigned int count) {
+extern "C" __global__ void qwen35_preexp_gate_f32(
+    const float *gate, float *decay, unsigned int count) {
     const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < count)
         decay[index] = expf(gate[index]);
 }
 
-extern "C" __global__ void
-qwen35_delta_subwarp16_preexp_f32(const float *query, const float *key, const float *value,
-                                  const float *decay_values, const float *beta, float *output,
-                                  int length, int heads, int key_heads, int value_dim) {
+extern "C" __global__ void qwen35_delta_subwarp16_preexp_f32(const float *query, const float *key,
+    const float *value, const float *decay_values, const float *beta, float *output, int length,
+    int heads, int key_heads, int value_dim) {
     const int batch_head = blockIdx.x;
     const int head = batch_head % heads;
     const int batch = batch_head / heads;

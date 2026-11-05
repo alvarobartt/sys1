@@ -8,8 +8,7 @@ __device__ __forceinline__ float qwen35_convqkv_decode(unsigned word, int half) 
 }
 template <int FixedKernel>
 __device__ __forceinline__ void qwen35_convqkv_four(const __nv_bfloat16 *x, const __nv_bfloat16 *w,
-                                                  float (&out)[4], int token, int channel,
-                                                  int begin, int channels, int kernel) {
+    float (&out)[4], int token, int channel, int begin, int channels, int kernel) {
     float sums[4] = {};
     unsigned weights[8] = {};
     const bool vector_input = (reinterpret_cast<uintptr_t>(x) & 7u) == 0;
@@ -49,8 +48,9 @@ __device__ __forceinline__ void qwen35_convqkv_four(const __nv_bfloat16 *x, cons
             for (int j = 0; j < 4; ++j) {
                 float weight;
                 if constexpr (FixedKernel == 4) {
-                    weight = vector_weights ? qwen35_convqkv_decode(weights[j * 2 + tap / 2], tap & 1)
-                                            : __bfloat162float(w[(channel + j) * kernel + tap]);
+                    weight = vector_weights
+                        ? qwen35_convqkv_decode(weights[j * 2 + tap / 2], tap & 1)
+                        : __bfloat162float(w[(channel + j) * kernel + tap]);
                 } else
                     weight = __bfloat162float(w[(channel + j) * kernel + tap]);
                 sums[j] = __fadd_rn(sums[j], __fmul_rn(inputs[j], weight));
@@ -64,19 +64,17 @@ __device__ __forceinline__ void qwen35_convqkv_four(const __nv_bfloat16 *x, cons
     }
 }
 __device__ __forceinline__ void qwen35_convqkv_element4(const __nv_bfloat16 *x,
-                                                      const __nv_bfloat16 *w, float (&out)[4],
-                                                      int token, int channel, int begin,
-                                                      int channels, int kernel) {
+    const __nv_bfloat16 *w, float (&out)[4], int token, int channel, int begin, int channels,
+    int kernel) {
     if (kernel == 4)
         qwen35_convqkv_four<4>(x, w, out, token, channel, begin, channels, kernel);
     else
         qwen35_convqkv_four<0>(x, w, out, token, channel, begin, channels, kernel);
 }
 template <bool Packed>
-__device__ __forceinline__ void
-qwen35_convqkv_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weights, float *query,
-                  float *key, float *value, const unsigned *starts, unsigned int rows,
-                  int key_heads, int value_heads, float scale, int length, int kernel) {
+__device__ __forceinline__ void qwen35_convqkv_impl(const __nv_bfloat16 *mixed,
+    const __nv_bfloat16 *weights, float *query, float *key, float *value, const unsigned *starts,
+    unsigned int rows, int key_heads, int value_heads, float scale, int length, int kernel) {
     const unsigned int row = blockIdx.x * 4 + threadIdx.x / 32;
     const unsigned int lane = threadIdx.x & 31;
     if (row >= rows)
@@ -88,9 +86,10 @@ qwen35_convqkv_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weights, fl
     const unsigned int source = token * (2 * key_width + value_width) + head * 128 + lane * 4;
     const unsigned int target = row * 128 + lane * 4;
     float q[4], k[4];
-    qwen35_convqkv_element4(mixed, weights, q, token, head * 128 + lane * 4, begin, channels, kernel);
-    qwen35_convqkv_element4(mixed, weights, k, token, key_width + head * 128 + lane * 4, begin,
-                          channels, kernel);
+    qwen35_convqkv_element4(
+        mixed, weights, q, token, head * 128 + lane * 4, begin, channels, kernel);
+    qwen35_convqkv_element4(
+        mixed, weights, k, token, key_width + head * 128 + lane * 4, begin, channels, kernel);
     float qs = __fmul_rn(q[0], q[0]), ks = __fmul_rn(k[0], k[0]);
 #pragma unroll
     for (int j = 1; j < 4; ++j) {
@@ -119,19 +118,17 @@ qwen35_convqkv_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weights, fl
     for (int j = lane * 4; j < repeat * 128; j += 128) {
         float out[4];
         qwen35_convqkv_element4(mixed, weights, out, token, 2 * key_width + head * repeat * 128 + j,
-                              begin, channels, kernel);
+            begin, channels, kernel);
         *reinterpret_cast<float4 *>(value + vo + j) = make_float4(out[0], out[1], out[2], out[3]);
     }
 }
 extern "C" __global__ void qwen35_conv_qkv_uniform(const __nv_bfloat16 *x, const __nv_bfloat16 *w,
-                                                 float *q, float *k, float *v, unsigned rows,
-                                                 int kh, int vh, float scale, int length,
-                                                 int kernel) {
+    float *q, float *k, float *v, unsigned rows, int kh, int vh, float scale, int length,
+    int kernel) {
     qwen35_convqkv_impl<false>(x, w, q, k, v, nullptr, rows, kh, vh, scale, length, kernel);
 }
 extern "C" __global__ void qwen35_conv_qkv_packed(const __nv_bfloat16 *x, const __nv_bfloat16 *w,
-                                                float *q, float *k, float *v,
-                                                const unsigned *starts, unsigned rows, int kh,
-                                                int vh, float scale, int length, int kernel) {
+    float *q, float *k, float *v, const unsigned *starts, unsigned rows, int kh, int vh,
+    float scale, int length, int kernel) {
     qwen35_convqkv_impl<true>(x, w, q, k, v, starts, rows, kh, vh, scale, length, kernel);
 }

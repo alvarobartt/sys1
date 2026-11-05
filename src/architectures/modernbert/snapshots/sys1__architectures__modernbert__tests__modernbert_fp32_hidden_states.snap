@@ -1,5 +1,5 @@
 ---
-source: src/archs/modernbert.rs
+source: src/architectures/modernbert/mod.rs
 expression: "hidden.i((0, 0, 0..128))?.to_vec1::<f32>()?"
 ---
 - -0.648

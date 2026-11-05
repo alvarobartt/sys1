@@ -1,25 +1,20 @@
-
-
-extern "C" __global__ void
-hopper_qkvz_conv_prepared_strided(const __nv_bfloat16 *x, const __nv_bfloat16 *w, float *q,
-                                       float *k, float *v, const unsigned *starts, unsigned rows,
-                                       int kh, int vh, float scale, int length, int kernel,
-                                       const __nv_bfloat16 *table, __half *qhalf, __half *khalf,
-                                       __half *vhalf, float limit, unsigned *qv_bad) {
+extern "C" __global__ void hopper_qkvz_conv_prepared_strided(const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w, float *q, float *k, float *v, const unsigned *starts, unsigned rows,
+    int kh, int vh, float scale, int length, int kernel, const __nv_bfloat16 *table, __half *qhalf,
+    __half *khalf, __half *vhalf, float limit, unsigned *qv_bad) {
     if (kh != 16 || vh != 32 || kernel != 4) {
         asm volatile("trap;");
         return;
     }
     halfonly_convcast_qv_impl<true, true, 12288>(x, w, q, k, v, starts, rows, kh, vh, scale, length,
-                                                 kernel, table, qhalf, khalf, vhalf, limit, qv_bad);
+        kernel, table, qhalf, khalf, vhalf, limit, qv_bad);
 }
 
-extern "C" __global__ void hopper_qkvz_post_lookup_strided_gate(
-    const __nv_bfloat16 *input, const __nv_bfloat16 *gate, const float *lut,
-    const __nv_bfloat16 *norm, __nv_bfloat16 *output, int columns, float epsilon,
-    unsigned long long length, unsigned long long heads, unsigned long long stride_b,
-    unsigned long long stride_t, unsigned long long stride_h, unsigned long long rows,
-    unsigned long long gate_stride_b, unsigned long long gate_stride_t,
+extern "C" __global__ void hopper_qkvz_post_lookup_strided_gate(const __nv_bfloat16 *input,
+    const __nv_bfloat16 *gate, const float *lut, const __nv_bfloat16 *norm, __nv_bfloat16 *output,
+    int columns, float epsilon, unsigned long long length, unsigned long long heads,
+    unsigned long long stride_b, unsigned long long stride_t, unsigned long long stride_h,
+    unsigned long long rows, unsigned long long gate_stride_b, unsigned long long gate_stride_t,
     unsigned long long gate_stride_h) {
     const unsigned long long row = (unsigned long long)blockIdx.x * 8 + threadIdx.x / 32;
     if (row >= rows)

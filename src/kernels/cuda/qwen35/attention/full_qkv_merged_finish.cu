@@ -2,11 +2,11 @@
 #include <cuda_bf16.h>
 #include <math.h>
 
-extern "C" __global__ void qwen35_full_finish_merged_warp128(
-    const __nv_bfloat16 *qg, const __nv_bfloat16 *keys, const __nv_bfloat16 *values,
-    const __nv_bfloat16 *qw, const __nv_bfloat16 *kw, const __nv_bfloat16 *cosine,
-    const __nv_bfloat16 *sine, const __nv_bfloat16 *table, __nv_bfloat16 *output, int width,
-    int rotary, int heads, int kv_heads, int length, float epsilon) {
+extern "C" __global__ void qwen35_full_finish_merged_warp128(const __nv_bfloat16 *qg,
+    const __nv_bfloat16 *keys, const __nv_bfloat16 *values, const __nv_bfloat16 *qw,
+    const __nv_bfloat16 *kw, const __nv_bfloat16 *cosine, const __nv_bfloat16 *sine,
+    const __nv_bfloat16 *table, __nv_bfloat16 *output, int width, int rotary, int heads,
+    int kv_heads, int length, float epsilon) {
     const int lane = threadIdx.x & 31;
     const int head = blockIdx.y * 4 + (threadIdx.x >> 5), token = blockIdx.x;
     if (head >= heads + kv_heads)

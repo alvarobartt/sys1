@@ -1048,7 +1048,7 @@ mod tests {
         let values = hidden.i((0, 0, 0..128))?.to_vec1::<f32>()?;
         insta::with_settings!({prepend_module_to_snapshot => false}, {
         insta::assert_yaml_snapshot!(
-            "sys1__archs__modernbert__tests__modernbert_fp32_hidden_states",
+            "sys1__architectures__modernbert__tests__modernbert_fp32_hidden_states",
             values,
             {
                 "[]" => insta::rounded_redaction(3),

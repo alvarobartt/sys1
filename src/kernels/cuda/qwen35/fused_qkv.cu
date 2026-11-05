@@ -1,9 +1,7 @@
 #include <cuda_bf16.h>
 
 extern "C" __global__ void qwen35_fused_qkv_prepare_bf16(const __nv_bfloat16 *mixed, float *query,
-                                                       float *key, float *value, unsigned int rows,
-                                                       int key_heads, int value_heads,
-                                                       float scale) {
+    float *key, float *value, unsigned int rows, int key_heads, int value_heads, float scale) {
     const unsigned int row = blockIdx.x * 4 + threadIdx.x / 32;
     const unsigned int lane = threadIdx.x & 31;
     if (row >= rows)

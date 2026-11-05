@@ -4,8 +4,8 @@
 #include <mma.h>
 
 template <typename T>
-__device__ void qwen35_conv(const T *input, const T *weights, T *output, int count, int length,
-                            int channels, int kernel) {
+__device__ void qwen35_conv(
+    const T *input, const T *weights, T *output, int count, int length, int channels, int kernel) {
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= count)
         return;
@@ -19,7 +19,7 @@ __device__ void qwen35_conv(const T *input, const T *weights, T *output, int cou
         if (source_token >= 0) {
             const float product =
                 __fmul_rn(float(input[(batch * length + source_token) * channels + channel]),
-                          float(weights[channel * kernel + tap]));
+                    float(weights[channel * kernel + tap]));
             value = __fadd_rn(value, product);
         }
     }
@@ -29,12 +29,12 @@ __device__ void qwen35_conv(const T *input, const T *weights, T *output, int cou
 }
 
 extern "C" __global__ void qwen35_conv_bf16(const __nv_bfloat16 *input,
-                                            const __nv_bfloat16 *weights, __nv_bfloat16 *output,
-                                            int count, int length, int channels, int kernel) {
+    const __nv_bfloat16 *weights, __nv_bfloat16 *output, int count, int length, int channels,
+    int kernel) {
     qwen35_conv(input, weights, output, count, length, channels, kernel);
 }
 
 extern "C" __global__ void qwen35_conv_f32(const float *input, const float *weights, float *output,
-                                           int count, int length, int channels, int kernel) {
+    int count, int length, int channels, int kernel) {
     qwen35_conv(input, weights, output, count, length, channels, kernel);
 }

@@ -1115,3 +1115,736 @@ impl Linear {
         Ok(slot.as_ref().unwrap().clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::architectures::qwen35_text::tests::supported_rotary_test_dtypes;
+
+    #[test]
+    fn stable_gate_projection_cuda_matches_fp64_cast_bitwise() -> Result<()> {
+        let device = test_cuda_device()?;
+        if !supported_rotary_test_dtypes(&device)?.contains(&DType::BF16) {
+            return Ok(());
+        }
+        for (batch, length, inner, columns) in [
+            (1, 3, 33, 9),
+            (2, 5, 129, 17),
+            (1, 17, 4096, 32),
+            (1, 2, 6144, 64),
+        ] {
+            let xs: Vec<f32> = (0..batch * length * inner)
+                .map(|i| ((i * 17 % 255) as f32 - 127.) / 64.)
+                .collect();
+            let ws: Vec<f32> = (0..columns * inner)
+                .map(|i| ((i * 29 % 127) as f32 - 63.) / 512.)
+                .collect();
+            let x = Tensor::from_vec(xs.clone(), (batch, length, inner), &device)?
+                .to_dtype(DType::BF16)?;
+            let w =
+                Tensor::from_vec(ws.clone(), (columns, inner), &device)?.to_dtype(DType::BF16)?;
+            let linear = Linear::new(w, None);
+            let actual = cuda_gate_projection_bf16(&x, &linear)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let repeated = cuda_gate_projection_bf16(&x, &linear)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let mut expected = Vec::with_capacity(actual.len());
+            for row in 0..batch * length {
+                for column in 0..columns {
+                    let sum: f64 = (0..inner)
+                        .map(|k| f64::from(xs[row * inner + k]) * f64::from(ws[column * inner + k]))
+                        .sum();
+                    expected.push(bf16::from_f32(sum as f32).to_f32());
+                }
+            }
+            assert_eq!(
+                actual, expected,
+                "fixed dyadic FP64 reference {inner}/{columns}"
+            );
+            assert_eq!(actual, repeated, "actual repeated CUDA gate projection");
+            let biased = Linear::new(
+                linear.weight().clone(),
+                Some(Tensor::zeros(columns, DType::BF16, &device)?),
+            );
+            let with_zero_bias = cuda_gate_projection_bf16(&x, &biased)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert_eq!(actual, with_zero_bias, "zero-bias compensated projection");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compensated_head_projection_cuda_matches_bias_cast_and_storage_offsets() -> Result<()> {
+        let device = test_cuda_device()?;
+        if !supported_rotary_test_dtypes(&device)?.contains(&DType::BF16) {
+            return Ok(());
+        }
+        let bits = |tensor: &Tensor| -> Result<Vec<f32>> {
+            tensor.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+        };
+        for (rows, inner, columns) in [(3, 33, 9), (5, 129, 17), (2, 2048, 64)] {
+            let xs: Vec<f32> = (0..(rows + 1) * inner)
+                .map(|i| ((i * 17 % 255) as f32 - 127.) / 64.)
+                .collect();
+            let ws: Vec<f32> = (0..(columns + 1) * inner)
+                .map(|i| ((i * 29 % 127) as f32 - 63.) / 512.)
+                .collect();
+            let bs: Vec<f32> = (0..columns + 1).map(|i| (i as f32 - 8.) / 128.).collect();
+            let x = Tensor::from_vec(xs.clone(), (rows + 1, inner), &device)?
+                .to_dtype(DType::BF16)?
+                .narrow(0, 1, rows)?;
+            let w = Tensor::from_vec(ws.clone(), (columns + 1, inner), &device)?
+                .to_dtype(DType::BF16)?
+                .narrow(0, 1, columns)?;
+            let b = Tensor::from_vec(bs.clone(), columns + 1, &device)?
+                .to_dtype(DType::BF16)?
+                .narrow(0, 1, columns)?;
+            let layer = Linear::new(w, Some(b));
+            let actual = compensated_bf16_projection(&x, &layer)?;
+            assert_eq!(actual.dims(), [rows, columns]);
+            let mut expected = Vec::with_capacity(rows * columns);
+            for row in 0..rows {
+                for column in 0..columns {
+                    let sum: f64 = (0..inner)
+                        .map(|k| {
+                            f64::from(xs[(row + 1) * inner + k])
+                                * f64::from(ws[(column + 1) * inner + k])
+                        })
+                        .sum();
+                    expected.push(bf16::from_f32(sum as f32 + bs[column + 1]).to_f32());
+                }
+            }
+            assert_eq!(bits(&actual)?, expected, "FP64 dot / FP32 bias / BF16 cast");
+            assert_eq!(bits(&compensated_bf16_projection(&x, &layer)?)?, expected);
+            let batch = Tensor::stack(&[&x, &x], 0)?;
+            let batch_actual = compensated_bf16_projection(&batch, &layer)?;
+            assert_eq!(batch_actual.dims(), [2, rows, columns]);
+            assert_eq!(
+                bits(&batch_actual)?,
+                [expected.clone(), expected.clone()].concat()
+            );
+            let padded = Tensor::cat(&[&x, &Tensor::zeros((19, inner), DType::BF16, &device)?], 0)?;
+            assert_eq!(
+                bits(&compensated_bf16_projection(&padded, &layer)?.narrow(0, 0, rows)?)?,
+                expected
+            );
+        }
+
+        let x = Tensor::ones((1, 1), DType::BF16, &device)?;
+        let layer = Linear::new(
+            Tensor::from_vec(vec![1_f32, -1_f32], (2, 1), &device)?.to_dtype(DType::BF16)?,
+            Some(
+                Tensor::from_vec(vec![1_f32 / 256., -1_f32 / 256.], 2, &device)?
+                    .to_dtype(DType::BF16)?,
+            ),
+        );
+        assert_eq!(
+            bits(&compensated_bf16_projection(&x, &layer)?)?,
+            vec![1., -1.]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stable_gate_projection_cuda_preserves_cancellation_and_exceptional_products() -> Result<()> {
+        let device = test_cuda_device()?;
+        if !supported_rotary_test_dtypes(&device)?.contains(&DType::BF16) {
+            return Ok(());
+        }
+        let mut weights = vec![2_f32.powi(-16); 129];
+        weights[0] = 1024.;
+        weights[128] = -1024.;
+        let cases = [
+            (vec![1.; 129], weights),
+            (
+                vec![2_f32.powi(100); 2],
+                vec![2_f32.powi(100), -2_f32.powi(100)],
+            ),
+            (vec![2_f32.powi(-100); 2], vec![2_f32.powi(-100); 2]),
+        ];
+        for (xs, ws) in cases {
+            let expected = bf16::from_f32(
+                xs.iter()
+                    .zip(&ws)
+                    .map(|(&x, &w)| f64::from(x) * f64::from(w))
+                    .sum::<f64>() as f32,
+            )
+            .to_f32();
+            let x =
+                Tensor::from_vec(xs.clone(), (1, 1, xs.len()), &device)?.to_dtype(DType::BF16)?;
+            let linear = Linear::new(
+                Tensor::from_vec(ws, (1, xs.len()), &device)?.to_dtype(DType::BF16)?,
+                None,
+            );
+            let actual = cuda_gate_projection_bf16(&x, &linear)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert_eq!(
+                actual,
+                vec![expected],
+                "cancellation/exceptional product fixture"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn guarded_tensor_double_cuda_matches_compensated_for_normal_tile_tails() -> Result<()> {
+        let device = test_cuda_device()?;
+        if !supported_rotary_test_dtypes(&device)?.contains(&DType::BF16) {
+            return Ok(());
+        }
+        for (rows, inner, columns) in [(3, 7, 9), (17, 65, 33), (2, 513, 17)] {
+            let x = Tensor::from_vec(
+                (0..rows * inner)
+                    .map(|i| ((i * 17 % 255) as f32 - 127.) / 64.)
+                    .collect::<Vec<_>>(),
+                (1, rows, inner),
+                &device,
+            )?
+            .to_dtype(DType::BF16)?;
+            let linear = Linear::new(
+                Tensor::from_vec(
+                    (0..columns * inner)
+                        .map(|i| ((i * 29 % 127) as f32 - 63.) / 512.)
+                        .collect::<Vec<_>>(),
+                    (columns, inner),
+                    &device,
+                )?
+                .to_dtype(DType::BF16)?,
+                None,
+            );
+            let bits = |mode| -> Result<Vec<u32>> {
+                Ok(cuda_bf16_projection_impl(&x, &linear, false, mode)?
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect())
+            };
+            assert_eq!(
+                bits(SimtProjection::Compensated)?,
+                bits(SimtProjection::GuardedTensorDouble)?
+            );
+            assert_eq!(
+                bits(SimtProjection::Compensated)?,
+                bits(SimtProjection::GuardedTensorDoubleRows16)?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn guarded_double_projection_cuda_matches_compensated_bits_across_tails() -> Result<()> {
+        let device = test_cuda_device()?;
+        if !supported_rotary_test_dtypes(&device)?.contains(&DType::BF16) {
+            return Ok(());
+        }
+        let mut state = 0x6a09_e667_u32;
+        let mut values = |count| {
+            (0..count)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let sign = (state >> 16) as u16 & 0x8000;
+                    let exponent = ((state >> 24) % 128 + 63) as u16;
+                    bf16::from_bits(sign | (exponent << 7) | ((state >> 17) as u16 & 127)).to_f32()
+                })
+                .collect::<Vec<_>>()
+        };
+        for (rows, inner, columns) in [
+            (1, 1, 1),
+            (3, 33, 9),
+            (2, 65, 17),
+            (17, 129, 65),
+            (2, 4096, 65),
+            (1, 18432, 9),
+        ] {
+            let x = Tensor::from_vec(values(rows * inner), (1, rows, inner), &device)?
+                .to_dtype(DType::BF16)?;
+            let linear = Linear::new(
+                Tensor::from_vec(values(columns * inner), (columns, inner), &device)?
+                    .to_dtype(DType::BF16)?,
+                None,
+            );
+            let bits = |variant| -> Result<Vec<u32>> {
+                Ok(cuda_bf16_projection_impl(&x, &linear, false, variant)?
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect())
+            };
+            for candidate in [
+                SimtProjection::TiledCompensated,
+                SimtProjection::GuardedDouble,
+                SimtProjection::GuardedTensorDouble,
+                SimtProjection::GuardedTensorDoubleRows16,
+            ] {
+                assert_eq!(
+                    bits(SimtProjection::Compensated)?,
+                    bits(candidate)?,
+                    "guarded double must preserve exact original bits {rows}/{inner}/{columns}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn guarded_double_projection_cuda_preserves_midpoints_cancellation_and_exceptional_bits()
+    -> Result<()> {
+        let device = test_cuda_device()?;
+        if !supported_rotary_test_dtypes(&device)?.contains(&DType::BF16) {
+            return Ok(());
+        }
+        let mut cancellation = vec![0.; 65];
+        cancellation[0] = 2_f32.powi(60);
+        cancellation[32] = 1.;
+        cancellation[64] = -2_f32.powi(60);
+        let cases = [
+            (vec![1.; 65], cancellation, Some(1_f32.to_bits())),
+            (vec![1.; 3], vec![1., 2_f32.powi(-8), 2_f32.powi(-20)], None),
+            (
+                vec![1.; 3],
+                vec![1., 2_f32.powi(-8), -2_f32.powi(-20)],
+                None,
+            ),
+            (
+                vec![2_f32.powi(100); 2],
+                vec![2_f32.powi(100), -2_f32.powi(100)],
+                None,
+            ),
+            (vec![2_f32.powi(-100); 2], vec![2_f32.powi(-100); 2], None),
+            (vec![-0.; 33], vec![1.; 33], None),
+            (vec![f32::INFINITY; 2], vec![1., -1.], None),
+        ];
+        for (xs, ws, exact) in cases {
+            let inner = xs.len();
+            let x = Tensor::from_vec(xs, (1, 1, inner), &device)?.to_dtype(DType::BF16)?;
+            let linear = Linear::new(
+                Tensor::from_vec(ws, (1, inner), &device)?.to_dtype(DType::BF16)?,
+                None,
+            );
+            let bits = |variant| -> Result<u32> {
+                Ok(cuda_bf16_projection_impl(&x, &linear, false, variant)?
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?[0]
+                    .to_bits())
+            };
+            let retained = bits(SimtProjection::Compensated)?;
+            assert_eq!(
+                retained,
+                bits(SimtProjection::TiledCompensated)?,
+                "tiled compensated exceptional bits"
+            );
+            assert_eq!(
+                retained,
+                bits(SimtProjection::GuardedDouble)?,
+                "including NaN/signed-zero bit patterns"
+            );
+            assert_eq!(
+                retained,
+                bits(SimtProjection::GuardedTensorDouble)?,
+                "tensor-double exceptional bits"
+            );
+            assert_eq!(
+                retained,
+                bits(SimtProjection::GuardedTensorDoubleRows16)?,
+                "rows16 tensor-double exceptional bits"
+            );
+            if let Some(expected) = exact {
+                assert_eq!(
+                    retained, expected,
+                    "plain FP64 loses this cancellation residual; guard must fall back"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tiled_compensated_projection_cuda_preserves_bias_offsets_batch_and_padding() -> Result<()> {
+        let device = test_cuda_device()?;
+        if !supported_rotary_test_dtypes(&device)?.contains(&DType::BF16) {
+            return Ok(());
+        }
+        let bits = |tensor: &Tensor| -> Result<Vec<u32>> {
+            Ok(tensor
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .into_iter()
+                .map(f32::to_bits)
+                .collect())
+        };
+        for (rows, inner, columns) in [(1, 1, 2), (3, 33, 9), (5, 129, 17), (2, 2048, 64)] {
+            let xs: Vec<f32> = (0..(rows + 1) * inner)
+                .map(|i| ((i * 17 % 255) as f32 - 127.) / 64.)
+                .collect();
+            let ws: Vec<f32> = (0..(columns + 1) * inner)
+                .map(|i| ((i * 29 % 127) as f32 - 63.) / 512.)
+                .collect();
+            let bs: Vec<f32> = (0..columns + 1).map(|i| (i as f32 - 8.) / 128.).collect();
+            let x = Tensor::from_vec(xs, (rows + 1, inner), &device)?
+                .to_dtype(DType::BF16)?
+                .narrow(0, 1, rows)?
+                .unsqueeze(0)?;
+            let w = Tensor::from_vec(ws, (columns + 1, inner), &device)?
+                .to_dtype(DType::BF16)?
+                .narrow(0, 1, columns)?;
+            let b = Tensor::from_vec(bs, columns + 1, &device)?
+                .to_dtype(DType::BF16)?
+                .narrow(0, 1, columns)?;
+            let layer = Linear::new(w, Some(b));
+            let run = |input, mode| cuda_bf16_projection_impl(input, &layer, false, mode);
+            let expected = bits(&run(&x, SimtProjection::Compensated)?)?;
+            assert_eq!(bits(&run(&x, SimtProjection::TiledCompensated)?)?, expected);
+            assert_eq!(bits(&run(&x, SimtProjection::TiledCompensated)?)?, expected);
+            let batch = Tensor::cat(&[&x, &x], 0)?;
+            assert_eq!(
+                bits(&run(&batch, SimtProjection::TiledCompensated)?)?,
+                [expected.clone(), expected.clone()].concat()
+            );
+            let padded = Tensor::cat(
+                &[&x, &Tensor::zeros((1, 19, inner), DType::BF16, &device)?],
+                1,
+            )?;
+            assert_eq!(
+                bits(&run(&padded, SimtProjection::TiledCompensated)?.narrow(1, 0, rows)?)?,
+                expected
+            );
+        }
+
+        let x = Tensor::ones((1, 1, 1), DType::BF16, &device)?;
+        let layer = Linear::new(
+            Tensor::from_vec(vec![1_f32, -1_f32], (2, 1), &device)?.to_dtype(DType::BF16)?,
+            Some(
+                Tensor::from_vec(vec![1_f32 / 256., -1_f32 / 256.], 2, &device)?
+                    .to_dtype(DType::BF16)?,
+            ),
+        );
+        assert_eq!(
+            bits(&cuda_bf16_projection_impl(
+                &x,
+                &layer,
+                false,
+                SimtProjection::TiledCompensated
+            )?)?,
+            vec![1_f32.to_bits(), (-1_f32).to_bits()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_blaslt_vs_compensated_cuda_microprofile() -> Result<()> {
+        let device = test_cuda_device()?;
+        if !supported_rotary_test_dtypes(&device)?.contains(&DType::BF16) {
+            return Ok(());
+        }
+
+        for (rows, inner, columns) in [
+            (128, 2560, 4096),
+            (512, 2560, 4096),
+            (128, 2560, 9216),
+            (128, 9216, 2560),
+        ] {
+            let x = Tensor::from_vec(
+                (0..rows * inner)
+                    .map(|i| ((i * 17 % 255) as f32 - 127.) / 64.)
+                    .collect::<Vec<_>>(),
+                (1, rows, inner),
+                &device,
+            )?
+            .to_dtype(DType::BF16)?;
+            let linear = Linear::new(
+                Tensor::from_vec(
+                    (0..columns * inner)
+                        .map(|i| ((i * 29 % 127) as f32 - 63.) / 512.)
+                        .collect::<Vec<_>>(),
+                    (columns, inner),
+                    &device,
+                )?
+                .to_dtype(DType::BF16)?,
+                None,
+            );
+            let run = |index| match index {
+                0 => crate::kernels::cuda::blaslt::project_pinned512(&x, &linear),
+                1 => cuda_bf16_projection_impl(&x, &linear, false, SimtProjection::Compensated),
+                _ => {
+                    cuda_bf16_projection_impl(&x, &linear, false, SimtProjection::TiledCompensated)
+                }
+            };
+            let baseline = run(0)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            for candidate in [1, 2] {
+                let values = run(candidate)?
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let different = baseline
+                    .iter()
+                    .zip(&values)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                let max_abs = baseline
+                    .iter()
+                    .zip(&values)
+                    .map(|(a, b)| (*a - *b).abs())
+                    .fold(0f32, f32::max);
+                for _ in 0..2 {
+                    let _ = run(0)?;
+                    let _ = run(candidate)?;
+                }
+                let mut samples = [Vec::new(), Vec::new()];
+                for iteration in 0..6 {
+                    for index in if iteration % 2 == 0 { [0, 1] } else { [1, 0] } {
+                        device.synchronize()?;
+                        let started = Instant::now();
+                        let _ = run(if index == 0 { 0 } else { candidate })?;
+                        device.synchronize()?;
+                        samples[index].push(started.elapsed().as_secs_f64() * 1000.);
+                    }
+                }
+                let median = |values: &mut Vec<f64>| {
+                    values.sort_by(f64::total_cmp);
+                    (values[2] + values[3]) / 2.
+                };
+                let old_ms = median(&mut samples[0]);
+                let candidate_ms = median(&mut samples[1]);
+                println!(
+                    "PINNED_BLASLT_PROJECTION_PROFILE rows={rows} inner={inner} columns={columns} candidate={candidate} old_ms={old_ms:.9} candidate_ms={candidate_ms:.9} ratio={:.9} different_elements={different} max_abs={max_abs} scope=seeded_operator_allocation_launch_and_barriers_not_http",
+                    candidate_ms / old_ms
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_blaslt_combined_gate_up_cuda_microprofile() -> Result<()> {
+        let device = test_cuda_device()?;
+        if !supported_rotary_test_dtypes(&device)?.contains(&DType::BF16) {
+            return Ok(());
+        }
+
+        for (rows, inner, columns) in [
+            (32, 4096, 12288),
+            (128, 4096, 12288),
+            (512, 4096, 12288),
+            (128, 5120, 17408),
+        ] {
+            let tensor = |shape: &[usize], seed: u32| -> Result<Tensor> {
+                let mut state = seed;
+                let values = (0..shape.iter().product::<usize>())
+                    .map(|_| {
+                        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                        ((state >> 16) as f32 / 65536. - 0.5) / 8.
+                    })
+                    .collect::<Vec<_>>();
+                Tensor::from_vec(values, shape, &device)?.to_dtype(DType::BF16)
+            };
+            let x = tensor(&[1, rows, inner], 123)?;
+            let gate = Linear::new(tensor(&[columns, inner], 456)?, None);
+            let up = Linear::new(tensor(&[columns, inner], 789)?, None);
+            let packed = Linear::new(Tensor::cat(&[gate.weight(), up.weight()], 0)?, None);
+            let run = |combined: bool| -> Result<(Tensor, Tensor)> {
+                if combined {
+                    let output = crate::kernels::cuda::blaslt::project_pinned512(&x, &packed)?;
+                    Ok((
+                        output.narrow(2, 0, columns)?.contiguous()?,
+                        output.narrow(2, columns, columns)?.contiguous()?,
+                    ))
+                } else {
+                    Ok((
+                        crate::kernels::cuda::blaslt::project_pinned512(&x, &gate)?,
+                        crate::kernels::cuda::blaslt::project_pinned512(&x, &up)?,
+                    ))
+                }
+            };
+            let host = |pair: (Tensor, Tensor)| -> Result<Vec<f32>> {
+                Tensor::cat(&[&pair.0, &pair.1], 2)?
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1()
+            };
+            let baseline = host(run(false)?)?;
+            let candidate = host(run(true)?)?;
+            let different = baseline
+                .iter()
+                .zip(&candidate)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let max_abs = baseline
+                .iter()
+                .zip(&candidate)
+                .map(|(a, b)| (*a - *b).abs())
+                .fold(0f32, f32::max);
+            for _ in 0..2 {
+                let _ = run(false)?;
+                let _ = run(true)?;
+            }
+            let mut samples = [Vec::new(), Vec::new()];
+            for iteration in 0..6 {
+                for index in if iteration % 2 == 0 { [0, 1] } else { [1, 0] } {
+                    device.synchronize()?;
+                    let started = Instant::now();
+                    let _ = run(index == 1)?;
+                    device.synchronize()?;
+                    samples[index].push(started.elapsed().as_secs_f64() * 1000.);
+                }
+            }
+            let median = |values: &mut Vec<f64>| {
+                values.sort_by(f64::total_cmp);
+                (values[2] + values[3]) / 2.
+            };
+            let old_ms = median(&mut samples[0]);
+            let candidate_ms = median(&mut samples[1]);
+            println!(
+                "PINNED_BLASLT_GATE_UP_PROFILE rows={rows} inner={inner} columns={columns} old_ms={old_ms:.9} candidate_ms={candidate_ms:.9} ratio={:.9} different_elements={different} max_abs={max_abs} scope=seeded_operator_including_output_copies_not_http",
+                candidate_ms / old_ms
+            );
+            assert_eq!(
+                different, 0,
+                "packing changes seeded gate/up projection bits"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn guarded_double_projection_cuda_paired_synchronized_microprofile() -> Result<()> {
+        let device = test_cuda_device()?;
+        if !supported_rotary_test_dtypes(&device)?.contains(&DType::BF16) {
+            return Ok(());
+        }
+        for (rows, inner, columns) in [
+            (17, 4096, 32),
+            (128, 2560, 4096),
+            (512, 2560, 4096),
+            (128, 2560, 9216),
+            (128, 9216, 2560),
+        ] {
+            let xs = (0..rows * inner)
+                .map(|i| ((i * 17 % 255) as f32 - 127.) / 64.)
+                .collect::<Vec<_>>();
+            let ws = (0..columns * inner)
+                .map(|i| ((i * 29 % 127) as f32 - 63.) / 512.)
+                .collect::<Vec<_>>();
+            let x = Tensor::from_vec(xs, (1, rows, inner), &device)?.to_dtype(DType::BF16)?;
+            let linear = Linear::new(
+                Tensor::from_vec(ws, (columns, inner), &device)?.to_dtype(DType::BF16)?,
+                None,
+            );
+            let run = |variant| cuda_bf16_projection_impl(&x, &linear, false, variant);
+            for candidate in [
+                SimtProjection::TiledCompensated,
+                SimtProjection::GuardedDouble,
+                SimtProjection::GuardedTensorDouble,
+                SimtProjection::GuardedTensorDoubleRows16,
+            ] {
+                let retained = run(SimtProjection::Compensated)?;
+                let guarded = run(candidate)?;
+                assert_eq!(
+                    retained
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                    guarded
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?
+                );
+                for _ in 0..2 {
+                    let _ = run(SimtProjection::Compensated)?;
+                    let _ = run(candidate)?;
+                }
+                device.synchronize()?;
+                let mut samples = [Vec::new(), Vec::new()];
+                for iteration in 0..6 {
+                    for index in if iteration % 2 == 0 { [0, 1] } else { [1, 0] } {
+                        device.synchronize()?;
+                        let started = Instant::now();
+                        let _ = run(if index == 0 {
+                            SimtProjection::Compensated
+                        } else {
+                            candidate
+                        })?;
+                        device.synchronize()?;
+                        samples[index].push(started.elapsed().as_secs_f64() * 1000.);
+                    }
+                }
+                let median = |values: &mut Vec<f64>| {
+                    values.sort_by(f64::total_cmp);
+                    (values[2] + values[3]) / 2.
+                };
+                let old_ms = median(&mut samples[0]);
+                let candidate_ms = median(&mut samples[1]);
+                let profile_kind = if matches!(candidate, SimtProjection::TiledCompensated) {
+                    "TILED_COMPENSATED_PROFILE"
+                } else if matches!(candidate, SimtProjection::GuardedTensorDoubleRows16) {
+                    "GUARDED_TENSOR_DOUBLE_ROWS16_PROFILE"
+                } else if matches!(candidate, SimtProjection::GuardedTensorDouble) {
+                    "GUARDED_TENSOR_DOUBLE_PROFILE"
+                } else {
+                    "GUARDED_DOUBLE_PROFILE"
+                };
+                println!(
+                    "{profile_kind} rows={rows} inner={inner} columns={columns} old_ms={old_ms:.9} candidate_ms={candidate_ms:.9} ratio={:.9} scope=allocation_launch_and_barriers_not_http",
+                    candidate_ms / old_ms
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn full_attention_kv_cuda_preserves_exceptional_products() -> Result<()> {
+        let device = test_cuda_device()?;
+        if !supported_rotary_test_dtypes(&device)?.contains(&DType::BF16) {
+            return Ok(());
+        }
+        for (xs, ws) in [
+            (
+                vec![2_f32.powi(100); 2],
+                vec![2_f32.powi(100), -2_f32.powi(100)],
+            ),
+            (vec![2_f32.powi(-70); 129], vec![2_f32.powi(-70); 129]),
+        ] {
+            let expected = bf16::from_f32(
+                xs.iter()
+                    .zip(&ws)
+                    .map(|(&x, &w)| f64::from(x) * f64::from(w))
+                    .sum::<f64>() as f32,
+            )
+            .to_f32();
+            let x =
+                Tensor::from_vec(xs.clone(), (1, 1, xs.len()), &device)?.to_dtype(DType::BF16)?;
+            let layer = Linear::new(
+                Tensor::from_vec(ws, (1, xs.len()), &device)?.to_dtype(DType::BF16)?,
+                None,
+            );
+            let actual = full_attention_kv_forward(&x, &layer)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert_eq!(
+                actual,
+                vec![expected],
+                "full K/V exceptional-product recovery"
+            );
+        }
+        Ok(())
+    }
+}

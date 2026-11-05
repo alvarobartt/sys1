@@ -2,11 +2,9 @@
 #include <cuda_runtime.h>
 #include <math.h>
 extern "C" __global__ void qwen35_shortvalues_0_bf16(const float *query, const float *key,
-                                                   const float *value, const float *gate,
-                                                   const float *beta, __nv_bfloat16 *output,
-                                                   const unsigned int *cu_seqlens,
-                                                   const unsigned int *short_ids, int total_length,
-                                                   int heads, int key_heads, int value_dim) {
+    const float *value, const float *gate, const float *beta, __nv_bfloat16 *output,
+    const unsigned int *cu_seqlens, const unsigned int *short_ids, int total_length, int heads,
+    int key_heads, int value_dim) {
     const int batch_head = blockIdx.x;
     const int head = batch_head % heads;
     const int batch = short_ids[batch_head / heads];
@@ -79,10 +77,8 @@ extern "C" __global__ void qwen35_shortvalues_0_bf16(const float *query, const f
 }
 
 extern "C" __global__ void qwen35_shortvalues_1_bf16(const float *query, const float *key,
-                                                   const float *value, const float *gate,
-                                                   const float *beta, __nv_bfloat16 *output,
-                                                   const unsigned int *cu_seqlens, int total_length,
-                                                   int heads, int key_heads, int value_dim) {
+    const float *value, const float *gate, const float *beta, __nv_bfloat16 *output,
+    const unsigned int *cu_seqlens, int total_length, int heads, int key_heads, int value_dim) {
     const int batch_head = blockIdx.x;
     const int head = batch_head % heads;
     const int batch = batch_head / heads;
@@ -155,10 +151,8 @@ extern "C" __global__ void qwen35_shortvalues_1_bf16(const float *query, const f
 }
 
 extern "C" __global__ void qwen35_shortvalues_2_bf16(const float *query, const float *key,
-                                                   const float *value, const float *gate,
-                                                   const float *beta, __nv_bfloat16 *output,
-                                                   int length, int heads, int key_heads,
-                                                   int value_dim) {
+    const float *value, const float *gate, const float *beta, __nv_bfloat16 *output, int length,
+    int heads, int key_heads, int value_dim) {
     const int batch_head = blockIdx.x;
     const int head = batch_head % heads;
     const int batch = batch_head / heads;

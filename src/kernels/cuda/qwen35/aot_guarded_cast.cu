@@ -2,8 +2,8 @@
 #include <math.h>
 #include <stdint.h>
 
-extern "C" __global__ void qwen35_aot91_cast_q(const float *input, __half *output, uint64_t count,
-                                             unsigned *bad) {
+extern "C" __global__ void qwen35_aot91_cast_q(
+    const float *input, __half *output, uint64_t count, unsigned *bad) {
     bool invalid = false;
     for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
          i += uint64_t(gridDim.x) * blockDim.x) {
@@ -15,8 +15,8 @@ extern "C" __global__ void qwen35_aot91_cast_q(const float *input, __half *outpu
         atomicOr(bad, 1u);
 }
 
-extern "C" __global__ void qwen35_aot91_cast_k(const float *input, __half *output, uint64_t rows,
-                                             unsigned *bad) {
+extern "C" __global__ void qwen35_aot91_cast_k(
+    const float *input, __half *output, uint64_t rows, unsigned *bad) {
     const int lane = threadIdx.x & 31;
     for (uint64_t row = uint64_t(blockIdx.x) * 4 + threadIdx.x / 32; row < rows;
          row += uint64_t(gridDim.x) * 4) {
@@ -37,9 +37,9 @@ extern "C" __global__ void qwen35_aot91_cast_k(const float *input, __half *outpu
     }
 }
 
-extern "C" __global__ void qwen35_aot91_cast_v(const float *input, const float *g, const float *beta,
-                                             __half *output, float *aligned_g, float *aligned_beta,
-                                             uint64_t count, float limit, unsigned *bad) {
+extern "C" __global__ void qwen35_aot91_cast_v(const float *input, const float *g,
+    const float *beta, __half *output, float *aligned_g, float *aligned_beta, uint64_t count,
+    float limit, unsigned *bad) {
     bool invalid = false;
     for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
          i += uint64_t(gridDim.x) * blockDim.x) {

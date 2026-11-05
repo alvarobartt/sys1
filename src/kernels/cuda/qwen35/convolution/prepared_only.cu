@@ -1,5 +1,3 @@
-
-
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -7,12 +5,11 @@
 #include <cuda_fp16.h>
 
 template <bool Packed, bool PrepareK = false, int InputChannels = 8192>
-__device__ __forceinline__ void
-halfonly_convcast_qv_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weights, float *query,
-                          float *key, float *value, const unsigned *starts, unsigned int rows,
-                          int key_heads_arg, int value_heads_arg, float scale, int length,
-                          int kernel_arg, const __nv_bfloat16 *table, __half *qhalf, __half *khalf,
-                          __half *vhalf, float limit, unsigned *qv_bad) {
+__device__ __forceinline__ void halfonly_convcast_qv_impl(const __nv_bfloat16 *mixed,
+    const __nv_bfloat16 *weights, float *query, float *key, float *value, const unsigned *starts,
+    unsigned int rows, int key_heads_arg, int value_heads_arg, float scale, int length,
+    int kernel_arg, const __nv_bfloat16 *table, __half *qhalf, __half *khalf, __half *vhalf,
+    float limit, unsigned *qv_bad) {
     constexpr int key_heads = 16, value_heads = 32, kernel = 4;
     const unsigned int row = blockIdx.x * 4 + threadIdx.x / 32;
     const unsigned int lane = threadIdx.x & 31;
@@ -25,10 +22,10 @@ halfonly_convcast_qv_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weigh
     const unsigned int source = token * (2 * key_width + value_width) + head * 128 + lane * 4;
     const unsigned int target = row * 128 + lane * 4;
     float q[4], k[4];
-    qwen35_convlookup156_element4(mixed, weights, q, token, head * 128 + lane * 4, begin, channels,
-                                kernel, table);
-    qwen35_convlookup156_element4(mixed, weights, k, token, key_width + head * 128 + lane * 4, begin,
-                                channels, kernel, table);
+    qwen35_convlookup156_element4(
+        mixed, weights, q, token, head * 128 + lane * 4, begin, channels, kernel, table);
+    qwen35_convlookup156_element4(mixed, weights, k, token, key_width + head * 128 + lane * 4,
+        begin, channels, kernel, table);
     float qs = __fmul_rn(q[0], q[0]), ks = __fmul_rn(k[0], k[0]);
 #pragma unroll
     for (int j = 1; j < 4; ++j) {
@@ -89,8 +86,7 @@ halfonly_convcast_qv_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weigh
     for (int j = lane * 4; j < repeat * 128; j += 128) {
         float out[4];
         qwen35_convlookup156_element4(mixed, weights, out, token,
-                                    2 * key_width + head * repeat * 128 + j, begin, channels,
-                                    kernel, table);
+            2 * key_width + head * repeat * 128 + j, begin, channels, kernel, table);
         unsigned hv[4];
 #pragma unroll
         for (int z = 0; z < 4; ++z) {
@@ -106,17 +102,14 @@ halfonly_convcast_qv_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weigh
         atomicOr(qv_bad, 4u);
 }
 
-
-extern "C" __global__ void
-halfonly_convcast_qkv_packed(const __nv_bfloat16 *x, const __nv_bfloat16 *w, float *q, float *k,
-                             float *v, const unsigned *starts, unsigned rows, int kh, int vh,
-                             float scale, int length, int kernel, const __nv_bfloat16 *table,
-                             __half *qhalf, __half *khalf, __half *vhalf, float limit,
-                             unsigned *qv_bad) {
+extern "C" __global__ void halfonly_convcast_qkv_packed(const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w, float *q, float *k, float *v, const unsigned *starts, unsigned rows,
+    int kh, int vh, float scale, int length, int kernel, const __nv_bfloat16 *table, __half *qhalf,
+    __half *khalf, __half *vhalf, float limit, unsigned *qv_bad) {
     if (kh != 16 || vh != 32 || kernel != 4) {
         asm volatile("trap;");
         return;
     }
     halfonly_convcast_qv_impl<true, true>(x, w, q, k, v, starts, rows, kh, vh, scale, length,
-                                          kernel, table, qhalf, khalf, vhalf, limit, qv_bad);
+        kernel, table, qhalf, khalf, vhalf, limit, qv_bad);
 }

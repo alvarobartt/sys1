@@ -260,7 +260,8 @@ mod tests {
                 )?;
                 assert_eq!(values(&actual.narrow(0, slot, 1)?)?, values(&single)?);
             }
-            let reference = crate::archs::qwen35_text::eager_attention(&q, &k, &v, scale, false)?;
+            let reference =
+                crate::architectures::qwen35_text::eager_attention(&q, &k, &v, scale, false)?;
             for (a, b) in values(&actual)?.iter().zip(values(&reference)?) {
                 assert!(a.is_finite() && b.is_finite());
                 assert!(
@@ -360,7 +361,7 @@ mod tests {
             for causal in [true, false] {
                 let actual = forward(&q, &k, &v, scale, causal)?;
                 let reference =
-                    crate::archs::qwen35_text::eager_attention(&q, &k, &v, scale, causal)?;
+                    crate::architectures::qwen35_text::eager_attention(&q, &k, &v, scale, causal)?;
 
                 for (a, b) in values(&actual)?.iter().zip(values(&reference)?) {
                     assert!(a.is_finite() && b.is_finite());

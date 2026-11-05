@@ -1,5 +1,3 @@
-
-
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <float.h>
@@ -21,8 +19,8 @@ __device__ __forceinline__ void qwen35_gate_nativevec_load2(unsigned *out, const
                  : "r"(address)
                  : "memory");
 }
-__device__ __forceinline__ void qwen35_gate_nativevec_mma(float *out, const unsigned *a,
-                                                        const unsigned *b) {
+__device__ __forceinline__ void qwen35_gate_nativevec_mma(
+    float *out, const unsigned *a, const unsigned *b) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                  "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
                  : "+f"(out[0]), "+f"(out[1]), "+f"(out[2]), "+f"(out[3])
@@ -31,17 +29,16 @@ __device__ __forceinline__ void qwen35_gate_nativevec_mma(float *out, const unsi
 #endif
 
 #if __CUDA_ARCH__ >= 800
-__device__ __forceinline__ void qwen35_gate_nativevec_copy16(__nv_bfloat16 *destination,
-                                                           const __nv_bfloat16 *source,
-                                                           int source_bytes) {
+__device__ __forceinline__ void qwen35_gate_nativevec_copy16(
+    __nv_bfloat16 *destination, const __nv_bfloat16 *source, int source_bytes) {
     const unsigned address = unsigned(__cvta_generic_to_shared(destination));
     asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;" ::"r"(address), "l"(source),
                  "r"(source_bytes)
                  : "memory");
 }
-__device__ __forceinline__ void
-qwen35_gate_nativevec_stage(__nv_bfloat16 *tile_a, __nv_bfloat16 *tile_b, const __nv_bfloat16 *input,
-                          const __nv_bfloat16 *weight, int first_row, int rows, int first_k) {
+__device__ __forceinline__ void qwen35_gate_nativevec_stage(__nv_bfloat16 *tile_a,
+    __nv_bfloat16 *tile_b, const __nv_bfloat16 *input, const __nv_bfloat16 *weight, int first_row,
+    int rows, int first_k) {
     constexpr int SharedStride = 80, Threads = 256;
     const int ar = threadIdx.x / 8, ac = (threadIdx.x % 8) * 8, physical = first_row + ar;
 
@@ -50,18 +47,16 @@ qwen35_gate_nativevec_stage(__nv_bfloat16 *tile_a, __nv_bfloat16 *tile_b, const 
 #pragma unroll
     for (int part = 0; part < 2; ++part) {
         const int index = threadIdx.x + part * Threads, br = index / 8, bc = (index % 8) * 8;
-        qwen35_gate_nativevec_copy16(tile_b + br * SharedStride + bc,
-                                   weight + br * 4096 + first_k + bc, 16);
+        qwen35_gate_nativevec_copy16(
+            tile_b + br * SharedStride + bc, weight + br * 4096 + first_k + bc, 16);
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
 }
 #endif
 
 __device__ __forceinline__ void qwen35_gate_nativevec_impl(const __nv_bfloat16 *input,
-                                                         const __nv_bfloat16 *weight,
-                                                         __nv_bfloat16 *output, int rows, int inner,
-                                                         int columns, const unsigned *starts,
-                                                         const unsigned *ends) {
+    const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows, int inner, int columns,
+    const unsigned *starts, const unsigned *ends) {
     constexpr int TileRows = 32, SharedStride = 80, Threads = 256;
     const int first_row = starts ? int(starts[blockIdx.x]) : int(blockIdx.x) * TileRows;
     if (ends)
@@ -74,8 +69,7 @@ __device__ __forceinline__ void qwen35_gate_nativevec_impl(const __nv_bfloat16 *
     const int row_base = (warp / 4) * 16, col_base = (warp % 4) * 16;
     bool exceptional = false;
     float running[2][4] = {}, correction[2][4] = {};
-    const bool vector_copy =
-        inner == 4096 && columns == 64 &&
+    const bool vector_copy = inner == 4096 && columns == 64 &&
         ((reinterpret_cast<uintptr_t>(input) | reinterpret_cast<uintptr_t>(weight)) & 15u) == 0;
     if (vector_copy)
         qwen35_gate_nativevec_stage(a_buffers, b_buffers, input, weight, first_row, rows, 0);
@@ -107,8 +101,8 @@ __device__ __forceinline__ void qwen35_gate_nativevec_impl(const __nv_bfloat16 *
             if (first_k + 64 < inner) {
                 const int next = ((first_k / 64) + 1) & 1;
                 qwen35_gate_nativevec_stage(a_buffers + next * TileRows * SharedStride,
-                                          b_buffers + next * 64 * SharedStride, input, weight,
-                                          first_row, rows, first_k + 64);
+                    b_buffers + next * 64 * SharedStride, input, weight, first_row, rows,
+                    first_k + 64);
             }
 
             const int ar = threadIdx.x / 8, ac = (threadIdx.x % 8) * 8;
@@ -138,15 +132,15 @@ __device__ __forceinline__ void qwen35_gate_nativevec_impl(const __nv_bfloat16 *
         }
         for (int offset = 0; offset < 64 && first_k + offset < inner; offset += 16) {
             unsigned a[4];
-            qwen35_gate_nativevec_load4(a, tile_a + (row_base + (lane & 15)) * SharedStride + offset +
-                                             (lane / 16) * 8);
+            qwen35_gate_nativevec_load4(
+                a, tile_a + (row_base + (lane & 15)) * SharedStride + offset + (lane / 16) * 8);
 #pragma unroll
             for (int part = 0; part < 2; ++part) {
                 unsigned b[2];
                 float partial[4] = {};
-                qwen35_gate_nativevec_load2(b, tile_b +
-                                                 (col_base + part * 8 + (lane & 7)) * SharedStride +
-                                                 offset + ((lane / 8) & 1) * 8);
+                qwen35_gate_nativevec_load2(b,
+                    tile_b + (col_base + part * 8 + (lane & 7)) * SharedStride + offset +
+                        ((lane / 8) & 1) * 8);
                 qwen35_gate_nativevec_mma(partial, a, b);
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
@@ -154,7 +148,7 @@ __device__ __forceinline__ void qwen35_gate_nativevec_impl(const __nv_bfloat16 *
                     const float virtual_partial = __fsub_rn(sum, running[part][i]);
                     const float error =
                         __fadd_rn(__fsub_rn(running[part][i], __fsub_rn(sum, virtual_partial)),
-                                  __fsub_rn(partial[i], virtual_partial));
+                            __fsub_rn(partial[i], virtual_partial));
                     correction[part][i] = __fadd_rn(correction[part][i], error);
                     running[part][i] = sum;
                 }
@@ -175,7 +169,7 @@ __device__ __forceinline__ void qwen35_gate_nativevec_impl(const __nv_bfloat16 *
                     double sum = 0.;
                     for (int k = 0; k < inner; ++k)
                         sum = __fma_rn(double(float(input[row * inner + k])),
-                                       double(float(weight[col * inner + k])), sum);
+                            double(float(weight[col * inner + k])), sum);
                     value = __double2float_rn(sum);
                 }
                 output[row * columns + col] = __float2bfloat16_rn(value);
@@ -189,22 +183,18 @@ __device__ __forceinline__ void qwen35_gate_nativevec_impl(const __nv_bfloat16 *
             double sum = 0.;
             for (int k = 0; k < inner; ++k)
                 sum = __fma_rn(double(float(input[row * inner + k])),
-                               double(float(weight[col * inner + k])), sum);
+                    double(float(weight[col * inner + k])), sum);
             output[row * columns + col] = __float2bfloat16_rn(__double2float_rn(sum));
         }
     }
 #endif
 }
 extern "C" __global__ void qwen35_gate_nativevec_rows32_bf16(const __nv_bfloat16 *x,
-                                                           const __nv_bfloat16 *w,
-                                                           __nv_bfloat16 *out, int rows, int inner,
-                                                           int columns) {
+    const __nv_bfloat16 *w, __nv_bfloat16 *out, int rows, int inner, int columns) {
     qwen35_gate_nativevec_impl(x, w, out, rows, inner, columns, nullptr, nullptr);
 }
 extern "C" __global__ void qwen35_gate_nativevec_packed_bf16(const __nv_bfloat16 *x,
-                                                           const __nv_bfloat16 *w,
-                                                           __nv_bfloat16 *out, int rows, int inner,
-                                                           int columns, const unsigned *starts,
-                                                           const unsigned *ends) {
+    const __nv_bfloat16 *w, __nv_bfloat16 *out, int rows, int inner, int columns,
+    const unsigned *starts, const unsigned *ends) {
     qwen35_gate_nativevec_impl(x, w, out, rows, inner, columns, starts, ends);
 }

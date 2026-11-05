@@ -7,9 +7,9 @@ __device__ __forceinline__ float qwen35_convvstore_decode(unsigned word, int hal
     return __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(word >> (half * 16))));
 }
 template <int FixedKernel>
-__device__ __forceinline__ void qwen35_convvstore_four(const __nv_bfloat16 *x, const __nv_bfloat16 *w,
-                                                     float (&out)[4], int token, int channel,
-                                                     int begin, int channels, int kernel) {
+__device__ __forceinline__ void qwen35_convvstore_four(const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w, float (&out)[4], int token, int channel, int begin, int channels,
+    int kernel) {
     float sums[4] = {};
     unsigned weights[8] = {};
     const bool vector_input = (reinterpret_cast<uintptr_t>(x) & 7u) == 0;
@@ -50,8 +50,8 @@ __device__ __forceinline__ void qwen35_convvstore_four(const __nv_bfloat16 *x, c
                 float weight;
                 if constexpr (FixedKernel == 4) {
                     weight = vector_weights
-                                 ? qwen35_convvstore_decode(weights[j * 2 + tap / 2], tap & 1)
-                                 : __bfloat162float(w[(channel + j) * kernel + tap]);
+                        ? qwen35_convvstore_decode(weights[j * 2 + tap / 2], tap & 1)
+                        : __bfloat162float(w[(channel + j) * kernel + tap]);
                 } else
                     weight = __bfloat162float(w[(channel + j) * kernel + tap]);
                 sums[j] = __fadd_rn(sums[j], __fmul_rn(inputs[j], weight));
@@ -65,19 +65,18 @@ __device__ __forceinline__ void qwen35_convvstore_four(const __nv_bfloat16 *x, c
     }
 }
 __device__ __forceinline__ void qwen35_convvstore_element4(const __nv_bfloat16 *x,
-                                                         const __nv_bfloat16 *w, float (&out)[4],
-                                                         int token, int channel, int begin,
-                                                         int channels, int kernel) {
+    const __nv_bfloat16 *w, float (&out)[4], int token, int channel, int begin, int channels,
+    int kernel) {
     if (kernel == 4)
         qwen35_convvstore_four<4>(x, w, out, token, channel, begin, channels, kernel);
     else
         qwen35_convvstore_four<0>(x, w, out, token, channel, begin, channels, kernel);
 }
 template <bool Packed>
-__device__ __forceinline__ void
-qwen35_convvstore_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weights, float *query,
-                     float *key, __nv_bfloat16 *value, const unsigned *starts, unsigned int rows,
-                     int key_heads, int value_heads, float scale, int length, int kernel) {
+__device__ __forceinline__ void qwen35_convvstore_impl(const __nv_bfloat16 *mixed,
+    const __nv_bfloat16 *weights, float *query, float *key, __nv_bfloat16 *value,
+    const unsigned *starts, unsigned int rows, int key_heads, int value_heads, float scale,
+    int length, int kernel) {
     const unsigned int row = blockIdx.x * 4 + threadIdx.x / 32;
     const unsigned int lane = threadIdx.x & 31;
     if (row >= rows)
@@ -89,10 +88,10 @@ qwen35_convvstore_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weights,
     const unsigned int source = token * (2 * key_width + value_width) + head * 128 + lane * 4;
     const unsigned int target = row * 128 + lane * 4;
     float q[4], k[4];
-    qwen35_convvstore_element4(mixed, weights, q, token, head * 128 + lane * 4, begin, channels,
-                             kernel);
-    qwen35_convvstore_element4(mixed, weights, k, token, key_width + head * 128 + lane * 4, begin,
-                             channels, kernel);
+    qwen35_convvstore_element4(
+        mixed, weights, q, token, head * 128 + lane * 4, begin, channels, kernel);
+    qwen35_convvstore_element4(
+        mixed, weights, k, token, key_width + head * 128 + lane * 4, begin, channels, kernel);
     float qs = __fmul_rn(q[0], q[0]), ks = __fmul_rn(k[0], k[0]);
 #pragma unroll
     for (int j = 1; j < 4; ++j) {
@@ -121,7 +120,7 @@ qwen35_convvstore_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weights,
     for (int j = lane * 4; j < repeat * 128; j += 128) {
         float out[4];
         qwen35_convvstore_element4(mixed, weights, out, token,
-                                 2 * key_width + head * repeat * 128 + j, begin, channels, kernel);
+            2 * key_width + head * repeat * 128 + j, begin, channels, kernel);
 
         const unsigned lo =
             (__float_as_uint(out[0]) >> 16) | (__float_as_uint(out[1]) & 0xffff0000u);
@@ -130,15 +129,13 @@ qwen35_convvstore_impl(const __nv_bfloat16 *mixed, const __nv_bfloat16 *weights,
         *reinterpret_cast<uint2 *>(value + vo + j) = make_uint2(lo, hi);
     }
 }
-extern "C" __global__ void qwen35_conv_vstore_uniform(const __nv_bfloat16 *x, const __nv_bfloat16 *w,
-                                                    float *q, float *k, __nv_bfloat16 *v,
-                                                    unsigned rows, int kh, int vh, float scale,
-                                                    int length, int kernel) {
+extern "C" __global__ void qwen35_conv_vstore_uniform(const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w, float *q, float *k, __nv_bfloat16 *v, unsigned rows, int kh, int vh,
+    float scale, int length, int kernel) {
     qwen35_convvstore_impl<false>(x, w, q, k, v, nullptr, rows, kh, vh, scale, length, kernel);
 }
 extern "C" __global__ void qwen35_conv_vstore_packed(const __nv_bfloat16 *x, const __nv_bfloat16 *w,
-                                                   float *q, float *k, __nv_bfloat16 *v,
-                                                   const unsigned *starts, unsigned rows, int kh,
-                                                   int vh, float scale, int length, int kernel) {
+    float *q, float *k, __nv_bfloat16 *v, const unsigned *starts, unsigned rows, int kh, int vh,
+    float scale, int length, int kernel) {
     qwen35_convvstore_impl<true>(x, w, q, k, v, starts, rows, kh, vh, scale, length, kernel);
 }

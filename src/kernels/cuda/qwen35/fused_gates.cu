@@ -1,15 +1,12 @@
 #include <cuda_bf16.h>
 #include <math.h>
 
-
 #include <cuda_bf16.h>
 #include <math.h>
 
 extern "C" __global__ void qwen35_packed_ba_nonlinearity_bf16(const __nv_bfloat16 *a,
-                                                            const __nv_bfloat16 *b,
-                                                            const float *bias, const float *a_log,
-                                                            float *gate, float *beta, int count,
-                                                            int heads) {
+    const __nv_bfloat16 *b, const float *bias, const float *a_log, float *gate, float *beta,
+    int count, int heads) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count)
         return;

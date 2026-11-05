@@ -1,14 +1,11 @@
-
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <float.h>
 #include <math.h>
 template <int RowTiles>
-__device__ void
-biased_projection_guard_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *weight,
-                              const __nv_bfloat16 *bias, __nv_bfloat16 *output, int rows, int inner,
-                              int columns, double radius_coefficient) {
+__device__ void biased_projection_guard_impl(const __nv_bfloat16 *input,
+    const __nv_bfloat16 *weight, const __nv_bfloat16 *bias, __nv_bfloat16 *output, int rows,
+    int inner, int columns, double radius_coefficient) {
     const int lane = threadIdx.x & 31;
     const int first_row = blockIdx.x * (8 * RowTiles);
     const int first_column = blockIdx.y * 32 + (threadIdx.x >> 5) * 8;
@@ -27,8 +24,8 @@ biased_projection_guard_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *we
             const float a = row < rows && k < inner ? float(input[row * inner + k]) : 0.f;
 
             unsafe[row_tile] |= !isfinite(a) || !isfinite(b) ||
-                                (a != 0.f && (fabsf(a) < 0x1p-60f || fabsf(a) > 0x1p60f)) ||
-                                (b != 0.f && (fabsf(b) < 0x1p-60f || fabsf(b) > 0x1p60f));
+                (a != 0.f && (fabsf(a) < 0x1p-60f || fabsf(a) > 0x1p60f)) ||
+                (b != 0.f && (fabsf(b) < 0x1p-60f || fabsf(b) > 0x1p60f));
             const double ad = double(a), aa = fabs(ad);
             asm volatile("mma.sync.aligned.m8n8k4.row.col.rn.f64.f64.f64.f64 "
                          "{%0, %1}, {%2}, {%3}, {%0, %1};"
@@ -91,18 +88,18 @@ biased_projection_guard_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *we
                 const float virtual_product = __fsub_rn(updated, running);
                 const float error =
                     __fadd_rn(__fsub_rn(running, __fsub_rn(updated, virtual_product)),
-                              __fsub_rn(product, virtual_product));
+                        __fsub_rn(product, virtual_product));
                 correction = __fadd_rn(correction, error);
                 running = updated;
                 exceptional |= !isfinite(product) || !isfinite(running) || !isfinite(correction) ||
-                               (a != 0.f && b != 0.f && fabsf(product) < FLT_MIN);
+                    (a != 0.f && b != 0.f && fabsf(product) < FLT_MIN);
             }
             double sum = __dadd_rn(double(running), double(correction));
             if (__any_sync(0xffffffff, exceptional)) {
                 sum = 0.;
                 for (int index = lane; index < inner; index += 32) {
                     sum = __fma_rn(double(float(input[row * inner + index])),
-                                   double(float(weight[column * inner + index])), sum);
+                        double(float(weight[column * inner + index])), sum);
                 }
             }
             for (int step = 16; step > 0; step >>= 1)
@@ -115,9 +112,7 @@ biased_projection_guard_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *we
 }
 
 extern "C" __global__ void biased_projection_guard_bf16(const __nv_bfloat16 *x,
-                                                         const __nv_bfloat16 *w,
-                                                         const __nv_bfloat16 *b, __nv_bfloat16 *out,
-                                                         int rows, int inner, int columns,
-                                                         double radius) {
+    const __nv_bfloat16 *w, const __nv_bfloat16 *b, __nv_bfloat16 *out, int rows, int inner,
+    int columns, double radius) {
     biased_projection_guard_impl<2>(x, w, b, out, rows, inner, columns, radius);
 }

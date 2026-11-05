@@ -5,12 +5,10 @@
 
 #include "projection_shared.cuh"
 
-
 template <int TileRows>
-__device__ __forceinline__ void
-qwen35_projection_tile_bf16(const __nv_bfloat16 *input, const __nv_bfloat16 *weight,
-                            __nv_bfloat16 *output, int rows, int inner, int columns,
-                            const __nv_bfloat16 *bias = nullptr) {
+__device__ __forceinline__ void qwen35_projection_tile_bf16(const __nv_bfloat16 *input,
+    const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows, int inner, int columns,
+    const __nv_bfloat16 *bias = nullptr) {
     const int first_row = blockIdx.x * TileRows;
     const int first_column = blockIdx.y * 64;
     constexpr int WarpRows = TileRows < 32 ? TileRows : 32;
@@ -62,12 +60,12 @@ qwen35_projection_tile_bf16(const __nv_bfloat16 *input, const __nv_bfloat16 *wei
             wmma::fill_fragment(c[group], 0.f);
         }
         for (int offset = 0; offset < 64 && first_k + offset < inner; offset += 16) {
-            wmma::load_matrix_sync(b, tile_b + warp_column * 16 * SharedStride + offset,
-                                   SharedStride);
+            wmma::load_matrix_sync(
+                b, tile_b + warp_column * 16 * SharedStride + offset, SharedStride);
 #pragma unroll
             for (int group = 0; group < Groups; ++group) {
-                wmma::load_matrix_sync(
-                    a, tile_a + (group * WarpRows + warp_row * 16) * SharedStride + offset,
+                wmma::load_matrix_sync(a,
+                    tile_a + (group * WarpRows + warp_row * 16) * SharedStride + offset,
                     SharedStride);
                 wmma::mma_sync(c[group], a, b, c[group]);
             }
@@ -81,7 +79,7 @@ qwen35_projection_tile_bf16(const __nv_bfloat16 *input, const __nv_bfloat16 *wei
                 const float virtual_partial = __fsub_rn(sum, running[group].x[i]);
                 const float error =
                     __fadd_rn(__fsub_rn(running[group].x[i], __fsub_rn(sum, virtual_partial)),
-                              __fsub_rn(partial, virtual_partial));
+                        __fsub_rn(partial, virtual_partial));
                 correction[group].x[i] = __fadd_rn(correction[group].x[i], error);
                 running[group].x[i] = sum;
             }
@@ -108,7 +106,7 @@ qwen35_projection_tile_bf16(const __nv_bfloat16 *input, const __nv_bfloat16 *wei
                     double sum = 0.;
                     for (int k = 0; k < inner; ++k) {
                         sum = __fma_rn(double(float(input[row * inner + k])),
-                                       double(float(weight[column * inner + k])), sum);
+                            double(float(weight[column * inner + k])), sum);
                     }
                     value = __double2float_rn(sum);
                 }
@@ -128,7 +126,7 @@ qwen35_projection_tile_bf16(const __nv_bfloat16 *input, const __nv_bfloat16 *wei
             double sum = 0.;
             for (int k = 0; k < inner; ++k) {
                 sum = __fma_rn(double(float(input[row * inner + k])),
-                               double(float(weight[column * inner + k])), sum);
+                    double(float(weight[column * inner + k])), sum);
             }
             float value = __double2float_rn(sum);
             if (bias != nullptr)
@@ -140,53 +138,39 @@ qwen35_projection_tile_bf16(const __nv_bfloat16 *input, const __nv_bfloat16 *wei
 }
 
 extern "C" __global__ void qwen35_kv_projection_bf16(const __nv_bfloat16 *input,
-                                                     const __nv_bfloat16 *weight,
-                                                     __nv_bfloat16 *output, int rows, int inner,
-                                                     int columns) {
+    const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows, int inner, int columns) {
     qwen35_projection_tile_bf16<16>(input, weight, output, rows, inner, columns);
 }
 
 extern "C" __global__ void qwen35_kv_projection_rows32_bf16(const __nv_bfloat16 *input,
-                                                            const __nv_bfloat16 *weight,
-                                                            __nv_bfloat16 *output, int rows,
-                                                            int inner, int columns) {
+    const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows, int inner, int columns) {
     qwen35_projection_tile_bf16<32>(input, weight, output, rows, inner, columns);
 }
 
 extern "C" __global__ void qwen35_kv_projection_rows128_bf16(const __nv_bfloat16 *input,
-                                                             const __nv_bfloat16 *weight,
-                                                             __nv_bfloat16 *output, int rows,
-                                                             int inner, int columns) {
+    const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows, int inner, int columns) {
     qwen35_projection_tile_bf16<128>(input, weight, output, rows, inner, columns);
 }
 
 extern "C" __global__ void qwen35_biased_projection_bf16(const __nv_bfloat16 *input,
-                                                         const __nv_bfloat16 *weight,
-                                                         const __nv_bfloat16 *bias,
-                                                         __nv_bfloat16 *output, int rows, int inner,
-                                                         int columns) {
+    const __nv_bfloat16 *weight, const __nv_bfloat16 *bias, __nv_bfloat16 *output, int rows,
+    int inner, int columns) {
     qwen35_projection_tile_bf16<16>(input, weight, output, rows, inner, columns, bias);
 }
 extern "C" __global__ void qwen35_biased_projection_rows32_bf16(const __nv_bfloat16 *input,
-                                                                const __nv_bfloat16 *weight,
-                                                                const __nv_bfloat16 *bias,
-                                                                __nv_bfloat16 *output, int rows,
-                                                                int inner, int columns) {
+    const __nv_bfloat16 *weight, const __nv_bfloat16 *bias, __nv_bfloat16 *output, int rows,
+    int inner, int columns) {
     qwen35_projection_tile_bf16<32>(input, weight, output, rows, inner, columns, bias);
 }
 extern "C" __global__ void qwen35_biased_projection_rows128_bf16(const __nv_bfloat16 *input,
-                                                                 const __nv_bfloat16 *weight,
-                                                                 const __nv_bfloat16 *bias,
-                                                                 __nv_bfloat16 *output, int rows,
-                                                                 int inner, int columns) {
+    const __nv_bfloat16 *weight, const __nv_bfloat16 *bias, __nv_bfloat16 *output, int rows,
+    int inner, int columns) {
     qwen35_projection_tile_bf16<128>(input, weight, output, rows, inner, columns, bias);
 }
 
 __device__ __forceinline__ void qwen35_compensated_projection_bf16(const __nv_bfloat16 *input,
-                                                                   const __nv_bfloat16 *weight,
-                                                                   const __nv_bfloat16 *bias,
-                                                                   __nv_bfloat16 *output, int inner,
-                                                                   int columns) {
+    const __nv_bfloat16 *weight, const __nv_bfloat16 *bias, __nv_bfloat16 *output, int inner,
+    int columns) {
     const int row = blockIdx.x;
     const int lane = threadIdx.x & 31;
     const int column = blockIdx.y * 8 + (threadIdx.x >> 5);
@@ -201,7 +185,7 @@ __device__ __forceinline__ void qwen35_compensated_projection_bf16(const __nv_bf
         const float updated = __fadd_rn(running, product);
         const float virtual_product = __fsub_rn(updated, running);
         const float error = __fadd_rn(__fsub_rn(running, __fsub_rn(updated, virtual_product)),
-                                      __fsub_rn(product, virtual_product));
+            __fsub_rn(product, virtual_product));
         correction = __fadd_rn(correction, error);
         running = updated;
 
@@ -212,7 +196,7 @@ __device__ __forceinline__ void qwen35_compensated_projection_bf16(const __nv_bf
         sum = 0.;
         for (int index = lane; index < inner; index += 32) {
             sum = __fma_rn(double(float(input[row * inner + index])),
-                           double(float(weight[column * inner + index])), sum);
+                double(float(weight[column * inner + index])), sum);
         }
     }
     for (int step = 16; step > 0; step >>= 1) {
@@ -227,17 +211,13 @@ __device__ __forceinline__ void qwen35_compensated_projection_bf16(const __nv_bf
 }
 
 extern "C" __global__ void qwen35_gate_projection_bf16(const __nv_bfloat16 *input,
-                                                       const __nv_bfloat16 *weight,
-                                                       __nv_bfloat16 *output, int inner,
-                                                       int columns) {
+    const __nv_bfloat16 *weight, __nv_bfloat16 *output, int inner, int columns) {
     qwen35_compensated_projection_bf16(input, weight, nullptr, output, inner, columns);
 }
 
 extern "C" __global__ void qwen35_biased_compensated_projection_bf16(const __nv_bfloat16 *input,
-                                                                     const __nv_bfloat16 *weight,
-                                                                     const __nv_bfloat16 *bias,
-                                                                     __nv_bfloat16 *output,
-                                                                     int inner, int columns) {
+    const __nv_bfloat16 *weight, const __nv_bfloat16 *bias, __nv_bfloat16 *output, int inner,
+    int columns) {
     qwen35_compensated_projection_bf16(input, weight, bias, output, inner, columns);
 }
 
@@ -270,7 +250,7 @@ __device__ __forceinline__ void qwen35_tiled_compensated_projection_impl_bf16(
                 const float virtual_product = __fsub_rn(updated, running[r][c]);
                 const float error =
                     __fadd_rn(__fsub_rn(running[r][c], __fsub_rn(updated, virtual_product)),
-                              __fsub_rn(product, virtual_product));
+                        __fsub_rn(product, virtual_product));
                 correction[r][c] = __fadd_rn(correction[r][c], error);
                 running[r][c] = updated;
                 if (a[r] != 0.f && b[c] != 0.f && fabsf(product) < FLT_MIN)
@@ -286,13 +266,13 @@ __device__ __forceinline__ void qwen35_tiled_compensated_projection_impl_bf16(
             if (row >= rows || column >= columns)
                 continue;
             double sum = __dadd_rn(double(running[r][c]), double(correction[r][c]));
-            if (__any_sync(0xffffffff, (exceptional & (1u << (r * ColumnTile + c))) ||
-                                           !isfinite(running[r][c]) ||
-                                           !isfinite(correction[r][c]))) {
+            if (__any_sync(0xffffffff,
+                    (exceptional & (1u << (r * ColumnTile + c))) || !isfinite(running[r][c]) ||
+                        !isfinite(correction[r][c]))) {
                 sum = 0.;
                 for (int index = lane; index < inner; index += 32)
                     sum = __fma_rn(double(float(input[row * inner + index])),
-                                   double(float(weight[column * inner + index])), sum);
+                        double(float(weight[column * inner + index])), sum);
             }
 #pragma unroll
             for (int step = 16; step > 0; step >>= 1)
@@ -308,25 +288,21 @@ __device__ __forceinline__ void qwen35_tiled_compensated_projection_impl_bf16(
 }
 
 extern "C" __global__ void qwen35_tiled_compensated_projection_bf16(const __nv_bfloat16 *input,
-                                                                    const __nv_bfloat16 *weight,
-                                                                    __nv_bfloat16 *output, int rows,
-                                                                    int inner, int columns) {
-    qwen35_tiled_compensated_projection_impl_bf16(input, weight, nullptr, output, rows, inner,
-                                                  columns);
+    const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows, int inner, int columns) {
+    qwen35_tiled_compensated_projection_impl_bf16(
+        input, weight, nullptr, output, rows, inner, columns);
 }
 
 extern "C" __global__ void qwen35_biased_tiled_compensated_projection_bf16(
     const __nv_bfloat16 *input, const __nv_bfloat16 *weight, const __nv_bfloat16 *bias,
     __nv_bfloat16 *output, int rows, int inner, int columns) {
-    qwen35_tiled_compensated_projection_impl_bf16(input, weight, bias, output, rows, inner,
-                                                  columns);
+    qwen35_tiled_compensated_projection_impl_bf16(
+        input, weight, bias, output, rows, inner, columns);
 }
 
 extern "C" __global__ void qwen35_guarded_double_projection_bf16(const __nv_bfloat16 *input,
-                                                                 const __nv_bfloat16 *weight,
-                                                                 __nv_bfloat16 *output, int inner,
-                                                                 int columns,
-                                                                 double radius_coefficient) {
+    const __nv_bfloat16 *weight, __nv_bfloat16 *output, int inner, int columns,
+    double radius_coefficient) {
     const int row = blockIdx.x;
     const int lane = threadIdx.x & 31;
     const int column = blockIdx.y * 8 + (threadIdx.x >> 5);
@@ -353,7 +329,6 @@ extern "C" __global__ void qwen35_guarded_double_projection_bf16(const __nv_bflo
     if (lane == 0 && !unsafe_warp && isfinite(absolute_sum) && absolute_sum > 0. &&
         absolute_sum <= double(FLT_MAX) * 0x1p-6 && isfinite(radius_coefficient) &&
         radius_coefficient > 0.) {
-
         const double radius = __dmul_ru(radius_coefficient, absolute_sum);
         const __nv_bfloat16 low =
             __float2bfloat16_rn(__double2float_rn(__dsub_rd(fast_sum, radius)));
@@ -375,18 +350,18 @@ extern "C" __global__ void qwen35_guarded_double_projection_bf16(const __nv_bflo
         const float updated = __fadd_rn(running, product);
         const float virtual_product = __fsub_rn(updated, running);
         const float error = __fadd_rn(__fsub_rn(running, __fsub_rn(updated, virtual_product)),
-                                      __fsub_rn(product, virtual_product));
+            __fsub_rn(product, virtual_product));
         correction = __fadd_rn(correction, error);
         running = updated;
         exceptional |= !isfinite(product) || !isfinite(running) || !isfinite(correction) ||
-                       (a != 0.f && b != 0.f && fabsf(product) < FLT_MIN);
+            (a != 0.f && b != 0.f && fabsf(product) < FLT_MIN);
     }
     double sum = __dadd_rn(double(running), double(correction));
     if (__any_sync(0xffffffff, exceptional)) {
         sum = 0.;
         for (int index = lane; index < inner; index += 32) {
             sum = __fma_rn(double(float(input[row * inner + index])),
-                           double(float(weight[column * inner + index])), sum);
+                double(float(weight[column * inner + index])), sum);
         }
     }
     for (int step = 16; step > 0; step >>= 1) {
@@ -399,10 +374,8 @@ extern "C" __global__ void qwen35_guarded_double_projection_bf16(const __nv_bflo
 
 template <int RowTiles>
 __device__ void qwen35_guarded_tensor_double_projection_impl_bf16(const __nv_bfloat16 *input,
-                                                                  const __nv_bfloat16 *weight,
-                                                                  __nv_bfloat16 *output, int rows,
-                                                                  int inner, int columns,
-                                                                  double radius_coefficient) {
+    const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows, int inner, int columns,
+    double radius_coefficient) {
     const int lane = threadIdx.x & 31;
     const int first_row = blockIdx.x * (8 * RowTiles);
     const int first_column = blockIdx.y * 32 + (threadIdx.x >> 5) * 8;
@@ -421,8 +394,8 @@ __device__ void qwen35_guarded_tensor_double_projection_impl_bf16(const __nv_bfl
             const float a = row < rows && k < inner ? float(input[row * inner + k]) : 0.f;
 
             unsafe[row_tile] |= !isfinite(a) || !isfinite(b) ||
-                                (a != 0.f && (fabsf(a) < 0x1p-60f || fabsf(a) > 0x1p60f)) ||
-                                (b != 0.f && (fabsf(b) < 0x1p-60f || fabsf(b) > 0x1p60f));
+                (a != 0.f && (fabsf(a) < 0x1p-60f || fabsf(a) > 0x1p60f)) ||
+                (b != 0.f && (fabsf(b) < 0x1p-60f || fabsf(b) > 0x1p60f));
             const double ad = double(a), aa = fabs(ad);
             asm volatile("mma.sync.aligned.m8n8k4.row.col.rn.f64.f64.f64.f64 "
                          "{%0, %1}, {%2}, {%3}, {%0, %1};"
@@ -484,18 +457,18 @@ __device__ void qwen35_guarded_tensor_double_projection_impl_bf16(const __nv_bfl
                 const float virtual_product = __fsub_rn(updated, running);
                 const float error =
                     __fadd_rn(__fsub_rn(running, __fsub_rn(updated, virtual_product)),
-                              __fsub_rn(product, virtual_product));
+                        __fsub_rn(product, virtual_product));
                 correction = __fadd_rn(correction, error);
                 running = updated;
                 exceptional |= !isfinite(product) || !isfinite(running) || !isfinite(correction) ||
-                               (a != 0.f && b != 0.f && fabsf(product) < FLT_MIN);
+                    (a != 0.f && b != 0.f && fabsf(product) < FLT_MIN);
             }
             double sum = __dadd_rn(double(running), double(correction));
             if (__any_sync(0xffffffff, exceptional)) {
                 sum = 0.;
                 for (int index = lane; index < inner; index += 32) {
                     sum = __fma_rn(double(float(input[row * inner + index])),
-                                   double(float(weight[column * inner + index])), sum);
+                        double(float(weight[column * inner + index])), sum);
                 }
             }
             for (int step = 16; step > 0; step >>= 1)
@@ -506,9 +479,9 @@ __device__ void qwen35_guarded_tensor_double_projection_impl_bf16(const __nv_bfl
     }
 }
 
-extern "C" __global__ void qwen35_guarded_tensor_double_projection_bf16(
-    const __nv_bfloat16 *input, const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows,
-    int inner, int columns, double radius_coefficient) {
+extern "C" __global__ void qwen35_guarded_tensor_double_projection_bf16(const __nv_bfloat16 *input,
+    const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows, int inner, int columns,
+    double radius_coefficient) {
     const int lane = threadIdx.x & 31;
     const int first_row = blockIdx.x * 8;
     const int first_column = blockIdx.y * 32 + (threadIdx.x >> 5) * 8;
@@ -523,8 +496,8 @@ extern "C" __global__ void qwen35_guarded_tensor_double_projection_bf16(
         const float b = column < columns && k < inner ? float(weight[column * inner + k]) : 0.f;
 
         unsafe |= !isfinite(a) || !isfinite(b) ||
-                  (a != 0.f && (fabsf(a) < 0x1p-60f || fabsf(a) > 0x1p60f)) ||
-                  (b != 0.f && (fabsf(b) < 0x1p-60f || fabsf(b) > 0x1p60f));
+            (a != 0.f && (fabsf(a) < 0x1p-60f || fabsf(a) > 0x1p60f)) ||
+            (b != 0.f && (fabsf(b) < 0x1p-60f || fabsf(b) > 0x1p60f));
         const double ad = double(a), bd = double(b);
         const double aa = fabs(ad), ab = fabs(bd);
         asm volatile("mma.sync.aligned.m8n8k4.row.col.rn.f64.f64.f64.f64 "
@@ -579,18 +552,18 @@ extern "C" __global__ void qwen35_guarded_tensor_double_projection_bf16(
             const float updated = __fadd_rn(running, product);
             const float virtual_product = __fsub_rn(updated, running);
             const float error = __fadd_rn(__fsub_rn(running, __fsub_rn(updated, virtual_product)),
-                                          __fsub_rn(product, virtual_product));
+                __fsub_rn(product, virtual_product));
             correction = __fadd_rn(correction, error);
             running = updated;
             exceptional |= !isfinite(product) || !isfinite(running) || !isfinite(correction) ||
-                           (a != 0.f && b != 0.f && fabsf(product) < FLT_MIN);
+                (a != 0.f && b != 0.f && fabsf(product) < FLT_MIN);
         }
         double sum = __dadd_rn(double(running), double(correction));
         if (__any_sync(0xffffffff, exceptional)) {
             sum = 0.;
             for (int index = lane; index < inner; index += 32) {
                 sum = __fma_rn(double(float(input[row * inner + index])),
-                               double(float(weight[column * inner + index])), sum);
+                    double(float(weight[column * inner + index])), sum);
             }
         }
         for (int step = 16; step > 0; step >>= 1)
@@ -603,6 +576,6 @@ extern "C" __global__ void qwen35_guarded_tensor_double_projection_bf16(
 extern "C" __global__ void qwen35_guarded_tensor_double_rows16_projection_bf16(
     const __nv_bfloat16 *input, const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows,
     int inner, int columns, double radius_coefficient) {
-    qwen35_guarded_tensor_double_projection_impl_bf16<2>(input, weight, output, rows, inner,
-                                                         columns, radius_coefficient);
+    qwen35_guarded_tensor_double_projection_impl_bf16<2>(
+        input, weight, output, rows, inner, columns, radius_coefficient);
 }

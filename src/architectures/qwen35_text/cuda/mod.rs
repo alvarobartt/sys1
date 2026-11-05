@@ -70,3 +70,8 @@ thread_local! {static DIRECT_MLP_CALLS:std::cell::Cell<usize>=const{std::cell::C
 pub(crate) fn is_hopper(device: &candle_core::CudaDevice) -> Result<bool> {
     Ok(device.cuda_stream().context().compute_capability().w()? == (9, 0))
 }
+
+#[cfg(test)]
+pub(super) fn test_cuda_device() -> Result<candle_core::Device> {
+    crate::device::load().map_err(|error| candle_core::Error::Msg(error.to_string()))
+}

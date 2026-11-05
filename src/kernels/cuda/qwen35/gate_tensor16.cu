@@ -1,9 +1,8 @@
 template <int TileRows>
-__device__ __forceinline__ void
-qwen35_gate_tensor16_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *weight,
-                        __nv_bfloat16 *output, int rows, int inner, int columns,
-                        const __nv_bfloat16 *bias = nullptr, const unsigned *tile_starts = nullptr,
-                        const unsigned *tile_ends = nullptr) {
+__device__ __forceinline__ void qwen35_gate_tensor16_impl(const __nv_bfloat16 *input,
+    const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows, int inner, int columns,
+    const __nv_bfloat16 *bias = nullptr, const unsigned *tile_starts = nullptr,
+    const unsigned *tile_ends = nullptr) {
     const int first_row = tile_starts ? int(tile_starts[blockIdx.x]) : int(blockIdx.x) * TileRows;
     if (tile_ends)
         rows = int(tile_ends[blockIdx.x]);
@@ -57,12 +56,12 @@ qwen35_gate_tensor16_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *weigh
             for (int group = 0; group < Groups; ++group) {
                 wmma::fill_fragment(c[group], 0.f);
             }
-            wmma::load_matrix_sync(b, tile_b + warp_column * 16 * SharedStride + offset,
-                                   SharedStride);
+            wmma::load_matrix_sync(
+                b, tile_b + warp_column * 16 * SharedStride + offset, SharedStride);
 #pragma unroll
             for (int group = 0; group < Groups; ++group) {
-                wmma::load_matrix_sync(
-                    a, tile_a + (group * WarpRows + warp_row * 16) * SharedStride + offset,
+                wmma::load_matrix_sync(a,
+                    tile_a + (group * WarpRows + warp_row * 16) * SharedStride + offset,
                     SharedStride);
                 wmma::mma_sync(c[group], a, b, c[group]);
             }
@@ -75,7 +74,7 @@ qwen35_gate_tensor16_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *weigh
                     const float virtual_partial = __fsub_rn(sum, running[group].x[i]);
                     const float error =
                         __fadd_rn(__fsub_rn(running[group].x[i], __fsub_rn(sum, virtual_partial)),
-                                  __fsub_rn(partial, virtual_partial));
+                            __fsub_rn(partial, virtual_partial));
                     correction[group].x[i] = __fadd_rn(correction[group].x[i], error);
                     running[group].x[i] = sum;
                 }
@@ -103,7 +102,7 @@ qwen35_gate_tensor16_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *weigh
                     double sum = 0.;
                     for (int k = 0; k < inner; ++k) {
                         sum = __fma_rn(double(float(input[row * inner + k])),
-                                       double(float(weight[column * inner + k])), sum);
+                            double(float(weight[column * inner + k])), sum);
                     }
                     value = __double2float_rn(sum);
                 }
@@ -123,7 +122,7 @@ qwen35_gate_tensor16_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *weigh
             double sum = 0.;
             for (int k = 0; k < inner; ++k) {
                 sum = __fma_rn(double(float(input[row * inner + k])),
-                               double(float(weight[column * inner + k])), sum);
+                    double(float(weight[column * inner + k])), sum);
             }
             float value = __double2float_rn(sum);
             if (bias != nullptr)
@@ -134,11 +133,9 @@ qwen35_gate_tensor16_impl(const __nv_bfloat16 *input, const __nv_bfloat16 *weigh
 #endif
 }
 
-
 extern "C" __global__ void qwen35_gate_tensor16_short_bf16(const __nv_bfloat16 *input,
-                                                         const __nv_bfloat16 *weight,
-                                                         __nv_bfloat16 *output, int rows, int inner,
-                                                         int columns, const unsigned *row_ids) {
+    const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows, int inner, int columns,
+    const unsigned *row_ids) {
     constexpr int RowTile = 4, ColumnTile = 2;
     const int lane = threadIdx.x & 31;
     const int first_row = blockIdx.x * RowTile;
@@ -166,7 +163,7 @@ extern "C" __global__ void qwen35_gate_tensor16_short_bf16(const __nv_bfloat16 *
                 const float virtual_product = __fsub_rn(updated, running[r][c]);
                 const float error =
                     __fadd_rn(__fsub_rn(running[r][c], __fsub_rn(updated, virtual_product)),
-                              __fsub_rn(product, virtual_product));
+                        __fsub_rn(product, virtual_product));
                 correction[r][c] = __fadd_rn(correction[r][c], error);
                 running[r][c] = updated;
 
@@ -184,13 +181,13 @@ extern "C" __global__ void qwen35_gate_tensor16_short_bf16(const __nv_bfloat16 *
             if (first_row + r >= rows || column >= columns)
                 continue;
             double sum = __dadd_rn(double(running[r][c]), double(correction[r][c]));
-            if (__any_sync(0xffffffff, (exceptional & (1u << (r * ColumnTile + c))) ||
-                                           !isfinite(running[r][c]) ||
-                                           !isfinite(correction[r][c]))) {
+            if (__any_sync(0xffffffff,
+                    (exceptional & (1u << (r * ColumnTile + c))) || !isfinite(running[r][c]) ||
+                        !isfinite(correction[r][c]))) {
                 sum = 0.;
                 for (int index = lane; index < inner; index += 32)
                     sum = __fma_rn(double(float(input[row * inner + index])),
-                                   double(float(weight[column * inner + index])), sum);
+                        double(float(weight[column * inner + index])), sum);
             }
 #pragma unroll
             for (int step = 16; step > 0; step >>= 1)

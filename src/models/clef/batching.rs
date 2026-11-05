@@ -439,10 +439,11 @@ mod tests {
             let k = Tensor::cat(&[&padded_k, &long_k], 0).unwrap();
             let v = Tensor::cat(&[&padded_v, &long_v], 0).unwrap();
 
-            let singleton =
-                crate::archs::qwen35_text::eager_attention(&short_q, &short_k, &short_v, 0.5, true)
-                    .unwrap();
-            let batched = crate::archs::qwen35_text::eager_attention(&q, &k, &v, 0.5, true)
+            let singleton = crate::architectures::qwen35_text::eager_attention(
+                &short_q, &short_k, &short_v, 0.5, true,
+            )
+            .unwrap();
+            let batched = crate::architectures::qwen35_text::eager_attention(&q, &k, &v, 0.5, true)
                 .unwrap()
                 .narrow(0, 0, 1)
                 .unwrap()

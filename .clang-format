@@ -1,7 +1,13 @@
 BasedOnStyle: LLVM
 IndentWidth: 4
+ContinuationIndentWidth: 4
+UseTab: Never
 ColumnLimit: 100
-SortIncludes: Never
+AlignAfterOpenBracket: DontAlign
+AlignOperands: DontAlign
+AlignEscapedNewlines: DontAlign
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
 BreakStringLiterals: false
-FixNamespaceComments: false
 ReflowComments: false
+SortIncludes: Never

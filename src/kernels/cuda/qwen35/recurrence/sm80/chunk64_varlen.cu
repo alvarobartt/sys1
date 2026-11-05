@@ -1,11 +1,10 @@
 __device__ __forceinline__ void qwen35_c64warp_scale_lower(float *, const float *);
 __device__ __forceinline__ void qwen35_c64warp_solve(float *, float *, const float *);
 template <int Mode>
-__device__ __forceinline__ void
-qwen35_c64v_gram(const float *query, const float *key, const float *beta, const float *prefix,
-               bool &key_unsafe, int physical_start, int begin, int length, int head, int heads,
-               int kh, int key_heads, __half *ahalf, __half *alow, __half *bhalf, __half *blow,
-               float *out) {
+__device__ __forceinline__ void qwen35_c64v_gram(const float *query, const float *key,
+    const float *beta, const float *prefix, bool &key_unsafe, int physical_start, int begin,
+    int length, int head, int heads, int kh, int key_heads, __half *ahalf, __half *alow,
+    __half *bhalf, __half *blow, float *out) {
     constexpr int C = 64, K = 128, P = 136;
     bool unsafe = Mode == 1 ? key_unsafe : false;
     for (int i = threadIdx.x; i < C * K; i += blockDim.x) {
@@ -21,7 +20,6 @@ qwen35_c64v_gram(const float *query, const float *key, const float *beta, const 
             bhalf[t * P + d] = b;
             blow[t * P + d] = __float2half_rn(__fmul_rn(__fsub_rn(kval, __half2float(b)), 4096.f));
         } else {
-
             lhs = token < length ? query[offset] : 0.f;
         }
         unsafe |= !(fabsf(lhs) <= 32768.f);
@@ -60,10 +58,9 @@ qwen35_c64v_gram(const float *query, const float *key, const float *beta, const 
             if (token < length && previous < length) {
                 for (int d = 0; d < K; ++d) {
                     const int offset = ((physical_start + token) * key_heads + kh) * K + d;
-                    const float lhs =
-                        Mode == 0
-                            ? __fmul_rn(key[offset], beta[(physical_start + token) * heads + head])
-                            : query[offset];
+                    const float lhs = Mode == 0
+                        ? __fmul_rn(key[offset], beta[(physical_start + token) * heads + head])
+                        : query[offset];
                     dot = __fmaf_rn(
                         lhs, key[((physical_start + previous) * key_heads + kh) * K + d], dot);
                 }
@@ -83,11 +80,10 @@ qwen35_c64v_gram(const float *query, const float *key, const float *beta, const 
     __syncthreads();
 }
 
-extern "C" __global__ __launch_bounds__(1024, 1) void qwen35_c64v_prepare_f32(
-    const float *query, const float *key, const float *value, const float *gate, const float *beta,
-    float *w, float *u, float *causal, float *decays, const unsigned int *cumulative,
-    const unsigned int *chunk_offsets, int sequence_count, int total_length, int heads,
-    int key_heads, int value_dim) {
+extern "C" __global__ __launch_bounds__(1024, 1) void qwen35_c64v_prepare_f32(const float *query,
+    const float *key, const float *value, const float *gate, const float *beta, float *w, float *u,
+    float *causal, float *decays, const unsigned int *cumulative, const unsigned int *chunk_offsets,
+    int sequence_count, int total_length, int heads, int key_heads, int value_dim) {
     constexpr int C = 64, K = 128, S = 129, P = 136;
     extern __shared__ __align__(32) unsigned char qwen35_c64v_storage[];
     auto *ahalf = reinterpret_cast<__half *>(qwen35_c64v_storage);
@@ -139,17 +135,17 @@ extern "C" __global__ __launch_bounds__(1024, 1) void qwen35_c64v_prepare_f32(
     }
     bool key_unsafe = false;
     qwen35_c64v_gram<0>(query, key, beta, prefix, key_unsafe, physical_start, begin, length, head,
-                      heads, kh, key_heads, ahalf, alow, bhalf, blow, lower);
+        heads, kh, key_heads, ahalf, alow, bhalf, blow, lower);
     qwen35_c64warp_scale_lower(lower, prefix);
     qwen35_c64v_gram<1>(query, key, beta, prefix, key_unsafe, physical_start, begin, length, head,
-                      heads, kh, key_heads, ahalf, alow, bhalf, blow, causal + instance * C * C);
+        heads, kh, key_heads, ahalf, alow, bhalf, blow, causal + instance * C * C);
     for (int i = threadIdx.x; i < C * K; i += blockDim.x) {
         const int t = i / K, d = i % K, token = begin + t;
         const float kval =
             token < length ? key[((physical_start + token) * key_heads + kh) * K + d] : 0.f;
         const float val = token < length && d < value_dim
-                              ? value[((physical_start + token) * heads + head) * value_dim + d]
-                              : 0.f;
+            ? value[((physical_start + token) * heads + head) * value_dim + d]
+            : 0.f;
         tile_w[t * S + d] = __fmul_rn(__fmul_rn(kval, betas[t]), expf(prefix[t]));
         tile_u[t * S + d] = __fmul_rn(val, betas[t]);
     }
@@ -169,11 +165,9 @@ extern "C" __global__ __launch_bounds__(1024, 1) void qwen35_c64v_prepare_f32(
 #include <math.h>
 
 extern "C" __global__ void qwen35_c64v_short_f32(const float *query, const float *key,
-                                               const float *value, const float *gate,
-                                               const float *beta, float *output,
-                                               const unsigned int *cu_seqlens,
-                                               const unsigned int *short_ids, int total_length,
-                                               int heads, int key_heads, int value_dim) {
+    const float *value, const float *gate, const float *beta, float *output,
+    const unsigned int *cu_seqlens, const unsigned int *short_ids, int total_length, int heads,
+    int key_heads, int value_dim) {
     const int batch_head = blockIdx.x;
     const int head = batch_head % heads;
     const int batch = short_ids[batch_head / heads];
