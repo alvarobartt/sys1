@@ -1,13 +1,13 @@
 [package]
 name = "sys1"
-version = "0.0.3"
+version = "0.1.0"
 edition = "2024"
-description = "Blazing fast structured decisions for System One open-models self-hosted with a TypeSafe AI compatible API, written in Rust."
+description = "Blazing fast, self-hosted structured decisions for open models with a TypeSafe AI compatible API, written in Rust."
 authors = ["Alvaro Bartolome <36760800+alvarobartt@users.noreply.github.com>"]
 default-run = "sys1"
 license = "Apache-2.0"
 repository = "https://github.com/alvarobartt/sys1"
-include = ["/src/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
+include = ["/src/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/licenses/**"]
 
 [dependencies]
 anyhow = "1"
@@ -17,13 +17,14 @@ candle-core = "0.11.0"
 candle-flash-attn = { version = "0.11.0", optional = true }
 candle-nn = "0.11.0"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+cudarc = { version = "=0.19.10", default-features = false, features = ["cublaslt"], optional = true }
 hf-hub = "1.0.0"
 half = { version = "2.7.1", optional = true }
 indicatif = "0.18.6"
 prometheus = "0.14.0"
 reqwest = { version = "0.13", features = ["blocking"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 tempfile = "3"
 tokenizers = "1.0.0-rc.2"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
@@ -31,6 +32,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 utoipa = { version = "5.5.0", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.190"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.11.0", features = ["accelerate"] }
@@ -40,18 +44,28 @@ dispatch2 = { version = "0.3.1", optional = true }
 objc2-metal = { version = "0.3.2", features = ["MTLDevice", "MTLLibrary", "dispatch2"], optional = true }
 
 [patch.crates-io]
+candle-core = { git = "https://github.com/huggingface/candle", rev = "e68b659fd096ed0947855d43b2eaa55634759c56" }
+candle-nn = { git = "https://github.com/huggingface/candle", rev = "e68b659fd096ed0947855d43b2eaa55634759c56" }
 candle-kernels = { git = "https://github.com/huggingface/candle", rev = "e68b659fd096ed0947855d43b2eaa55634759c56" }
+candle-flash-attn = { git = "https://github.com/huggingface/candle", rev = "e68b659fd096ed0947855d43b2eaa55634759c56" }
+candle-metal-kernels = { git = "https://github.com/huggingface/candle", rev = "e68b659fd096ed0947855d43b2eaa55634759c56" }
+
+[build-dependencies]
+reqwest = { version = "0.13", features = ["blocking"] }
+sha2 = { version = "0.10", optional = true }
+tempfile = "3"
+cudaforge = { version = "=0.1.6", optional = true }
 
 [dev-dependencies]
+sha2 = "0.10"
 insta = { version = "1.48.0", features = ["redactions", "yaml"] }
 tower = { version = "0.5", features = ["util"] }
 
 [features]
 default = ["cpu"]
 cpu = []
-cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:half"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:half", "dep:cudarc", "dep:candle-flash-attn", "dep:cudaforge", "dep:sha2"]
 cudnn = ["cuda", "candle-core/cudnn", "candle-nn/cudnn"]
-flash-attn-2 = ["cuda", "dep:candle-flash-attn"]
 metal = ["candle-core/metal", "candle-nn/metal", "dep:candle-metal-kernels", "dep:dispatch2", "dep:objc2-metal"]
 
 [profile.release]

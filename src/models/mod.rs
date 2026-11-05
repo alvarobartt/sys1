@@ -5,7 +5,7 @@ mod laya;
 use crate::schema::{ApiError, DecisionRequest, DecisionResponse};
 
 use anyhow::{Context, bail};
-use candle_core::DType;
+use candle_core::{DType, Device};
 use clap::ValueEnum;
 use serde::Deserialize;
 use std::{fs, path::Path};
@@ -21,6 +21,8 @@ pub enum AttentionImplementation {
     Eager,
     #[value(name = "flash-attn-2")]
     FlashAttention2,
+    #[value(name = "flash-attn-blackwell")]
+    FlashAttentionBlackwell,
 }
 
 impl AttentionImplementation {
@@ -29,6 +31,7 @@ impl AttentionImplementation {
             Self::Auto => "auto",
             Self::Eager => "eager",
             Self::FlashAttention2 => "flash-attn-2",
+            Self::FlashAttentionBlackwell => "flash-attn-blackwell",
         }
     }
 
@@ -37,18 +40,59 @@ impl AttentionImplementation {
         let enabled = match self {
             Self::Auto => return Ok(()),
             Self::Eager => return Ok(()),
-            Self::FlashAttention2 => cfg!(feature = "flash-attn-2"),
+            Self::FlashAttention2 | Self::FlashAttentionBlackwell => cfg!(feature = "cuda"),
         };
         anyhow::ensure!(
             enabled,
-            "--attention {name} requires a binary built with --features {name}"
+            "{name} attention requires a binary built with --features cuda"
         );
         anyhow::ensure!(
             matches!(dtype, DType::F16 | DType::BF16),
-            "--attention {name} requires --dtype f16 or --dtype bf16"
+            "{name} attention requires --dtype f16 or --dtype bf16"
         );
         Ok(())
     }
+}
+
+pub(crate) fn automatic_attention(
+    dtype: DType,
+    capability: Option<(i32, i32)>,
+) -> AttentionImplementation {
+    if !matches!(dtype, DType::F16 | DType::BF16) {
+        return AttentionImplementation::Eager;
+    }
+    #[cfg(feature = "cuda")]
+    if capability.is_some_and(|(major, _)| (8..=9).contains(&major)) {
+        return AttentionImplementation::FlashAttention2;
+    }
+    #[cfg(feature = "cuda")]
+    if capability == Some((12, 0)) {
+        return AttentionImplementation::FlashAttentionBlackwell;
+    }
+    let _ = capability;
+    AttentionImplementation::Eager
+}
+
+pub(crate) fn attention_for_device(
+    dtype: DType,
+    device: &Device,
+) -> anyhow::Result<AttentionImplementation> {
+    if device.is_metal() {
+        return Ok(AttentionImplementation::Auto);
+    }
+    let capability = None;
+    #[cfg(feature = "cuda")]
+    let capability = match device {
+        Device::Cuda(cuda) if matches!(dtype, DType::F16 | DType::BF16) => Some(
+            cuda.cuda_stream()
+                .context()
+                .compute_capability()
+                .context("Failed to query CUDA compute capability")?,
+        ),
+        _ => capability,
+    };
+    let _ = device;
+    Ok(automatic_attention(dtype, capability))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,6 +196,16 @@ pub trait DecisionModel: Send + Sync {
         &self,
         requests: Vec<DecisionRequest>,
     ) -> Vec<Result<DecisionResponse, ApiError>>;
+
+    fn predict_batch_incremental(
+        &self,
+        requests: Vec<DecisionRequest>,
+        complete: &mut dyn FnMut(usize, Result<DecisionResponse, ApiError>),
+    ) {
+        for (slot, response) in self.predict_batch(requests).into_iter().enumerate() {
+            complete(slot, response);
+        }
+    }
 }
 
 impl DecisionModel for Model {
@@ -170,6 +224,16 @@ impl DecisionModel for Model {
         match self {
             Self::Laya(model) => model.predict_batch(requests),
             Self::Clef(model) => model.predict_batch(requests),
+        }
+    }
+    fn predict_batch_incremental(
+        &self,
+        requests: Vec<DecisionRequest>,
+        complete: &mut dyn FnMut(usize, Result<DecisionResponse, ApiError>),
+    ) {
+        match self {
+            Self::Laya(model) => model.predict_batch_incremental(requests, complete),
+            Self::Clef(model) => model.predict_batch_incremental(requests, complete),
         }
     }
 }
@@ -202,6 +266,44 @@ pub fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_attention_handles_cpu_and_unsupported_cuda_devices() {
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            assert_eq!(
+                attention_for_device(dtype, &Device::Cpu).unwrap(),
+                AttentionImplementation::Eager
+            );
+            assert_eq!(
+                automatic_attention(dtype, Some((7, 5))),
+                AttentionImplementation::Eager
+            );
+            assert_eq!(
+                automatic_attention(dtype, Some((10, 0))),
+                AttentionImplementation::Eager
+            );
+        }
+        for capability in [(8, 0), (8, 6), (8, 9), (9, 0), (12, 0)] {
+            assert_eq!(
+                automatic_attention(DType::F32, Some(capability)),
+                AttentionImplementation::Eager
+            );
+        }
+        let supported = if cfg!(feature = "cuda") {
+            AttentionImplementation::FlashAttention2
+        } else {
+            AttentionImplementation::Eager
+        };
+        for capability in [(8, 0), (8, 6), (8, 9), (9, 0)] {
+            assert_eq!(automatic_attention(DType::F16, Some(capability)), supported);
+        }
+        let supported = if cfg!(feature = "cuda") {
+            AttentionImplementation::FlashAttentionBlackwell
+        } else {
+            AttentionImplementation::Eager
+        };
+        assert_eq!(automatic_attention(DType::BF16, Some((12, 0))), supported);
+    }
 
     #[test]
     fn identifies_qwen35_from_config_independent_of_repository_name() {

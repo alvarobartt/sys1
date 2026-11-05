@@ -22,11 +22,13 @@ driver_cuda="$({
 } || true)"
 
 version_number() {
+    # nvidia-smi reports the driver CUDA API major.minor, not the toolkit
+    # package's patch version. CUDA13.0 must not compare older than13.0.2.
+    # Keep minor differences: our embedded PTX can require a newer driver.
     local version="$1" major minor patch
     IFS=. read -r major minor patch <<<"${version}"
     minor="${minor:-0}"
-    patch="${patch:-0}"
-    printf '%d' "$((10#${major} * 10000 + 10#${minor} * 100 + 10#${patch}))"
+    printf '%d' "$((10#${major} * 100 + 10#${minor}))"
 }
 
 if [[ -d /usr/local/cuda/compat && -n "${driver_cuda}" ]]; then

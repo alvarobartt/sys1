@@ -1,4 +1,5 @@
 use super::qwen35_text::VisionConfig;
+use crate::kernels::linear::{forward_compatible, matmul_compatible};
 use crate::models::AttentionImplementation;
 use candle_core::{D, DType, Result, Tensor};
 use candle_nn::{LayerNorm, Linear, VarBuilder, layer_norm, ops::softmax_last_dim};
@@ -55,17 +56,10 @@ impl Block {
         })
     }
 
-    fn attention_fn(
-        &self,
-        x: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        lengths: &[usize],
-    ) -> Result<Tensor> {
+    fn attend(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, lengths: &[usize]) -> Result<Tensor> {
         let tokens = x.dim(0)?;
-        let parts = x
-            .apply(&self.qkv)?
-            .reshape((tokens, 3, self.heads, self.head_dim))?;
+        let parts =
+            forward_compatible(x, &self.qkv)?.reshape((tokens, 3, self.heads, self.head_dim))?;
         let rotate = |input: Tensor| -> Result<Tensor> {
             let half = self.head_dim / 2;
             let first = input.narrow(D::Minus1, 0, half)?;
@@ -80,7 +74,7 @@ impl Block {
         let v = parts.narrow(1, 2, 1)?.squeeze(1)?;
         let scale = (self.head_dim as f32).powf(-0.5);
         let attention = match self.attention {
-            AttentionImplementation::Eager => {
+            AttentionImplementation::Auto | AttentionImplementation::Eager => {
                 let mut offset = 0;
                 let mut outputs = Vec::with_capacity(lengths.len());
                 for &length in lengths {
@@ -105,16 +99,14 @@ impl Block {
                         offset += length;
                         continue;
                     }
-                    let scores = (qi
-                        .contiguous()?
-                        .matmul(&ki.transpose(D::Minus2, D::Minus1)?.contiguous()?)?
-                        * scale as f64)?;
+                    let scores = (matmul_compatible(
+                        &qi.contiguous()?,
+                        &ki.transpose(D::Minus2, D::Minus1)?.contiguous()?,
+                    )? * scale as f64)?;
                     let probs =
                         softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(x.dtype())?;
                     outputs.push(
-                        probs
-                            .contiguous()?
-                            .matmul(&vi.contiguous()?)?
+                        matmul_compatible(&probs.contiguous()?, &vi.contiguous()?)?
                             .squeeze(0)?
                             .transpose(0, 1)?,
                     );
@@ -122,7 +114,7 @@ impl Block {
                 }
                 Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 0)?
             }
-            #[cfg(feature = "flash-attn-2")]
+            #[cfg(feature = "cuda")]
             implementation => {
                 let mut cumulative = Vec::with_capacity(lengths.len() + 1);
                 cumulative.push(0u32);
@@ -132,9 +124,10 @@ impl Block {
                 let max_length = lengths.iter().copied().max().unwrap_or(0);
                 let cumulative = Tensor::from_vec(cumulative, lengths.len() + 1, x.device())?;
                 match implementation {
-                    #[cfg(feature = "flash-attn-2")]
-                    AttentionImplementation::FlashAttention2 => {
-                        candle_flash_attn::flash_attn_varlen(
+                    #[cfg(feature = "cuda")]
+                    AttentionImplementation::FlashAttention2
+                    | AttentionImplementation::FlashAttentionBlackwell => {
+                        crate::kernels::cuda::attention::flash_attn_varlen(
                             &q.contiguous()?,
                             &k.contiguous()?,
                             &v.contiguous()?,
@@ -152,22 +145,20 @@ impl Block {
                     ),
                 }
             }
-            #[cfg(not(feature = "flash-attn-2"))]
+            #[cfg(not(feature = "cuda"))]
             other => candle_core::bail!("{} support is not compiled in", other.cli_name()),
         };
-        attention
-            .reshape((tokens, self.heads * self.head_dim))?
-            .apply(&self.proj)
+        forward_compatible(
+            &attention.reshape((tokens, self.heads * self.head_dim))?,
+            &self.proj,
+        )
     }
 
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, lengths: &[usize]) -> Result<Tensor> {
-        let mixed = self.attention_fn(&x.apply(&self.norm1)?, cos, sin, lengths)?;
+        let mixed = self.attend(&x.apply(&self.norm1)?, cos, sin, lengths)?;
         let x = (x + mixed)?;
-        &x + x
-            .apply(&self.norm2)?
-            .apply(&self.fc1)?
-            .gelu()?
-            .apply(&self.fc2)?
+        let hidden = forward_compatible(&x.apply(&self.norm2)?, &self.fc1)?.gelu()?;
+        &x + forward_compatible(&hidden, &self.fc2)?
     }
 }
 
@@ -234,9 +225,8 @@ impl VisionTower {
         if patches.dim(1)? != patch_width {
             candle_core::bail!("vision patch width mismatch")
         }
-        let mut x = patches
-            .matmul(&self.patch_weight.t()?)?
-            .broadcast_add(&self.patch_bias)?;
+        let mut x =
+            matmul_compatible(patches, &self.patch_weight.t()?)?.broadcast_add(&self.patch_bias)?;
         let (position_indices, position_weights, rotary, lengths) = self.positions_for(grids)?;
         let mut position = Tensor::zeros((total, width), x.dtype(), x.device())?;
         for corner in 0..4 {
@@ -262,10 +252,8 @@ impl VisionTower {
             total / self.config.spatial_merge_size.pow(2),
             self.config.hidden_size * self.config.spatial_merge_size.pow(2),
         ))?;
-        merged
-            .apply(&self.merge_fc1)?
-            .gelu_erf()?
-            .apply(&self.merge_fc2)
+        let hidden = forward_compatible(&merged, &self.merge_fc1)?.gelu_erf()?;
+        forward_compatible(&hidden, &self.merge_fc2)
     }
 
     fn positions_for(&self, grids: &[[usize; 3]]) -> Result<PositionData> {

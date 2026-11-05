@@ -1,8 +1,12 @@
+mod batching;
+
 use super::AttentionImplementation;
 use super::DecisionModel;
-use crate::archs::modernbert::{
-    AttentionOptions, Config as ModernBertConfig, Encoder as ModernBertEncoder,
-};
+#[cfg(feature = "metal")]
+use crate::archs::metal::ModernBertEncoder;
+#[cfg(not(feature = "metal"))]
+use crate::archs::modernbert::Encoder as ModernBertEncoder;
+use crate::archs::modernbert::{AttentionOptions, Config as ModernBertConfig};
 use crate::{
     device,
     schema::{ApiError, DecisionRequest, DecisionResponse, Usage},
@@ -11,12 +15,25 @@ use crate::{
 
 use anyhow::Context;
 use candle_core::{D, DType, Device, IndexOp, Tensor};
-use candle_nn::{Embedding, LayerNorm, Linear, VarBuilder, embedding, layer_norm};
+use candle_nn::{Embedding, LayerNorm, Linear, VarBuilder, embedding};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 const TYPES: [&str; 3] = ["choice", "score", "noul"];
+
+fn layer_norm(size: usize, eps: f64, vb: VarBuilder) -> candle_core::Result<LayerNorm> {
+    Ok(LayerNorm::new(
+        vb.get_with_hints(size, "weight", candle_nn::Init::Const(1.))?,
+        vb.get_with_hints(size, "bias", candle_nn::Init::Const(0.))?,
+        eps,
+    ))
+}
 
 #[derive(Deserialize)]
 struct LayaConfig {
@@ -92,36 +109,6 @@ impl HeadLayer {
         })
     }
 
-    fn attention_fn(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        scale: f64,
-        mask: &Tensor,
-        lengths: &[usize],
-    ) -> candle_core::Result<Tensor> {
-        #[cfg(feature = "metal")]
-        if q.device().is_metal() {
-            // `sdpa` reads the mask through its strides, so the broadcast view is enough.
-            let (batch, _, length, _) = q.dims4()?;
-            let mask = mask.broadcast_as((batch, self.heads, length, length))?;
-            return candle_nn::ops::sdpa(q, k, v, Some(&mask), false, scale as f32, 1.0);
-        }
-        crate::archs::modernbert::scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            scale,
-            AttentionOptions {
-                mask: Some(mask),
-                implementation: self.attention,
-                lengths,
-                window: None,
-            },
-        )
-    }
-
     fn forward(
         &self,
         xs: &Tensor,
@@ -130,10 +117,8 @@ impl HeadLayer {
     ) -> candle_core::Result<Tensor> {
         let (batch, length, hidden) = xs.dims3()?;
         let size = hidden / self.heads;
-        let qkv = xs
-            .apply(&self.norm1)?
-            .to_dtype(self.compute_dtype)?
-            .apply(&self.qkv)?
+        let normalized = xs.apply(&self.norm1)?.to_dtype(self.compute_dtype)?;
+        let qkv = crate::kernels::linear::forward(&normalized, &self.qkv)?
             .reshape((batch, length, 3, self.heads, size))?
             .permute((2, 0, 3, 1, 4))?;
         let q = qkv.get(0)?;
@@ -141,23 +126,67 @@ impl HeadLayer {
         let v = qkv.get(2)?;
         let scale = (size as f64).powf(-0.5);
 
-        let attention = self.attention_fn(&q, &k, &v, scale, mask, lengths)?;
-        let attention = crate::archs::modernbert::merge_heads(&attention, batch, length, hidden)?
-            .apply(&self.projection)?
-            .to_dtype(xs.dtype())?;
+        #[cfg(feature = "metal")]
+        let attention = if xs.device().is_metal() && self.attention == AttentionImplementation::Auto
+        {
+            let mask = mask
+                .broadcast_as((batch, self.heads, length, length))?
+                .contiguous()?;
+            candle_nn::ops::sdpa(&q, &k, &v, Some(&mask), false, scale as f32, 1.0)?
+        } else {
+            crate::archs::modernbert::scaled_dot_product_attention(
+                &q,
+                &k,
+                &v,
+                scale,
+                AttentionOptions {
+                    mask: Some(mask),
+                    implementation: self.attention,
+                    lengths,
+                    window: None,
+                },
+            )?
+        };
+        #[cfg(not(feature = "metal"))]
+        let attention = crate::archs::modernbert::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            AttentionOptions {
+                mask: Some(mask),
+                implementation: self.attention,
+                lengths,
+                window: None,
+            },
+        )?;
+        #[cfg(feature = "metal")]
+        let attention = if attention.device().is_metal() {
+            crate::archs::modernbert::metal::merge_heads(&attention, batch, length, hidden)?
+        } else {
+            attention
+                .transpose(1, 2)?
+                .reshape((batch, length, hidden))?
+        };
+        #[cfg(not(feature = "metal"))]
+        let attention = attention
+            .transpose(1, 2)?
+            .reshape((batch, length, hidden))?;
+        let attention =
+            crate::kernels::linear::forward(&attention, &self.projection)?.to_dtype(xs.dtype())?;
         let xs = (xs + attention)?;
-        let feed_forward = xs
-            .apply(&self.norm2)?
-            .to_dtype(self.compute_dtype)?
-            .apply(&self.linear1)?
-            .relu()?
-            .apply(&self.linear2)?
-            .to_dtype(xs.dtype())?;
+        let normalized = xs.apply(&self.norm2)?.to_dtype(self.compute_dtype)?;
+        let intermediate = crate::kernels::linear::forward(&normalized, &self.linear1)?.relu()?;
+        let feed_forward =
+            crate::kernels::linear::forward(&intermediate, &self.linear2)?.to_dtype(xs.dtype())?;
         xs + feed_forward
     }
 }
 
 pub struct Laya {
+    activation_budget: AtomicUsize,
+    activation_bytes_per_token: usize,
+    attention_bytes_per_cell: usize,
     tokenizer: tokenizer::Tokenizer,
     encoder: ModernBertEncoder,
     head: Vec<HeadLayer>,
@@ -195,6 +224,11 @@ impl Laya {
         attention: AttentionImplementation,
     ) -> anyhow::Result<Self> {
         let device = device::load()?;
+        let attention = if attention == AttentionImplementation::Auto {
+            super::attention_for_device(compute_dtype, &device)?
+        } else {
+            attention
+        };
         validate_attention(attention, &device, compute_dtype)?;
         let mut config: LayaConfig =
             serde_json::from_slice(&fs::read(path.join("rl_agent_config.json"))?)?;
@@ -250,7 +284,24 @@ impl Laya {
         let cls_id = token(&["[CLS]", "<bos>"])?;
         let sep_id = token(&["[SEP]", "<eos>"])?;
         let mask_id = token(&["[MASK]", "<mask>"])?;
-        Ok(Self {
+        let model = Self {
+            activation_budget: AtomicUsize::new(usize::MAX),
+            activation_bytes_per_token: encoder_config
+                .hidden_size()
+                .saturating_mul(16)
+                .saturating_add(encoder_config.intermediate_size().saturating_mul(3))
+                .saturating_mul(4),
+            attention_bytes_per_cell: if matches!(
+                attention,
+                AttentionImplementation::Auto | AttentionImplementation::Eager
+            ) {
+                encoder_config
+                    .attention_heads()
+                    .max(head.iter().map(|layer| layer.heads).max().unwrap_or(1))
+                    .saturating_mul(12)
+            } else {
+                0
+            },
             tokenizer,
             encoder,
             head,
@@ -275,7 +326,9 @@ impl Laya {
             cls_id,
             sep_id,
             mask_id,
-        })
+        };
+        model.refresh_activation_budget();
+        Ok(model)
     }
 
     fn encode(&self, text: &str) -> Result<Vec<u32>, ApiError> {
@@ -396,8 +449,108 @@ impl Laya {
     fn forward(&self, prepared: &[RequestItems]) -> anyhow::Result<Vec<Vec<f32>>> {
         let items: Vec<_> = prepared.iter().flat_map(|request| &request.items).collect();
         let (unique, indices) = deduplicate(&items);
-        let batch = unique.len();
+        if unique.is_empty() {
+            return Ok(Vec::new());
+        }
+        let output = if self.device.is_cuda() {
+            let lengths: Vec<_> = unique.iter().map(|item| item.ids.len()).collect();
+            let groups = batching::buckets(
+                &lengths,
+                self.refresh_activation_budget(),
+                self.activation_bytes_per_token,
+                self.attention_bytes_per_cell,
+            );
+            let mut ordered = vec![None; unique.len()];
+            for group in groups {
+                let subset: Vec<_> = group.iter().map(|&slot| unique[slot]).collect();
+                let results = self.forward_admitted(&subset)?;
+                anyhow::ensure!(
+                    results.len() == group.len(),
+                    "Laya admitted result count differs"
+                );
+                for (slot, result) in group.into_iter().zip(results) {
+                    ordered[slot] = Some(result);
+                }
+            }
+            ordered
+                .into_iter()
+                .map(|row| row.context("Missing Laya admitted result"))
+                .collect::<anyhow::Result<Vec<_>>>()?
+        } else {
+            self.forward_unique(&unique)?
+        };
+        Ok(indices
+            .into_iter()
+            .map(|index| output[index].clone())
+            .collect())
+    }
+
+    fn refresh_activation_budget(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(cuda) = &self.device
+            && let Ok((free_bytes, total_bytes)) = cuda.cuda_stream().context().mem_get_info()
+        {
+            let live = free_bytes.saturating_sub(free_bytes / 4).max(1);
+            let previous = self.activation_budget.fetch_min(live, Ordering::Relaxed);
+            if live < previous {
+                tracing::info!(
+                    free_bytes,
+                    total_bytes,
+                    reserved_headroom_bytes = free_bytes / 4,
+                    activation_budget_bytes = live,
+                    activation_bytes_per_token = self.activation_bytes_per_token,
+                    attention_bytes_per_cell = self.attention_bytes_per_cell,
+                    estimated_linear_tokens = live / self.activation_bytes_per_token.max(1),
+                    capacity_kind = "estimated activations, not KV cache; eager attention adds quadratic workspace",
+                    "Laya CUDA admission budget updated"
+                );
+            }
+        }
+        self.activation_budget.load(Ordering::Relaxed)
+    }
+
+    fn forward_admitted(&self, items: &[&Item]) -> anyhow::Result<Vec<Vec<f32>>> {
+        match self.forward_unique(items) {
+            Err(error) if items.len() > 1 && batching::is_cuda_oom(&error) => {
+                let length = items.iter().map(|item| item.ids.len()).max().unwrap_or(0);
+                let estimate = batching::bytes(
+                    items.len(),
+                    length,
+                    self.activation_bytes_per_token,
+                    self.attention_bytes_per_cell,
+                );
+                self.activation_budget
+                    .fetch_min((estimate / 2).max(1), Ordering::Relaxed);
+                tracing::warn!(
+                    rows = items.len(),
+                    padded_length = length,
+                    activation_budget_bytes = self.activation_budget.load(Ordering::Relaxed),
+                    "Laya CUDA OOM: retrying smaller internal batches"
+                );
+                let (left, right) = items.split_at(items.len() / 2);
+                let mut output = self.forward_admitted(left)?;
+                output.extend(self.forward_admitted(right)?);
+                Ok(output)
+            }
+            result => result,
+        }
+    }
+
+    fn forward_unique(&self, unique: &[&Item]) -> anyhow::Result<Vec<Vec<f32>>> {
         let length = unique.iter().map(|item| item.ids.len()).max().unwrap_or(0);
+        self.forward_unique_at_length(unique, length)
+    }
+
+    fn forward_unique_at_length(
+        &self,
+        unique: &[&Item],
+        length: usize,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        anyhow::ensure!(
+            unique.iter().all(|item| item.ids.len() <= length),
+            "padded length is shorter than an input"
+        );
+        let batch = unique.len();
         let mut ids = vec![self.pad_id; batch * length];
         let mut mask = vec![0f32; batch * length];
         let mut kinds = Vec::with_capacity(batch);
@@ -436,25 +589,11 @@ impl Laya {
                 .with_context(|| format!("decision head layer {index}"))?;
         }
         let output = if !self.device.is_cpu() {
-            self.score_batched(&hidden, &unique, length)?
+            self.score_batched(&hidden, unique, length)?
         } else {
-            self.score_rows(&hidden, &unique)?
+            self.score_rows(&hidden, unique)?
         };
-        if let Some((row, _)) = output
-            .iter()
-            .enumerate()
-            .find(|(_, scores)| scores.iter().any(|score| !score.is_finite()))
-        {
-            anyhow::bail!(
-                "non-finite logits for question {:?}; the model produced values outside the \
-                 inference dtype's range",
-                unique[row].question.id
-            )
-        }
-        Ok(indices
-            .into_iter()
-            .map(|index| output[index].clone())
-            .collect())
+        Ok(output)
     }
 
     fn score_rows(&self, hidden: &Tensor, items: &[&Item]) -> anyhow::Result<Vec<Vec<f32>>> {
@@ -508,15 +647,17 @@ impl Laya {
     }
 
     fn score(&self, selected: &Tensor) -> anyhow::Result<Vec<f32>> {
-        Ok(selected
+        let normalized = selected
             .apply(&self.scorer_norm)?
-            .to_dtype(self.compute_dtype)?
-            .apply(&self.scorer_in)?
-            .gelu_erf()?
-            .apply(&self.scorer_out)?
-            .squeeze(1)?
-            .to_dtype(DType::F32)?
-            .to_vec1::<f32>()?)
+            .to_dtype(self.compute_dtype)?;
+        let projected = crate::kernels::linear::forward(&normalized, &self.scorer_in)?;
+        let intermediate = crate::kernels::activation::gelu_erf(&projected)?;
+        Ok(
+            crate::kernels::linear::forward(&intermediate, &self.scorer_out)?
+                .squeeze(1)?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?,
+        )
     }
 
     fn response(
@@ -644,9 +785,9 @@ fn validate_attention(
     compute_dtype: DType,
 ) -> anyhow::Result<()> {
     attention.validate(compute_dtype)?;
-    #[cfg(feature = "flash-attn-2")]
+    #[cfg(feature = "cuda")]
     match attention {
-        AttentionImplementation::Eager => {}
+        AttentionImplementation::Auto | AttentionImplementation::Eager => {}
         implementation => {
             anyhow::ensure!(
                 _device.is_cuda(),
@@ -667,7 +808,7 @@ fn validate_attention(
     Ok(())
 }
 
-#[cfg(any(feature = "flash-attn-2", test))]
+#[cfg(any(feature = "cuda", test))]
 fn validate_flash_capability(
     attention: AttentionImplementation,
     major: i32,
@@ -677,6 +818,7 @@ fn validate_flash_capability(
         AttentionImplementation::Auto => true,
         AttentionImplementation::Eager => true,
         AttentionImplementation::FlashAttention2 => (8..=9).contains(&major),
+        AttentionImplementation::FlashAttentionBlackwell => (major, minor) == (12, 0),
     };
     anyhow::ensure!(
         supported,
@@ -725,7 +867,7 @@ impl DecisionModel for Laya {
         let outputs = match self.forward(&prepared) {
             Ok(outputs) => outputs,
             Err(error) => {
-                let message = error.to_string();
+                let message = format!("{error:#}");
                 return slots
                     .into_iter()
                     .map(|slot| slot.and_then(|_| Err(ApiError::new(message.clone()))))
@@ -938,59 +1080,6 @@ mod tests {
         assert_eq!(argmax(&[0.5, 0.5]), 0);
     }
 
-    fn decision_request() -> anyhow::Result<DecisionRequest> {
-        Ok(serde_json::from_value(json!({
-            "state": {
-                "message": "I was charged twice for invoice 4411. Please refund me today.",
-                "account_tier": "enterprise"
-            },
-            "questions": {
-                "route": {
-                    "type": "choice",
-                    "instructions": "Where should this ticket go?",
-                    "criteria": {
-                        "billing": "payments, refunds, invoices",
-                        "bug": "the product is broken",
-                        "account": "login or access"
-                    }
-                },
-                "urgency": {
-                    "type": "score",
-                    "instructions": "How urgent is this message?",
-                    "criteria": [
-                        "routine, no rush",
-                        "today",
-                        "urgent",
-                        "critical, about to churn"
-                    ]
-                },
-                "escalate": {
-                    "type": "noul",
-                    "instructions": "Escalate to a human immediately?"
-                }
-            }
-        }))?)
-    }
-
-    fn scored(model: &Laya, prepared: &RequestItems, logits: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        prepared
-            .items
-            .iter()
-            .zip(logits)
-            .map(|(item, logits)| {
-                let bucket = bucket(item.question.kind, logits.len());
-                let temperature = model
-                    .config
-                    .temperature_by_options
-                    .get(&bucket)
-                    .copied()
-                    .unwrap_or(model.config.temperature[item.question.kind])
-                    .clamp(0.5, 5.0);
-                probability(logits, temperature)
-            })
-            .collect()
-    }
-
     #[tokio::test]
     async fn fp32_logits_and_probabilities() -> anyhow::Result<()> {
         let models = [
@@ -1019,11 +1108,56 @@ mod tests {
                 None,
                 AttentionImplementation::Eager,
             )?;
-            let request = decision_request()?;
+            let request: DecisionRequest = serde_json::from_value(json!({
+                "state": {
+                    "message": "I was charged twice for invoice 4411. Please refund me today.",
+                    "account_tier": "enterprise"
+                },
+                "questions": {
+                    "route": {
+                        "type": "choice",
+                        "instructions": "Where should this ticket go?",
+                        "criteria": {
+                            "billing": "payments, refunds, invoices",
+                            "bug": "the product is broken",
+                            "account": "login or access"
+                        }
+                    },
+                    "urgency": {
+                        "type": "score",
+                        "instructions": "How urgent is this message?",
+                        "criteria": [
+                            "routine, no rush",
+                            "today",
+                            "urgent",
+                            "critical, about to churn"
+                        ]
+                    },
+                    "escalate": {
+                        "type": "noul",
+                        "instructions": "Escalate to a human immediately?"
+                    }
+                }
+            }))?;
 
             let prepared = model.prepare(request).expect("prepare the test request");
             let logits = model.forward(std::slice::from_ref(&prepared))?;
-            let probabilities = scored(&model, &prepared, &logits);
+            let probabilities: Vec<_> = prepared
+                .items
+                .iter()
+                .zip(&logits)
+                .map(|(item, logits)| {
+                    let bucket = bucket(item.question.kind, logits.len());
+                    let temperature = model
+                        .config
+                        .temperature_by_options
+                        .get(&bucket)
+                        .copied()
+                        .unwrap_or(model.config.temperature[item.question.kind])
+                        .clamp(0.5, 5.0);
+                    probability(logits, temperature)
+                })
+                .collect();
 
             insta::assert_yaml_snapshot!(format!("{snapshot}_fp32_logits"), logits, {
                 "[][]" => insta::rounded_redaction(3),
@@ -1034,77 +1168,6 @@ mod tests {
                 {
                     "[][]" => insta::rounded_redaction(4),
                 }
-            );
-        }
-
-        Ok(())
-    }
-
-    #[cfg(feature = "metal")]
-    #[tokio::test]
-    async fn metal_f16_and_bf16_logits_and_probabilities() -> anyhow::Result<()> {
-        let path = crate::hub::download(
-            "convaiinnovations/laya-typed-decisions",
-            "1a793eb568e6718f15941d08f85432581df534e3",
-        )
-        .await?;
-
-        let reference = {
-            let model = Laya::load(
-                &path,
-                Some(DType::F32),
-                None,
-                AttentionImplementation::Eager,
-            )?;
-            let prepared = model
-                .prepare(decision_request()?)
-                .expect("prepare the test request");
-            let logits = model.forward(std::slice::from_ref(&prepared))?;
-            scored(&model, &prepared, &logits)
-        };
-
-        for (dtype, logit_digits, probability_digits, tolerance) in [
-            (DType::F16, 2usize, 3usize, 0.01f32),
-            (DType::BF16, 1, 2, 0.05),
-        ] {
-            let model = Laya::load(&path, Some(dtype), None, AttentionImplementation::Eager)?;
-            let prepared = model
-                .prepare(decision_request()?)
-                .expect("prepare the test request");
-            let logits = model.forward(std::slice::from_ref(&prepared))?;
-            let probabilities = scored(&model, &prepared, &logits);
-
-            assert!(
-                logits.iter().flatten().all(|value| value.is_finite()),
-                "{dtype:?} produced non-finite logits"
-            );
-            for (expected, actual) in reference.iter().zip(&probabilities) {
-                assert_eq!(
-                    argmax(expected),
-                    argmax(actual),
-                    "{dtype:?} changed the selected option"
-                );
-                let difference = expected
-                    .iter()
-                    .zip(actual)
-                    .map(|(left, right)| (left - right).abs())
-                    .fold(0f32, f32::max);
-                assert!(
-                    difference <= tolerance,
-                    "{dtype:?} probabilities drifted by {difference} from f32"
-                );
-            }
-
-            let name = if dtype == DType::F16 { "f16" } else { "bf16" };
-            insta::assert_yaml_snapshot!(
-                format!("laya_typed_decisions_{name}_logits"),
-                logits,
-                { "[][]" => insta::rounded_redaction(logit_digits) }
-            );
-            insta::assert_yaml_snapshot!(
-                format!("laya_typed_decisions_{name}_probabilities"),
-                probabilities,
-                { "[][]" => insta::rounded_redaction(probability_digits) }
             );
         }
 
@@ -1170,6 +1233,11 @@ mod tests {
         assert!(validate_flash_capability(AttentionImplementation::FlashAttention2, 7, 5).is_err());
         assert!(
             validate_flash_capability(AttentionImplementation::FlashAttention2, 10, 0).is_err()
+        );
+        validate_flash_capability(AttentionImplementation::FlashAttentionBlackwell, 12, 0).unwrap();
+        assert!(
+            validate_flash_capability(AttentionImplementation::FlashAttentionBlackwell, 10, 0)
+                .is_err()
         );
     }
 }

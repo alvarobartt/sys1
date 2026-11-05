@@ -1,27 +1,21 @@
+#[cfg(feature = "cuda")]
+mod cuda;
+#[cfg(feature = "cuda")]
+pub(crate) use cuda::compensated_bf16_projection;
+#[cfg(all(test, feature = "cuda"))]
+use cuda::fixed_bf16_projection;
+#[cfg(feature = "cuda")]
+use cuda::*;
+
+#[cfg(feature = "metal")]
+pub(crate) mod metal;
+
+use crate::kernels::activation::sigmoid;
 use crate::models::AttentionImplementation;
-use candle_core::{D, DType, Device, Result, Tensor};
-use candle_nn::{
-    Embedding, Linear, VarBuilder, embedding,
-    ops::{sigmoid, softmax},
-};
+use candle_core::{D, DType, Result, Tensor};
+use candle_nn::{Embedding, Linear as CandleLinear, VarBuilder, embedding, ops::softmax_last_dim};
 use serde::Deserialize;
-use std::{fs, path::Path};
-
-#[cfg(feature = "cuda")]
-use candle_core::{
-    CudaStorage, Storage,
-    backend::BackendStorage,
-    cuda_backend::{
-        WrapErr,
-        cudarc::driver::{LaunchConfig, PushKernelArg},
-    },
-    op::BackpropOp,
-};
-#[cfg(feature = "cuda")]
-use half::bf16;
-
-#[cfg(feature = "cuda")]
-const CUDA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/cuda.ptx"));
+use std::{fs, path::Path, sync::OnceLock, time::Instant};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -85,124 +79,65 @@ impl Config {
     }
 }
 
-/// Additive mask value for disallowed positions: finite, so a masked row cannot give `0/0`.
-#[cfg(feature = "metal")]
-const ATTENTION_MASK_VALUE: f64 = -10_000.0;
-
-struct Shared {
-    #[cfg(feature = "metal")]
-    causal: Option<Tensor>,
-    cos: Tensor,
-    sin: Tensor,
-}
-
-/// `divisors` holds `rope_theta.powf(..)` rather than its reciprocal, so the phase stays a
-/// division.
-struct RopeParams {
-    divisors: Vec<f32>,
-    axes: Vec<usize>,
-    rotary_dim: usize,
-}
-
-impl RopeParams {
-    fn new(config: &TextConfig) -> Result<Self> {
-        let rotary_dim =
-            (config.head_dim as f64 * config.rope_parameters.partial_rotary_factor) as usize;
-        if !rotary_dim.is_multiple_of(2) {
-            candle_core::bail!("Qwen3.5 rotary dimension must be even")
-        }
-        let section = config.rope_parameters.mrope_section;
-        if section.iter().sum::<usize>() != rotary_dim / 2 {
-            candle_core::bail!("Qwen3.5 mRoPE sections do not match the rotary dimension")
-        }
-        let half = rotary_dim / 2;
-        Ok(Self {
-            divisors: (0..half)
-                .map(|index| {
-                    config
-                        .rope_parameters
-                        .rope_theta
-                        .powf(2. * index as f64 / rotary_dim as f64) as f32
-                })
-                .collect(),
-            axes: (0..half)
-                .map(|index| {
-                    if index < section[1] * 3 && index % 3 == 1 {
-                        1
-                    } else if index < section[2] * 3 && index % 3 == 2 {
-                        2
-                    } else {
-                        0
-                    }
-                })
-                .collect(),
-            rotary_dim,
-        })
-    }
-
-    fn tables(
-        &self,
-        positions: &[[u32; 3]],
-        dtype: DType,
-        device: &Device,
-    ) -> Result<(Tensor, Tensor)> {
-        let half = self.rotary_dim / 2;
-        let length = positions.len();
-        let mut frequencies = Vec::with_capacity(length * half);
-        for position in positions {
-            for index in 0..half {
-                frequencies.push(position[self.axes[index]] as f32 / self.divisors[index]);
-            }
-        }
-        let phase = Tensor::from_vec(frequencies, (1, length, 1, half), device)?;
-        let cos = phase.cos()?;
-        let sin = phase.sin()?;
-        Ok((
-            Tensor::cat(&[&cos, &cos], D::Minus1)?.to_dtype(dtype)?,
-            Tensor::cat(&[&sin, &sin], D::Minus1)?.to_dtype(dtype)?,
-        ))
-    }
-}
-
-/// The f32 kernel stages `(BQ + BK) * head_dim` floats in threadgroup memory, which passes
-/// the 32 KB limit at head dimension 256; f16 and bf16 stage half as much.
-#[cfg(feature = "metal")]
-fn supports_metal_sdpa(dtype: DType, head_dim: usize) -> bool {
-    matches!(dtype, DType::F16 | DType::BF16) || head_dim <= 128
-}
-
 fn linear(input: usize, output: usize, vb: VarBuilder) -> Result<Linear> {
-    Ok(Linear::new(vb.get((output, input), "weight")?, None))
+    let result = Linear::new(vb.get((output, input), "weight")?, None);
+    Ok(result)
 }
 
 struct RmsNorm {
-    alpha: Tensor,
+    #[cfg(feature = "cuda")]
+    weight: Tensor,
+    scale: Tensor,
     eps: f64,
 }
 
 impl RmsNorm {
     fn load(width: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let weight = vb.get(width, "weight")?;
-        let alpha = (&weight.to_dtype(DType::F32)? + 1.)?;
-        Ok(Self { alpha, eps })
+        let scale = (&weight.to_dtype(DType::F32)? + 1.)?;
+        Ok(Self {
+            #[cfg(feature = "cuda")]
+            weight,
+            scale,
+            eps,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if x.device().is_cuda() && x.dtype() == DType::BF16 {
+            return cuda_rms_norm_delta(x, &self.weight, self.eps);
+        }
         let dtype = x.dtype();
         let x = x.to_dtype(DType::F32)?;
-        #[cfg(feature = "metal")]
-        if x.device().is_metal() && x.is_contiguous() {
-            return candle_nn::ops::rms_norm(&x, &self.alpha, self.eps as f32)?.to_dtype(dtype);
-        }
         let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
         let scale = (variance + self.eps)?.sqrt()?.recip()?;
         x.broadcast_mul(&scale)?
-            .broadcast_mul(&self.alpha)?
+            .broadcast_mul(&self.scale)?
             .to_dtype(dtype)
+    }
+
+    fn forward_residual(&self, x: &Tensor, mixed: &Tensor) -> Result<(Tensor, Tensor)> {
+        #[cfg(feature = "cuda")]
+        if x.device().is_cuda()
+            && x.dtype() == DType::BF16
+            && mixed.dtype() == DType::BF16
+            && self.weight.dtype() == DType::BF16
+            && x.dims() == mixed.dims()
+        {
+            return cuda_residual_rms_norm_delta(x, mixed, &self.weight, self.eps);
+        }
+        let residual = (x + mixed)?;
+        let normalized = self.forward(&residual)?;
+        Ok((residual, normalized))
     }
 }
 
 struct Mlp {
+    #[cfg(all(feature = "cuda", sys1_cuda_direct_ffn))]
+    direct_weight: Option<crate::kernels::cuda::sm86::fused_gate_up::Prepared>,
+    #[cfg(all(feature = "cuda", sys1_cuda_fused_ffn))]
+    fused_weight: std::sync::Arc<std::sync::Mutex<Option<Tensor>>>,
     gate: Linear,
     up: Linear,
     down: Linear,
@@ -210,37 +145,226 @@ struct Mlp {
 
 impl Mlp {
     fn load(config: &TextConfig, vb: VarBuilder) -> Result<Self> {
+        let gate = linear(
+            config.hidden_size,
+            config.intermediate_size,
+            vb.pp("gate_proj"),
+        )?;
+        let up = linear(
+            config.hidden_size,
+            config.intermediate_size,
+            vb.pp("up_proj"),
+        )?;
+        let down = linear(
+            config.intermediate_size,
+            config.hidden_size,
+            vb.pp("down_proj"),
+        )?;
+        #[cfg(all(feature = "cuda", sys1_cuda_direct_ffn))]
+        let direct_weight =
+            if crate::kernels::cuda::sm86::fused_gate_up::available(gate.weight(), up.weight()) {
+                Some(crate::kernels::cuda::sm86::fused_gate_up::prepare(
+                    gate.weight(),
+                    up.weight(),
+                )?)
+            } else {
+                None
+            };
         Ok(Self {
-            gate: linear(
-                config.hidden_size,
-                config.intermediate_size,
-                vb.pp("gate_proj"),
-            )?,
-            up: linear(
-                config.hidden_size,
-                config.intermediate_size,
-                vb.pp("up_proj"),
-            )?,
-            down: linear(
-                config.intermediate_size,
-                config.hidden_size,
-                vb.pp("down_proj"),
-            )?,
+            #[cfg(all(feature = "cuda", sys1_cuda_direct_ffn))]
+            direct_weight,
+            #[cfg(all(feature = "cuda", sys1_cuda_fused_ffn))]
+            fused_weight: Default::default(),
+            gate,
+            up,
+            down,
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = x.apply(&self.gate)?;
-        let up = x.apply(&self.up)?;
-        #[cfg(feature = "metal")]
-        if x.device().is_metal() {
-            return crate::kernels::metal::swiglu(&gate, &up)?.apply(&self.down);
+    fn forward(&self, x: &Tensor, capture_index: usize) -> Result<Tensor> {
+        let fused_product: Option<Tensor> = {
+            #[cfg(all(feature = "cuda", sys1_cuda_fused_ffn))]
+            {
+                let rows = x.elem_count() / x.dim(D::Minus1)?.max(1);
+                if x.device().is_cuda() && x.dtype() == DType::BF16 && (512..=32768).contains(&rows)
+                {
+                    if let Some(weight) = self.cached_fused()? {
+                        let result = crate::kernels::cuda::fused_gate_up::forward(
+                            x,
+                            &weight,
+                            crate::numerics::enabled(),
+                        )?;
+                        #[cfg(test)]
+                        FUSED_MLP_CALLS.with(|slot| slot.set(slot.get() + 1));
+                        if let Some((gate, up)) = result.projections {
+                            crate::numerics::layer_capture(
+                                capture_index,
+                                "mlp-gate-projected",
+                                &gate,
+                            )?;
+                            crate::numerics::layer_capture(capture_index, "mlp-up-projected", &up)?;
+                            crate::numerics::layer_capture(
+                                capture_index,
+                                "mlp-gate-activated",
+                                &crate::kernels::activation::silu(&gate)?,
+                            )?;
+                        }
+                        profiling::mark(x.device(), capture_index, "mlp_fused_gate_up_product")?;
+                        Some(result.product)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(all(feature = "cuda", sys1_cuda_fused_ffn)))]
+            {
+                None
+            }
+        };
+        #[cfg(all(feature = "cuda", sys1_cuda_direct_ffn))]
+        let fused_product = match fused_product {
+            Some(product) => Some(product),
+            None => self.direct_product(x, capture_index)?,
+        };
+        let product = if let Some(product) = fused_product {
+            product
+        } else if x.device().is_cuda() && x.dtype() == DType::BF16 {
+            let gate = linear_attention_projection_forward(x, &self.gate)?;
+            #[cfg(feature = "cuda")]
+            profiling::mark(x.device(), capture_index, "mlp_gate_projection")?;
+            crate::numerics::layer_capture(capture_index, "mlp-gate-projected", &gate)?;
+
+            if crate::numerics::enabled() {
+                let activated = crate::kernels::activation::silu(&gate)?;
+                crate::numerics::layer_capture(capture_index, "mlp-gate-activated", &activated)?;
+            }
+            let up = linear_attention_projection_forward(x, &self.up)?;
+            #[cfg(feature = "cuda")]
+            profiling::mark(x.device(), capture_index, "mlp_up_projection")?;
+            crate::numerics::layer_capture(capture_index, "mlp-up-projected", &up)?;
+            crate::kernels::activation::mul_silu(&gate, &up)?
+        } else {
+            let activated = {
+                let gate = linear_attention_projection_forward(x, &self.gate)?;
+                crate::numerics::layer_capture(capture_index, "mlp-gate-projected", &gate)?;
+                let activated = crate::kernels::activation::silu(&gate)?;
+                crate::numerics::layer_capture(capture_index, "mlp-gate-activated", &activated)?;
+                activated
+            };
+            let up = linear_attention_projection_forward(x, &self.up)?;
+            crate::numerics::layer_capture(capture_index, "mlp-up-projected", &up)?;
+            (activated * up)?
+        };
+        #[cfg(feature = "cuda")]
+        profiling::mark(x.device(), capture_index, "mlp_activation_product")?;
+        crate::numerics::layer_capture(capture_index, "mlp-product", &product)?;
+
+        #[cfg(feature = "cuda")]
+        if product.device().is_cuda() && product.dtype() == DType::BF16 {
+            #[cfg(feature = "cuda")]
+            if let Some(output) = try_nn_projection(&product, &self.down)? {
+                profiling::mark(x.device(), capture_index, "mlp_down_projection")?;
+                return Ok(output);
+            }
+            let output = cuda_bf16_projection(&product, &self.down, false)?;
+            profiling::mark(x.device(), capture_index, "mlp_down_projection")?;
+            return Ok(output);
         }
-        (gate.silu()? * up)?.apply(&self.down)
+        crate::kernels::linear::forward_compatible(&product, &self.down)
+    }
+}
+
+struct Rotary {
+    dimension: usize,
+    divisors: Vec<f32>,
+    sections: [usize; 3],
+}
+
+struct RotaryTensors {
+    dimension: usize,
+    cos: Tensor,
+    sin: Tensor,
+}
+
+impl Rotary {
+    fn new(dimension: usize, theta: f64, sections: [usize; 3]) -> Result<Self> {
+        if !dimension.is_multiple_of(2) || sections.iter().sum::<usize>() != dimension / 2 {
+            candle_core::bail!("Qwen3.5 mRoPE sections do not match an even rotary dimension")
+        }
+        Ok(Self {
+            dimension,
+            divisors: (0..dimension / 2)
+                .map(|index| theta.powf(2. * index as f64 / dimension as f64) as f32)
+                .collect(),
+            sections,
+        })
+    }
+
+    fn prepare(
+        &self,
+        positions: &[[u32; 3]],
+        dtype: DType,
+        device: &candle_core::Device,
+    ) -> Result<RotaryTensors> {
+        let frequencies = positions
+            .iter()
+            .flat_map(|position| {
+                self.divisors
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, divisor)| {
+                        let axis = if index < self.sections[1] * 3 && index % 3 == 1 {
+                            1
+                        } else if index < self.sections[2] * 3 && index % 3 == 2 {
+                            2
+                        } else {
+                            0
+                        };
+                        position[axis] as f32 / divisor
+                    })
+            })
+            .collect::<Vec<_>>();
+        let phase = Tensor::from_vec(
+            frequencies,
+            (1, positions.len(), 1, self.dimension / 2),
+            device,
+        )?;
+        let cos = phase.cos()?;
+        let sin = phase.sin()?;
+        Ok(RotaryTensors {
+            dimension: self.dimension,
+            cos: Tensor::cat(&[&cos, &cos], D::Minus1)?.to_dtype(dtype)?,
+            sin: Tensor::cat(&[&sin, &sin], D::Minus1)?.to_dtype(dtype)?,
+        })
+    }
+}
+
+impl RotaryTensors {
+    fn apply(&self, x: &Tensor) -> Result<Tensor> {
+        let (_, length, _, width) = x.dims4()?;
+        if length != self.cos.dim(1)? || width < self.dimension {
+            candle_core::bail!("Qwen3.5 rotary tensor shape does not match attention input")
+        }
+        let active = x.narrow(D::Minus1, 0, self.dimension)?;
+        let first = active.narrow(D::Minus1, 0, self.dimension / 2)?;
+        let second = active.narrow(D::Minus1, self.dimension / 2, self.dimension / 2)?;
+        let rotated = Tensor::cat(&[&second.neg()?, &first], D::Minus1)?;
+        let active = (active.broadcast_mul(&self.cos)? + rotated.broadcast_mul(&self.sin)?)?;
+        Tensor::cat(
+            &[
+                &active,
+                &x.narrow(D::Minus1, self.dimension, width - self.dimension)?,
+            ],
+            D::Minus1,
+        )
     }
 }
 
 struct FullAttention {
+    #[cfg(feature = "cuda")]
+    merged_qkv: Option<Linear>,
     q: Linear,
     k: Linear,
     v: Linear,
@@ -250,11 +374,160 @@ struct FullAttention {
     heads: usize,
     kv_heads: usize,
     head_dim: usize,
-    rotary_dim: usize,
+    rotary: Rotary,
     implementation: AttentionImplementation,
 }
 
+fn full_attention_kv_forward(input: &Tensor, linear: &Linear) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if let Some(output) = try_nn_projection(input, linear)? {
+        return Ok(output);
+    }
+
+    #[cfg(feature = "cuda")]
+    if input.device().is_cuda() && input.dtype() == DType::BF16 {
+        return cuda_bf16_projection(input, linear, false);
+    }
+    crate::kernels::linear::forward_compatible(input, linear)
+}
+
+fn linear_attention_projection_forward(input: &Tensor, linear: &Linear) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if let Some(output) = try_nn_projection(input, linear)? {
+        return Ok(output);
+    }
+
+    #[cfg(feature = "cuda")]
+    if input.device().is_cuda() && input.dtype() == DType::BF16 {
+        return cuda_bf16_projection(input, linear, false);
+    }
+    crate::kernels::linear::forward_compatible(input, linear)
+}
+
 impl FullAttention {
+    fn project_finish(
+        &self,
+        x: &Tensor,
+        rotary: &RotaryTensors,
+        capture_index: usize,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let (batch, length, _) = x.dims3()?;
+        #[cfg(feature = "cuda")]
+        if matches!(
+            option_env!("SYS1_CUDA_COMPUTE_CAP"),
+            Some("80" | "90" | "120")
+        ) && x.device().is_cuda()
+            && x.dtype() == DType::BF16
+            && self.q_norm.weight.dtype() == DType::BF16
+            && self.k_norm.weight.dtype() == DType::BF16
+            && (32..=1024).contains(&self.head_dim)
+            && rotary.dimension <= self.head_dim
+            && rotary.dimension.is_multiple_of(2)
+            && rotary.cos.dtype() == DType::BF16
+            && rotary.sin.dtype() == DType::BF16
+        {
+            if let Some(merged) = &self.merged_qkv
+                && (16_384..=65_536).contains(&x.elem_count().checked_div(x.dim(2)?).unwrap_or(0))
+            {
+                let projected = crate::kernels::cuda::blaslt::project_unblocked(x, merged)?;
+                #[cfg(test)]
+                FULL_QKV_MERGED_SELECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                if crate::numerics::enabled()
+                    && capture_index < 4
+                    && std::env::var_os("SYS1_NUMERICS_INPUTS_ONLY").is_none()
+                {
+                    let q_columns = 2 * self.heads * self.head_dim;
+                    crate::numerics::layer_capture(
+                        capture_index,
+                        "full-qg-projected",
+                        &projected.narrow(2, 0, q_columns)?,
+                    )?;
+                    crate::numerics::layer_capture(
+                        capture_index,
+                        "full-k-projected",
+                        &projected.narrow(2, q_columns, self.kv_heads * self.head_dim)?,
+                    )?;
+                }
+                let (q, k, v, gate) = cuda_full_qkv_finish(
+                    &projected,
+                    None,
+                    (&self.q_norm.weight, &self.k_norm.weight),
+                    rotary,
+                    self.heads,
+                    self.kv_heads,
+                    self.q_norm.eps,
+                )?;
+                crate::numerics::layer_capture(capture_index, "full-q", &q)?;
+                crate::numerics::layer_capture(capture_index, "full-k", &k)?;
+                crate::numerics::layer_capture(capture_index, "full-v", &v)?;
+                crate::numerics::layer_capture(capture_index, "full-gate", &gate)?;
+                return Ok((q, k, v, gate));
+            }
+
+            let qg = linear_attention_projection_forward(x, &self.q)?;
+            let k = full_attention_kv_forward(x, &self.k)?;
+            let v = full_attention_kv_forward(x, &self.v)?;
+            crate::numerics::layer_capture(
+                capture_index,
+                "full-qg-projected",
+                &qg.reshape((batch, length, self.heads, 2, self.head_dim))?,
+            )?;
+            crate::numerics::layer_capture(
+                capture_index,
+                "full-k-projected",
+                &k.reshape((batch, length, self.kv_heads, self.head_dim))?,
+            )?;
+            let (q, k, v, gate) = cuda_full_qkv_finish(
+                &qg,
+                Some((&k, &v)),
+                (&self.q_norm.weight, &self.k_norm.weight),
+                rotary,
+                self.heads,
+                self.kv_heads,
+                self.q_norm.eps,
+            )?;
+            crate::numerics::layer_capture(capture_index, "full-q", &q)?;
+            crate::numerics::layer_capture(capture_index, "full-k", &k)?;
+            crate::numerics::layer_capture(capture_index, "full-v", &v)?;
+            crate::numerics::layer_capture(capture_index, "full-gate", &gate)?;
+            return Ok((q, k, v, gate));
+        }
+        let qg = linear_attention_projection_forward(x, &self.q)?.reshape((
+            batch,
+            length,
+            self.heads,
+            2,
+            self.head_dim,
+        ))?;
+        crate::numerics::layer_capture(capture_index, "full-qg-projected", &qg)?;
+        let q = full_attention_norm_rotary(&qg.narrow(3, 0, 1)?.squeeze(3)?, &self.q_norm, rotary)?;
+        let gate = sigmoid(&qg.narrow(3, 1, 1)?.squeeze(3)?.reshape((
+            batch,
+            length,
+            self.heads * self.head_dim,
+        ))?)?;
+        let k_projected = full_attention_kv_forward(x, &self.k)?.reshape((
+            batch,
+            length,
+            self.kv_heads,
+            self.head_dim,
+        ))?;
+        crate::numerics::layer_capture(capture_index, "full-k-projected", &k_projected)?;
+        let k = full_attention_norm_rotary(&k_projected, &self.k_norm, rotary)?;
+        let v = full_attention_kv_forward(x, &self.v)?.reshape((
+            batch,
+            length,
+            self.kv_heads,
+            self.head_dim,
+        ))?;
+        crate::numerics::layer_capture(capture_index, "full-q", &q)?;
+        crate::numerics::layer_capture(capture_index, "full-k", &k)?;
+        crate::numerics::layer_capture(capture_index, "full-v", &v)?;
+        crate::numerics::layer_capture(capture_index, "full-gate", &gate)?;
+        Ok((q, k, v, gate))
+    }
+
     fn load(
         config: &TextConfig,
         vb: VarBuilder,
@@ -262,22 +535,60 @@ impl FullAttention {
     ) -> Result<Self> {
         let rotary_dim =
             (config.head_dim as f64 * config.rope_parameters.partial_rotary_factor) as usize;
+        let rotary = Rotary::new(
+            rotary_dim,
+            config.rope_parameters.rope_theta,
+            config.rope_parameters.mrope_section,
+        )?;
+        let q = linear(
+            config.hidden_size,
+            config.num_attention_heads * config.head_dim * 2,
+            vb.pp("q_proj"),
+        )?;
+        let k = linear(
+            config.hidden_size,
+            config.num_key_value_heads * config.head_dim,
+            vb.pp("k_proj"),
+        )?;
+        let v = linear(
+            config.hidden_size,
+            config.num_key_value_heads * config.head_dim,
+            vb.pp("v_proj"),
+        )?;
+        #[cfg(feature = "cuda")]
+        let (q, k, v, merged_qkv) = {
+            let geometry = config.hidden_size == 4096
+                && config.num_attention_heads == 16
+                && config.num_key_value_heads == 4
+                && config.head_dim == 256
+                && rotary_dim == 64
+                && q.weight().dtype() == DType::BF16
+                && q.bias().is_none()
+                && k.bias().is_none()
+                && v.bias().is_none();
+            let hopper = match q.weight().device() {
+                candle_core::Device::Cuda(device) => geometry && is_hopper(device)?,
+                _ => false,
+            };
+            if hopper {
+                let q_columns = q.weight().dim(0)?;
+                let k_columns = k.weight().dim(0)?;
+                let v_columns = v.weight().dim(0)?;
+                let packed = Tensor::cat(&[q.weight(), k.weight(), v.weight()], 0)?;
+                let q = Linear::new(packed.narrow(0, 0, q_columns)?, None);
+                let k = Linear::new(packed.narrow(0, q_columns, k_columns)?, None);
+                let v = Linear::new(packed.narrow(0, q_columns + k_columns, v_columns)?, None);
+                (q, k, v, Some(Linear::new(packed, None)))
+            } else {
+                (q, k, v, None)
+            }
+        };
         Ok(Self {
-            q: linear(
-                config.hidden_size,
-                config.num_attention_heads * config.head_dim * 2,
-                vb.pp("q_proj"),
-            )?,
-            k: linear(
-                config.hidden_size,
-                config.num_key_value_heads * config.head_dim,
-                vb.pp("k_proj"),
-            )?,
-            v: linear(
-                config.hidden_size,
-                config.num_key_value_heads * config.head_dim,
-                vb.pp("v_proj"),
-            )?,
+            #[cfg(feature = "cuda")]
+            merged_qkv,
+            q,
+            k,
+            v,
             output: linear(
                 config.num_attention_heads * config.head_dim,
                 config.hidden_size,
@@ -288,140 +599,173 @@ impl FullAttention {
             heads: config.num_attention_heads,
             kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
-            rotary_dim,
+            rotary,
             implementation,
         })
     }
 
-    fn rotary(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let half = self.rotary_dim / 2;
-        let active = x.narrow(D::Minus1, 0, self.rotary_dim)?;
-        let first = active.narrow(D::Minus1, 0, half)?;
-        let second = active.narrow(D::Minus1, half, half)?;
-        let rotated = Tensor::cat(&[&second.neg()?, &first], D::Minus1)?;
-        let active = (active.broadcast_mul(cos)? + rotated.broadcast_mul(sin)?)?;
-        Tensor::cat(
-            &[
-                &active,
-                &x.narrow(D::Minus1, self.rotary_dim, self.head_dim - self.rotary_dim)?,
-            ],
-            D::Minus1,
-        )
-    }
-
-    fn forward(&self, x: &Tensor, shared: &Shared) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, rotary: &RotaryTensors, capture_index: usize) -> Result<Tensor> {
         let (batch, length, _) = x.dims3()?;
-        let qg = x
-            .apply(&self.q)?
-            .reshape((batch, length, self.heads, 2, self.head_dim))?;
-        let q = self.rotary(
-            &self.q_norm.forward(&qg.narrow(3, 0, 1)?.squeeze(3)?)?,
-            &shared.cos,
-            &shared.sin,
-        )?;
-        let gate = sigmoid(&qg.narrow(3, 1, 1)?.squeeze(3)?.reshape((
-            batch,
-            length,
-            self.heads * self.head_dim,
-        ))?)?;
-        let k = self.rotary(
-            &self.k_norm.forward(&x.apply(&self.k)?.reshape((
-                batch,
-                length,
-                self.kv_heads,
-                self.head_dim,
-            ))?)?,
-            &shared.cos,
-            &shared.sin,
-        )?;
-        let v = x
-            .apply(&self.v)?
-            .reshape((batch, length, self.kv_heads, self.head_dim))?;
+        let (q, k, v, gate) = self.project_finish(x, rotary, capture_index)?;
         let scale = (self.head_dim as f32).powf(-0.5);
         #[cfg(feature = "metal")]
-        if x.device().is_metal() && supports_metal_sdpa(x.dtype(), self.head_dim) {
-            // An explicit additive mask, not `do_causal`: candle's in-kernel causal path
-            // returns non-finite values for f16 and bf16 at head dimensions of 128 or more.
-            let mask = shared
-                .causal
-                .as_ref()
-                .ok_or_else(|| candle_core::Error::Msg("missing Qwen3.5 causal mask".into()))?
-                .broadcast_as((batch, self.heads, length, length))?;
+        if x.device().is_metal()
+            && x.dtype() != DType::BF16
+            && self.implementation != AttentionImplementation::Eager
+        {
             let attention = candle_nn::ops::sdpa(
                 &q.transpose(1, 2)?.contiguous()?,
                 &k.transpose(1, 2)?.contiguous()?,
                 &v.transpose(1, 2)?.contiguous()?,
-                Some(&mask),
-                false,
+                None,
+                true,
                 scale,
                 1.0,
             )?
             .transpose(1, 2)?;
-            let gated = (attention.reshape((batch, length, self.heads * self.head_dim))? * gate)?;
+            crate::numerics::layer_capture(capture_index, "full-attention", &attention)?;
+            let gated = full_attention_gate_mul(
+                &attention,
+                &gate,
+                batch,
+                length,
+                self.heads * self.head_dim,
+            )?;
+            crate::numerics::layer_capture(capture_index, "full-gated", &gated)?;
             return gated.apply(&self.output);
         }
-        let attention = match self.implementation {
-            AttentionImplementation::Eager => {
-                let repeat = self.heads / self.kv_heads;
-                let repeat_kv = |xs: &Tensor| -> Result<Tensor> {
-                    xs.unsqueeze(3)?
-                        .broadcast_as((batch, length, self.kv_heads, repeat, self.head_dim))?
-                        .reshape((batch, length, self.heads, self.head_dim))?
-                        .transpose(1, 2)
-                };
-                let q = q.transpose(1, 2)?;
-                let k = repeat_kv(&k)?.transpose(D::Minus2, D::Minus1)?;
-                let v = repeat_kv(&v)?;
-                let mut chunks = Vec::with_capacity(length.div_ceil(128));
-                for start in (0..length).step_by(128) {
-                    let count = (length - start).min(128);
-                    let mask = Tensor::from_vec(
-                        (start..start + count)
-                            .flat_map(|row| {
-                                (0..length)
-                                    .map(move |col| if col > row { f32::NEG_INFINITY } else { 0. })
-                            })
-                            .collect::<Vec<_>>(),
-                        (1, 1, count, length),
-                        x.device(),
-                    )?
-                    .to_dtype(x.dtype())?;
-                    let scores = (contiguous_matmul(&q.narrow(2, start, count)?, &k)?
-                        * scale as f64)?
-                        .broadcast_add(&mask)?;
-                    let probs =
-                        softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(x.dtype())?;
-                    chunks.push(contiguous_matmul(&probs, &v)?);
-                }
-                Tensor::cat(&chunks.iter().collect::<Vec<_>>(), 2)?.transpose(1, 2)?
-            }
-            #[cfg(feature = "flash-attn-2")]
-            AttentionImplementation::FlashAttention2 => candle_flash_attn::flash_attn(
+        let attention = attention_forward(&q, &k, &v, scale, true, self.implementation)?;
+        crate::numerics::layer_capture(capture_index, "full-attention", &attention)?;
+        #[cfg(feature = "cuda")]
+        if crate::numerics::full_attention_reference_enabled(capture_index) {
+            let reference = crate::kernels::cuda::attention::ordinary_reference(
+                &q.to_dtype(DType::F32)?,
+                &k.to_dtype(DType::F32)?,
+                &v.to_dtype(DType::F32)?,
+                scale,
+                true,
+            )?;
+            let ordinary =
+                crate::kernels::cuda::attention::ordinary_reference(&q, &k, &v, scale, true)?;
+            crate::numerics::layer_capture(capture_index, "full-reference-f32", &reference)?;
+            crate::numerics::layer_capture(capture_index, "full-reference-ordinary", &ordinary)?;
+        }
+        let gated =
+            full_attention_gate_mul(&attention, &gate, batch, length, self.heads * self.head_dim)?;
+        crate::numerics::layer_capture(capture_index, "full-gated", &gated)?;
+
+        linear_attention_projection_forward(&gated, &self.output)
+    }
+}
+
+pub(crate) fn attention_forward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    causal: bool,
+    implementation: AttentionImplementation,
+) -> Result<Tensor> {
+    let implementation = if implementation == AttentionImplementation::Auto {
+        crate::models::attention_for_device(q.dtype(), q.device())
+            .map_err(|error| candle_core::Error::Msg(error.to_string()))?
+    } else {
+        implementation
+    };
+    match implementation {
+        AttentionImplementation::Auto | AttentionImplementation::Eager => {
+            eager_attention(q, k, v, scale, causal)
+        }
+        #[cfg(feature = "cuda")]
+        AttentionImplementation::FlashAttention2
+        | AttentionImplementation::FlashAttentionBlackwell => {
+            crate::kernels::cuda::attention::flash_attn(
                 &q.contiguous()?,
                 &k.contiguous()?,
                 &v.contiguous()?,
                 scale,
-                true,
-            )?,
-            #[allow(unreachable_patterns)]
-            other => candle_core::bail!("{} support is not compiled in", other.cli_name()),
-        };
-        let gated = (attention.reshape((batch, length, self.heads * self.head_dim))? * gate)?;
-        gated.apply(&self.output)
+                causal,
+            )
+        }
+        #[allow(unreachable_patterns)]
+        other => candle_core::bail!("{} support is not compiled in", other.cli_name()),
     }
 }
 
+pub(crate) fn eager_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    causal: bool,
+) -> Result<Tensor> {
+    let (batch, q_length, heads, width) = q.dims4()?;
+    let (k_batch, k_length, kv_heads, k_width) = k.dims4()?;
+    if kv_heads == 0
+        || heads == 0
+        || q_length == 0
+        || k_length == 0
+        || k_batch != batch
+        || k_width != width
+        || heads % kv_heads != 0
+        || k.dims() != v.dims()
+        || (causal && q_length != k_length)
+    {
+        candle_core::bail!("Unsupported eager attention dimensions")
+    }
+    let expand = |tensor: &Tensor| -> Result<Tensor> {
+        tensor
+            .to_dtype(DType::F32)?
+            .unsqueeze(3)?
+            .broadcast_as((batch, k_length, kv_heads, heads / kv_heads, width))?
+            .reshape((batch, k_length, heads, width))?
+            .transpose(1, 2)
+    };
+    let query = q.to_dtype(DType::F32)?.transpose(1, 2)?;
+    let key = expand(k)?.transpose(D::Minus2, D::Minus1)?;
+    let value = expand(v)?;
+
+    const QUERY_CHUNK: usize = 256;
+    let mut chunks = Vec::with_capacity(q_length.div_ceil(QUERY_CHUNK));
+    for start in (0..q_length).step_by(QUERY_CHUNK) {
+        let count = (q_length - start).min(QUERY_CHUNK);
+        let mut scores =
+            (contiguous_matmul(&query.narrow(2, start, count)?, &key)? * scale as f64)?;
+        if causal {
+            let mask = Tensor::from_vec(
+                (start..start + count)
+                    .flat_map(|row| {
+                        (0..k_length).map(move |col| if col > row { f32::NEG_INFINITY } else { 0. })
+                    })
+                    .collect::<Vec<_>>(),
+                (1, 1, count, k_length),
+                q.device(),
+            )?;
+            scores = scores.broadcast_add(&mask)?;
+        }
+        let probabilities = softmax_last_dim(&scores.contiguous()?)?;
+        chunks.push(contiguous_matmul(&probabilities, &value)?);
+    }
+    Tensor::cat(&chunks.iter().collect::<Vec<_>>(), 2)?
+        .transpose(1, 2)?
+        .to_dtype(q.dtype())
+}
+
 struct LinearAttention {
+    #[cfg(feature = "cuda")]
+    merged_hopper_qkvz: Option<Linear>,
+    #[cfg(all(feature = "cuda", sys1_cuda_fused_ffn))]
+    qkvz_weight: std::sync::Mutex<Option<Tensor>>,
     qkv: Linear,
     z: Linear,
     b: Linear,
     a: Linear,
+    #[cfg(feature = "cuda")]
+    ba: Option<Linear>,
     conv: Tensor,
-    decay: Tensor,
+    a_log: Tensor,
     dt_bias: Tensor,
     norm: Tensor,
-    #[cfg(feature = "metal")]
-    norm_f32: Tensor,
     output: Linear,
     key_heads: usize,
     value_heads: usize,
@@ -429,31 +773,45 @@ struct LinearAttention {
     value_dim: usize,
     kernel: usize,
     eps: f64,
-    /// Set when the Metal kernels can take q and k un-expanded.
-    grouped_qk: bool,
 }
 
 impl LinearAttention {
     fn load(config: &TextConfig, vb: VarBuilder) -> Result<Self> {
         let key_width = config.linear_num_key_heads * config.linear_key_head_dim;
         let value_width = config.linear_num_value_heads * config.linear_value_head_dim;
+        let b = vb.pp("in_proj_b").get(
+            (config.linear_num_value_heads, config.hidden_size),
+            "weight",
+        )?;
+        let a = vb.pp("in_proj_a").get(
+            (config.linear_num_value_heads, config.hidden_size),
+            "weight",
+        )?;
+        #[cfg(feature = "cuda")]
+        let ba = if vb.device().is_cuda() && vb.dtype() == DType::BF16 {
+            Some(Linear::new(Tensor::cat(&[&b, &a], 0)?, None))
+        } else {
+            None
+        };
+        let qkv = linear(
+            config.hidden_size,
+            key_width * 2 + value_width,
+            vb.pp("in_proj_qkv"),
+        )?;
+        let z = linear(config.hidden_size, value_width, vb.pp("in_proj_z"))?;
+        #[cfg(feature = "cuda")]
+        let (qkv, z, merged_hopper_qkvz) = qkvz::prepare(qkv, z)?;
         Ok(Self {
-            qkv: linear(
-                config.hidden_size,
-                key_width * 2 + value_width,
-                vb.pp("in_proj_qkv"),
-            )?,
-            z: linear(config.hidden_size, value_width, vb.pp("in_proj_z"))?,
-            b: linear(
-                config.hidden_size,
-                config.linear_num_value_heads,
-                vb.pp("in_proj_b"),
-            )?,
-            a: linear(
-                config.hidden_size,
-                config.linear_num_value_heads,
-                vb.pp("in_proj_a"),
-            )?,
+            #[cfg(feature = "cuda")]
+            merged_hopper_qkvz,
+            #[cfg(all(feature = "cuda", sys1_cuda_fused_ffn))]
+            qkvz_weight: std::sync::Mutex::new(None),
+            qkv,
+            z,
+            b: Linear::new(b, None),
+            a: Linear::new(a, None),
+            #[cfg(feature = "cuda")]
+            ba,
             conv: vb.get(
                 (
                     key_width * 2 + value_width,
@@ -462,7 +820,7 @@ impl LinearAttention {
                 ),
                 "conv1d.weight",
             )?,
-            decay: vb
+            a_log: vb
                 .get(config.linear_num_value_heads, "A_log")?
                 .to_dtype(DType::F32)?
                 .exp()?
@@ -471,10 +829,6 @@ impl LinearAttention {
                 .get(config.linear_num_value_heads, "dt_bias")?
                 .to_dtype(DType::F32)?,
             norm: vb.get(config.linear_value_head_dim, "norm.weight")?,
-            #[cfg(feature = "metal")]
-            norm_f32: vb
-                .get(config.linear_value_head_dim, "norm.weight")?
-                .to_dtype(DType::F32)?,
             output: linear(value_width, config.hidden_size, vb.pp("out_proj"))?,
             key_heads: config.linear_num_key_heads,
             value_heads: config.linear_num_value_heads,
@@ -482,118 +836,496 @@ impl LinearAttention {
             value_dim: config.linear_value_head_dim,
             kernel: config.linear_conv_kernel_dim,
             eps: config.rms_norm_eps,
-            grouped_qk: vb.device().is_metal()
-                && config.linear_key_head_dim == 128
-                && config.linear_value_head_dim == 128,
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, capture_index: usize) -> Result<Tensor> {
+        let mut profile = if layer_profiling_enabled() {
+            x.device().synchronize()?;
+            Some(Instant::now())
+        } else {
+            None
+        };
         let (batch, length, _) = x.dims3()?;
-        let value_width = self.value_heads * self.value_dim;
-        let mixed = self.project_and_mix(x)?;
-        #[cfg(feature = "metal")]
-        if self.grouped_qk && x.dtype() == DType::BF16 {
-            let packed = crate::kernels::metal::pack_delta_inputs_bf16(
-                &mixed,
-                &x.apply(&self.b)?,
-                &x.apply(&self.a)?,
-                &self.dt_bias,
-                &self.decay,
-                self.key_heads,
-                self.value_heads,
-                (self.key_dim as f64).powf(-0.5) as f32,
-            )?;
-            let output = crate::kernels::metal::delta_rule_packed(&packed, self.value_dim)?;
-            return self.finish_delta(x, output, batch, length, value_width);
-        }
-        let (q, k, v, g, beta) = self.delta_inputs(x, &mixed, batch, length)?;
-        let output = self.delta_rule(&q, &k, &v, &g, &beta)?;
-        self.finish_delta(x, output, batch, length, value_width)
-    }
-
-    fn project_and_mix(&self, x: &Tensor) -> Result<Tensor> {
-        let projected = x.apply(&self.qkv)?;
-        #[cfg(feature = "cuda")]
-        if x.device().is_cuda() && matches!(x.dtype(), DType::BF16 | DType::F32) {
-            return cuda_conv_silu(&projected, &self.conv);
-        }
-        #[cfg(feature = "metal")]
-        if x.device().is_metal() && matches!(x.dtype(), DType::BF16 | DType::F16 | DType::F32) {
-            return crate::kernels::metal::conv_silu(&projected, &self.conv);
-        }
-        causal_conv_silu(&projected, &self.conv, self.kernel)
-    }
-
-    fn delta_inputs(
-        &self,
-        x: &Tensor,
-        mixed: &Tensor,
-        batch: usize,
-        length: usize,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
         let key_width = self.key_heads * self.key_dim;
         let value_width = self.value_heads * self.value_dim;
-        let q = mixed.narrow(D::Minus1, 0, key_width)?.reshape((
+        let (projected, early_z) = self.project_qkvz(x)?;
+        crate::numerics::layer_capture(capture_index, "linear-projected", &projected)?;
+        linear_profile_checkpoint(x, capture_index, "qkv_projection", &mut profile)?;
+
+        let (q, k, v) = {
+            #[cfg(feature = "cuda")]
+            if x.device().is_cuda()
+                && x.dtype() == DType::BF16
+                && matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("89" | "120"))
+                && batch.saturating_mul(length) >= 512
+                && self.key_dim == 128
+                && self.value_dim == 128
+            {
+                #[cfg(test)]
+                let vstorage_enabled = VSTORAGE_MODEL_REPLAY.with(std::cell::Cell::get);
+                #[cfg(not(test))]
+                let vstorage_enabled = true;
+                let values = if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120")
+                    && vstorage_enabled
+                    && length >= 512
+                {
+                    #[cfg(test)]
+                    VSTORAGE_MODEL_CALLS.with(|slot| slot.set(slot.get() + 1));
+                    cuda_conv_vstore(
+                        &projected,
+                        &self.conv,
+                        self.key_heads,
+                        self.value_heads,
+                        None,
+                    )?
+                } else {
+                    cuda_conv_qkv(
+                        &projected,
+                        &self.conv,
+                        self.key_heads,
+                        self.value_heads,
+                        None,
+                    )?
+                };
+
+                if crate::numerics::enabled() {
+                    let mixed = cuda_conv_silu(&projected, &self.conv)?;
+                    crate::numerics::layer_capture(capture_index, "linear-conv", &mixed)?;
+                }
+                linear_profile_checkpoint(x, capture_index, "convolution_qkv_fused", &mut profile)?;
+                values
+            } else {
+                #[cfg(feature = "cuda")]
+                let mixed = if x.device().is_cuda() && matches!(x.dtype(), DType::BF16 | DType::F32)
+                {
+                    cuda_conv_silu(&projected, &self.conv)?
+                } else {
+                    causal_conv_silu(&projected, &self.conv, self.kernel)?
+                };
+                #[cfg(feature = "metal")]
+                let mixed = if x.device().is_metal()
+                    && matches!(x.dtype(), DType::BF16 | DType::F16 | DType::F32)
+                {
+                    crate::kernels::metal::conv_silu(&projected, &self.conv)?
+                } else {
+                    causal_conv_silu(&projected, &self.conv, self.kernel)?
+                };
+                #[cfg(not(any(feature = "cuda", feature = "metal")))]
+                let mixed = causal_conv_silu(&projected, &self.conv, self.kernel)?;
+                crate::numerics::layer_capture(capture_index, "linear-conv", &mixed)?;
+                linear_profile_checkpoint(x, capture_index, "convolution", &mut profile)?;
+                let (q, k, v) = {
+                    #[cfg(feature = "cuda")]
+                    if x.device().is_cuda()
+                        && x.dtype() == DType::BF16
+                        && self.key_dim == 128
+                        && self.value_dim == 128
+                    {
+                        cuda_fused_qkv_prepare(&mixed, self.key_heads, self.value_heads)?
+                    } else {
+                        let q = mixed.narrow(D::Minus1, 0, key_width)?.reshape((
+                            batch,
+                            length,
+                            self.key_heads,
+                            self.key_dim,
+                        ))?;
+                        let k = mixed.narrow(D::Minus1, key_width, key_width)?.reshape((
+                            batch,
+                            length,
+                            self.key_heads,
+                            self.key_dim,
+                        ))?;
+                        let v = mixed
+                            .narrow(D::Minus1, key_width * 2, value_width)?
+                            .reshape((batch, length, self.value_heads, self.value_dim))?;
+                        let repeat = self.value_heads / self.key_heads;
+                        let expand = |xs: Tensor| -> Result<Tensor> {
+                            xs.unsqueeze(3)?
+                                .broadcast_as((
+                                    batch,
+                                    length,
+                                    self.key_heads,
+                                    repeat,
+                                    self.key_dim,
+                                ))?
+                                .reshape((batch, length, self.value_heads, self.key_dim))
+                        };
+                        let grouped_qk =
+                            (cfg!(feature = "cuda") && x.device().is_cuda() && self.key_dim == 128)
+                                || (cfg!(feature = "metal")
+                                    && x.device().is_metal()
+                                    && self.key_dim == 128
+                                    && self.value_dim == 128);
+                        let l2 = |xs: Tensor, scale: f64| -> Result<Tensor> {
+                            #[cfg(feature = "cuda")]
+                            if xs.device().is_cuda() && self.key_dim == 128 {
+                                return cuda_l2_128(&xs, scale as f32);
+                            }
+                            let denom = (xs.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?;
+                            let normalized = xs.broadcast_div(&denom)?;
+                            if scale == 1. {
+                                Ok(normalized)
+                            } else {
+                                normalized * scale
+                            }
+                        };
+                        let q = if grouped_qk { q } else { expand(q)? };
+                        let q = l2(q.to_dtype(DType::F32)?, (self.key_dim as f64).powf(-0.5))?;
+                        let k = if grouped_qk { k } else { expand(k)? };
+                        let k = l2(k.to_dtype(DType::F32)?, 1.)?;
+                        let v = v.to_dtype(DType::F32)?;
+                        (q, k, v)
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        let q = mixed.narrow(D::Minus1, 0, key_width)?.reshape((
+                            batch,
+                            length,
+                            self.key_heads,
+                            self.key_dim,
+                        ))?;
+                        let k = mixed.narrow(D::Minus1, key_width, key_width)?.reshape((
+                            batch,
+                            length,
+                            self.key_heads,
+                            self.key_dim,
+                        ))?;
+                        let v = mixed
+                            .narrow(D::Minus1, key_width * 2, value_width)?
+                            .reshape((batch, length, self.value_heads, self.value_dim))?;
+                        let repeat = self.value_heads / self.key_heads;
+                        let expand = |xs: Tensor| -> Result<Tensor> {
+                            xs.unsqueeze(3)?
+                                .broadcast_as((
+                                    batch,
+                                    length,
+                                    self.key_heads,
+                                    repeat,
+                                    self.key_dim,
+                                ))?
+                                .reshape((batch, length, self.value_heads, self.key_dim))
+                        };
+                        let grouped_qk =
+                            (cfg!(feature = "cuda") && x.device().is_cuda() && self.key_dim == 128)
+                                || (cfg!(feature = "metal")
+                                    && x.device().is_metal()
+                                    && self.key_dim == 128
+                                    && self.value_dim == 128);
+                        let l2 = |xs: Tensor, scale: f64| -> Result<Tensor> {
+                            #[cfg(feature = "cuda")]
+                            if xs.device().is_cuda() && self.key_dim == 128 {
+                                return cuda_l2_128(&xs, scale as f32);
+                            }
+                            let denom = (xs.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?;
+                            let normalized = xs.broadcast_div(&denom)?;
+                            if scale == 1. {
+                                Ok(normalized)
+                            } else {
+                                normalized * scale
+                            }
+                        };
+                        let q = if grouped_qk { q } else { expand(q)? };
+                        let q = l2(q.to_dtype(DType::F32)?, (self.key_dim as f64).powf(-0.5))?;
+                        let k = if grouped_qk { k } else { expand(k)? };
+                        let k = l2(k.to_dtype(DType::F32)?, 1.)?;
+                        let v = v.to_dtype(DType::F32)?;
+                        (q, k, v)
+                    }
+                };
+                (q, k, v)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                #[cfg(feature = "cuda")]
+                let mixed = if x.device().is_cuda() && matches!(x.dtype(), DType::BF16 | DType::F32)
+                {
+                    cuda_conv_silu(&projected, &self.conv)?
+                } else {
+                    causal_conv_silu(&projected, &self.conv, self.kernel)?
+                };
+                #[cfg(feature = "metal")]
+                let mixed = if x.device().is_metal()
+                    && matches!(x.dtype(), DType::BF16 | DType::F16 | DType::F32)
+                {
+                    crate::kernels::metal::conv_silu(&projected, &self.conv)?
+                } else {
+                    causal_conv_silu(&projected, &self.conv, self.kernel)?
+                };
+                #[cfg(not(any(feature = "cuda", feature = "metal")))]
+                let mixed = causal_conv_silu(&projected, &self.conv, self.kernel)?;
+                crate::numerics::layer_capture(capture_index, "linear-conv", &mixed)?;
+                linear_profile_checkpoint(x, capture_index, "convolution", &mut profile)?;
+                let (q, k, v) = {
+                    #[cfg(feature = "cuda")]
+                    if x.device().is_cuda()
+                        && x.dtype() == DType::BF16
+                        && self.key_dim == 128
+                        && self.value_dim == 128
+                    {
+                        cuda_fused_qkv_prepare(&mixed, self.key_heads, self.value_heads)?
+                    } else {
+                        let q = mixed.narrow(D::Minus1, 0, key_width)?.reshape((
+                            batch,
+                            length,
+                            self.key_heads,
+                            self.key_dim,
+                        ))?;
+                        let k = mixed.narrow(D::Minus1, key_width, key_width)?.reshape((
+                            batch,
+                            length,
+                            self.key_heads,
+                            self.key_dim,
+                        ))?;
+                        let v = mixed
+                            .narrow(D::Minus1, key_width * 2, value_width)?
+                            .reshape((batch, length, self.value_heads, self.value_dim))?;
+                        let repeat = self.value_heads / self.key_heads;
+                        let expand = |xs: Tensor| -> Result<Tensor> {
+                            xs.unsqueeze(3)?
+                                .broadcast_as((
+                                    batch,
+                                    length,
+                                    self.key_heads,
+                                    repeat,
+                                    self.key_dim,
+                                ))?
+                                .reshape((batch, length, self.value_heads, self.key_dim))
+                        };
+                        let grouped_qk =
+                            (cfg!(feature = "cuda") && x.device().is_cuda() && self.key_dim == 128)
+                                || (cfg!(feature = "metal")
+                                    && x.device().is_metal()
+                                    && self.key_dim == 128
+                                    && self.value_dim == 128);
+                        let l2 = |xs: Tensor, scale: f64| -> Result<Tensor> {
+                            #[cfg(feature = "cuda")]
+                            if xs.device().is_cuda() && self.key_dim == 128 {
+                                return cuda_l2_128(&xs, scale as f32);
+                            }
+                            let denom = (xs.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?;
+                            let normalized = xs.broadcast_div(&denom)?;
+                            if scale == 1. {
+                                Ok(normalized)
+                            } else {
+                                normalized * scale
+                            }
+                        };
+                        let q = if grouped_qk { q } else { expand(q)? };
+                        let q = l2(q.to_dtype(DType::F32)?, (self.key_dim as f64).powf(-0.5))?;
+                        let k = if grouped_qk { k } else { expand(k)? };
+                        let k = l2(k.to_dtype(DType::F32)?, 1.)?;
+                        let v = v.to_dtype(DType::F32)?;
+                        (q, k, v)
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        let q = mixed.narrow(D::Minus1, 0, key_width)?.reshape((
+                            batch,
+                            length,
+                            self.key_heads,
+                            self.key_dim,
+                        ))?;
+                        let k = mixed.narrow(D::Minus1, key_width, key_width)?.reshape((
+                            batch,
+                            length,
+                            self.key_heads,
+                            self.key_dim,
+                        ))?;
+                        let v = mixed
+                            .narrow(D::Minus1, key_width * 2, value_width)?
+                            .reshape((batch, length, self.value_heads, self.value_dim))?;
+                        let repeat = self.value_heads / self.key_heads;
+                        let expand = |xs: Tensor| -> Result<Tensor> {
+                            xs.unsqueeze(3)?
+                                .broadcast_as((
+                                    batch,
+                                    length,
+                                    self.key_heads,
+                                    repeat,
+                                    self.key_dim,
+                                ))?
+                                .reshape((batch, length, self.value_heads, self.key_dim))
+                        };
+                        let grouped_qk =
+                            (cfg!(feature = "cuda") && x.device().is_cuda() && self.key_dim == 128)
+                                || (cfg!(feature = "metal")
+                                    && x.device().is_metal()
+                                    && self.key_dim == 128
+                                    && self.value_dim == 128);
+                        let l2 = |xs: Tensor, scale: f64| -> Result<Tensor> {
+                            #[cfg(feature = "cuda")]
+                            if xs.device().is_cuda() && self.key_dim == 128 {
+                                return cuda_l2_128(&xs, scale as f32);
+                            }
+                            let denom = (xs.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?;
+                            let normalized = xs.broadcast_div(&denom)?;
+                            if scale == 1. {
+                                Ok(normalized)
+                            } else {
+                                normalized * scale
+                            }
+                        };
+                        let q = if grouped_qk { q } else { expand(q)? };
+                        let q = l2(q.to_dtype(DType::F32)?, (self.key_dim as f64).powf(-0.5))?;
+                        let k = if grouped_qk { k } else { expand(k)? };
+                        let k = l2(k.to_dtype(DType::F32)?, 1.)?;
+                        let v = v.to_dtype(DType::F32)?;
+                        (q, k, v)
+                    }
+                };
+                (q, k, v)
+            }
+        };
+        let (g, beta) = self.reference_gates(x, capture_index)?;
+        crate::numerics::layer_capture(capture_index, "linear-q", &q)?;
+        crate::numerics::layer_capture(capture_index, "linear-k", &k)?;
+        crate::numerics::layer_capture(capture_index, "linear-v", &v)?;
+        crate::numerics::layer_capture(capture_index, "linear-g", &g)?;
+        crate::numerics::layer_capture(capture_index, "linear-beta", &beta)?;
+        linear_profile_checkpoint(x, capture_index, "qk_and_gates", &mut profile)?;
+        #[cfg(feature = "cuda")]
+        if x.device().is_cuda() && self.key_dim == 128 {
+            let output = if x.dtype() == DType::BF16
+                && matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90"))
+                && self.value_dim == 128
+                && length >= 128
+            {
+                cuda_c64bfout_uniform(&q, &k, &v, &g, &beta, 32, false)?
+            } else if x.dtype() == DType::BF16
+                && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120")
+                && self.value_dim == 128
+            {
+                if length >= 512 {
+                    if v.dtype() == DType::BF16 {
+                        cuda_vstore_gdn_uniform(&q, &k, &v, &g, &beta, 32, false)?
+                    } else {
+                        cuda_c64bfout_uniform(&q, &k, &v, &g, &beta, 32, false)?
+                    }
+                } else {
+                    cuda_delta_rule_token_major_bfout(&q, &k, &v, &g, &beta, true)?
+                }
+            } else if x.dtype() == DType::BF16
+                && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120")
+                && length >= 512
+                && self.value_dim <= 128
+            {
+                cuda_chunk64_direct(&q, &k, &v, &g, &beta, 32, false)?
+            } else {
+                cuda_delta_rule_token_major(&q, &k, &v, &g, &beta)?
+            };
+            crate::numerics::layer_capture(capture_index, "linear-delta", &output)?;
+            if crate::numerics::enabled() {
+                crate::numerics::layer_capture(
+                    capture_index,
+                    "linear-delta-rounded",
+                    &output.to_dtype(x.dtype())?,
+                )?;
+            }
+            linear_profile_checkpoint(x, capture_index, "delta_rule", &mut profile)?;
+            let result = self.finish_delta(
+                x,
+                output,
+                batch,
+                length,
+                value_width,
+                capture_index,
+                early_z,
+            )?;
+            linear_profile_checkpoint(x, capture_index, "finalize_and_projection", &mut profile)?;
+            return Ok(result);
+        }
+        #[cfg(feature = "metal")]
+        let grouped_qk = (cfg!(feature = "cuda") && x.device().is_cuda() && self.key_dim == 128)
+            || (cfg!(feature = "metal")
+                && x.device().is_metal()
+                && self.key_dim == 128
+                && self.value_dim == 128);
+        let q = q.transpose(1, 2)?;
+        let k = k.transpose(1, 2)?;
+        let v = v.transpose(1, 2)?;
+        let beta = beta.transpose(1, 2)?;
+        let g = g.transpose(1, 2)?;
+        #[cfg(feature = "metal")]
+        let output = if grouped_qk {
+            let packed = crate::kernels::metal::pack_delta_f32(&q, &k, &v, &g, &beta)?;
+            crate::kernels::metal::delta_rule_packed(&packed, self.value_dim)?
+        } else {
+            chunked_delta_rule(&q, &k, &v, &g, &beta)?
+        };
+        #[cfg(not(feature = "metal"))]
+        let output = chunked_delta_rule(&q, &k, &v, &g, &beta)?;
+        if crate::numerics::enabled() {
+            crate::numerics::layer_capture(
+                capture_index,
+                "linear-delta-rounded",
+                &output.to_dtype(x.dtype())?,
+            )?;
+        }
+        linear_profile_checkpoint(x, capture_index, "delta_rule", &mut profile)?;
+        let result = self.finish_delta(
+            x,
+            output,
             batch,
             length,
-            self.key_heads,
-            self.key_dim,
-        ))?;
-        let k = mixed.narrow(D::Minus1, key_width, key_width)?.reshape((
-            batch,
-            length,
-            self.key_heads,
-            self.key_dim,
-        ))?;
-        let v = mixed
-            .narrow(D::Minus1, key_width * 2, value_width)?
-            .reshape((batch, length, self.value_heads, self.value_dim))?;
-        let repeat = self.value_heads / self.key_heads;
-        let expand = |xs: Tensor| -> Result<Tensor> {
-            xs.unsqueeze(3)?
-                .broadcast_as((batch, length, self.key_heads, repeat, self.key_dim))?
-                .reshape((batch, length, self.value_heads, self.key_dim))
+            value_width,
+            capture_index,
+            early_z,
+        )?;
+        linear_profile_checkpoint(x, capture_index, "finalize_and_projection", &mut profile)?;
+        Ok(result)
+    }
+
+    fn reference_gates(&self, x: &Tensor, capture_index: usize) -> Result<(Tensor, Tensor)> {
+        #[cfg(feature = "cuda")]
+        if x.device().is_cuda() && x.dtype() == DType::BF16 {
+            let ba = self
+                .ba
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::Msg("missing packed BF16 gates".into()))?;
+            let projected = if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120")
+                && x.dim(1)? >= 1024
+                && ba.weight().dims() == [64, 4096]
+            {
+                cuda_gate_tensor16_rows32(x, ba, true, SimtProjection::Compensated)?
+            } else {
+                cuda_gate_projection_bf16(x, ba)?
+            };
+            if crate::numerics::enabled() {
+                let b = projected.narrow(D::Minus1, 0, self.value_heads)?;
+                let a = projected.narrow(D::Minus1, self.value_heads, self.value_heads)?;
+                crate::numerics::layer_capture(capture_index, "linear-b-projection", &b)?;
+                crate::numerics::layer_capture(
+                    capture_index,
+                    "linear-a-projection",
+                    &a.to_dtype(DType::F32)?,
+                )?;
+            }
+
+            return cuda_packed_ba_nonlinearity(&projected, &projected, &self.dt_bias, &self.a_log);
+        }
+        let project = |linear: &Linear| {
+            #[cfg(feature = "cuda")]
+            if x.device().is_cuda() && x.dtype() == DType::BF16 {
+                return cuda_gate_projection_bf16(x, linear);
+            }
+            crate::kernels::linear::forward_compatible(x, linear)
         };
-        let q = if self.grouped_qk { q } else { expand(q)? };
-        let k = if self.grouped_qk { k } else { expand(k)? };
-        let l2 = |xs: Tensor| -> Result<Tensor> {
-            let denom = (xs.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?;
-            xs.broadcast_div(&denom)
-        };
-        let q = (l2(q.to_dtype(DType::F32)?)? * (self.key_dim as f64).powf(-0.5))?;
-        let k = l2(k.to_dtype(DType::F32)?)?;
-        let v = v.to_dtype(DType::F32)?;
-        let beta = sigmoid(&x.apply(&self.b)?.to_dtype(DType::F32)?)?;
-        let a = x.apply(&self.a)?.to_dtype(DType::F32)?;
+        let b = project(&self.b)?;
+        crate::numerics::layer_capture(capture_index, "linear-b-projection", &b)?;
+        let beta = rounded_beta(&b)?;
+        drop(b);
+        let a = project(&self.a)?.to_dtype(DType::F32)?;
+        crate::numerics::layer_capture(capture_index, "linear-a-projection", &a)?;
         let gate_input = a.broadcast_add(&self.dt_bias)?;
         let softplus = (gate_input.relu()? + (gate_input.abs()?.neg()?.exp()? + 1.)?.log()?)?;
-        let g = softplus.broadcast_mul(&self.decay)?;
-        Ok((
-            q.transpose(1, 2)?,
-            k.transpose(1, 2)?,
-            v.transpose(1, 2)?,
-            g.transpose(1, 2)?,
-            beta.transpose(1, 2)?,
-        ))
+        Ok((softplus.broadcast_mul(&self.a_log)?, beta))
     }
 
-    fn delta_rule(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        g: &Tensor,
-        beta: &Tensor,
-    ) -> Result<Tensor> {
-        #[cfg(feature = "metal")]
-        if self.grouped_qk {
-            let packed = crate::kernels::metal::pack_delta_f32(q, k, v, g, beta)?;
-            return crate::kernels::metal::delta_rule_packed(&packed, self.value_dim);
-        }
-        chunked_delta_rule(q, k, v, g, beta)
-    }
-
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep the validated decoder geometry and optional early-Z cast boundary explicit"
+    )]
     fn finish_delta(
         &self,
         x: &Tensor,
@@ -601,41 +1333,184 @@ impl LinearAttention {
         batch: usize,
         length: usize,
         value_width: usize,
+        capture_index: usize,
+        early_z: Option<Tensor>,
     ) -> Result<Tensor> {
-        let gate = x
-            .apply(&self.z)?
-            .reshape((batch, length, self.value_heads, self.value_dim))?;
-        let variance = output.sqr()?.mean_keepdim(D::Minus1)?;
+        let gate = match early_z {
+            Some(z) => z,
+            None => linear_attention_projection_forward(x, &self.z)?,
+        };
+
+        #[cfg(feature = "cuda")]
+        let merged_gate = option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("90")
+            && x.device().is_cuda()
+            && output.dtype() == DType::BF16
+            && self.value_heads == 32
+            && self.value_dim == 128
+            && gate.dims() == [batch, length, 4096]
+            && gate.stride() == [length * 12288, 12288, 1];
+        #[cfg(not(feature = "cuda"))]
+        let merged_gate = false;
+        let gate = if merged_gate {
+            gate
+        } else {
+            gate.reshape((batch, length, self.value_heads, self.value_dim))?
+        };
+        if crate::numerics::enabled() && merged_gate {
+            let captured_gate = gate.reshape((batch, length, self.value_heads, self.value_dim))?;
+            crate::numerics::layer_capture(capture_index, "linear-z-projected", &captured_gate)?;
+        } else {
+            crate::numerics::layer_capture(capture_index, "linear-z-projected", &gate)?;
+        }
+        #[cfg(feature = "cuda")]
+        if x.device().is_cuda() && x.dtype() == DType::BF16 && self.value_dim == 128 {
+            let finalized = cuda_post_finalize_bf16(&output, &gate, &self.norm, self.eps)?
+                .reshape((batch, length, value_width))?;
+            crate::numerics::layer_capture(capture_index, "linear-finalized", &finalized)?;
+            return linear_attention_projection_forward(&finalized, &self.output);
+        }
         #[cfg(feature = "metal")]
         if x.device().is_metal() && x.dtype() == DType::BF16 && self.value_dim == 128 {
+            let output = output.to_dtype(x.dtype())?.to_dtype(DType::F32)?;
+            let variance = output.sqr()?.mean_keepdim(D::Minus1)?;
             let denominator = (variance + self.eps)?.sqrt()?;
+            let gate_silu = gate.to_dtype(DType::F32)?.silu()?;
+            let norm = self.norm.to_dtype(DType::F32)?;
             return crate::kernels::metal::post_finalize_bf16(
                 &output,
                 &denominator,
-                &gate,
-                &self.norm_f32,
+                &gate_silu,
+                &norm,
             )?
             .reshape((batch, length, value_width))?
             .apply(&self.output);
         }
-        let output = output.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let output = output.broadcast_mul(&self.norm.to_dtype(DType::F32)?)?;
-        let gate = gate.to_dtype(DType::F32)?.silu()?;
-        output
-            .broadcast_mul(&gate)?
-            .to_dtype(x.dtype())?
-            .reshape((batch, length, value_width))?
-            .apply(&self.output)
+        let finalized = gated_norm_reference(&output, &gate, &self.norm, self.eps, x.dtype())?
+            .reshape((batch, length, value_width))?;
+        crate::numerics::layer_capture(capture_index, "linear-finalized", &finalized)?;
+        crate::kernels::linear::forward_compatible(&finalized, &self.output)
     }
 }
 
+#[cfg(any(feature = "cuda", test))]
+#[allow(dead_code)]
+fn blocked_projection(input: &Tensor, linear: &Linear, block_rows: usize) -> Result<Tensor> {
+    if block_rows == 0 {
+        candle_core::bail!("Blocked projection requires a nonzero row block")
+    }
+    let (batch, length, inner) = input.dims3()?;
+    let rows = batch
+        .checked_mul(length)
+        .ok_or_else(|| candle_core::Error::Msg("Blocked projection row count overflow".into()))?;
+    if rows == 0 {
+        return input.apply(linear);
+    }
+    let columns = linear.weight().dim(0)?;
+    let matrix = input.contiguous()?.reshape((rows, inner))?;
+    let mut chunks = Vec::new();
+    for start in (0..rows).step_by(block_rows) {
+        let count = (rows - start).min(block_rows);
+        let piece = matrix.narrow(0, start, count)?;
+        let padded = if count == block_rows {
+            piece
+        } else {
+            let zeros = Tensor::zeros((block_rows - count, inner), input.dtype(), input.device())?;
+            Tensor::cat(&[&piece, &zeros], 0)?
+        };
+        chunks.push(padded.apply(linear)?.narrow(0, 0, count)?);
+    }
+    let output = if chunks.len() == 1 {
+        chunks.pop().unwrap()
+    } else {
+        Tensor::cat(&chunks.iter().collect::<Vec<_>>(), 0)?
+    };
+    output.reshape((batch, length, columns))
+}
+
+#[cfg(test)]
+fn guarded_double_radius_coefficient(inner: usize) -> f64 {
+    guarded_double_radius_coefficient_impl(inner, false)
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn guarded_double_radius_coefficient_impl(inner: usize, tensor_dot: bool) -> f64 {
+    let count = inner.div_ceil(32);
+    let unit32 = f64::from(f32::EPSILON) / 2.;
+    let unit64 = f64::EPSILON / 2.;
+    if count == 0 || count as f64 * unit32 >= 0.25 {
+        return f64::INFINITY;
+    }
+    let gamma = |n: usize, unit: f64| {
+        let nu = (n as f64 * unit).next_up();
+        (nu / (1. - nu).next_down()).next_up()
+    };
+    let g32 = gamma(count, unit32);
+    let amplified = (1. + g32).next_up();
+    let final_error = (gamma(6, unit64) * (amplified * amplified).next_up()).next_up();
+    let old_error = ((g32 * g32).next_up() + final_error).next_up();
+
+    let candidate_operations = if tensor_dot { inner } else { count + 5 };
+    (old_error + gamma(candidate_operations, unit64)).next_up()
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn projection_tile_rows(rows: usize, columns: usize, sm120: bool) -> usize {
+    if columns < 2048 {
+        16
+    } else if sm120 && rows >= 128 {
+        128
+    } else if rows >= 64 {
+        32
+    } else {
+        16
+    }
+}
+
+fn rounded_beta(input: &Tensor) -> Result<Tensor> {
+    sigmoid(&input.to_dtype(DType::F32)?)?
+        .to_dtype(input.dtype())?
+        .to_dtype(DType::F32)
+}
+
+fn gated_norm_reference(
+    input: &Tensor,
+    gate: &Tensor,
+    weight: &Tensor,
+    epsilon: f64,
+    dtype: DType,
+) -> Result<Tensor> {
+    let input = input.to_dtype(dtype)?.to_dtype(DType::F32)?;
+    let variance = input.sqr()?.mean_keepdim(D::Minus1)?;
+    let normalized = input
+        .broadcast_div(&(variance + epsilon)?.sqrt()?)?
+        .to_dtype(dtype)?;
+
+    normalized
+        .broadcast_mul(&weight.to_dtype(dtype)?)?
+        .to_dtype(DType::F32)?
+        .broadcast_mul(&gate.to_dtype(DType::F32)?.silu()?)?
+        .to_dtype(dtype)
+}
+
 fn causal_conv_silu(projected: &Tensor, conv: &Tensor, kernel: usize) -> Result<Tensor> {
+    crate::kernels::activation::silu(&causal_conv(projected, conv, kernel)?)
+}
+
+fn causal_conv(projected: &Tensor, conv: &Tensor, kernel: usize) -> Result<Tensor> {
     let (batch, length, channels) = projected.dims3()?;
-    let padded = projected.pad_with_zeros(1, kernel - 1, 0)?;
-    let weights = conv.reshape((channels, kernel))?;
+    let accumulation_dtype = match projected.dtype() {
+        DType::F16 | DType::BF16 => DType::F32,
+        dtype => dtype,
+    };
+    let padded = projected
+        .to_dtype(accumulation_dtype)?
+        .pad_with_zeros(1, kernel - 1, 0)?;
+    let weights = conv
+        .to_dtype(accumulation_dtype)?
+        .reshape((channels, kernel))?;
     let mut mixed = Tensor::zeros(
         (batch, length, channels),
-        projected.dtype(),
+        accumulation_dtype,
         projected.device(),
     )?;
     for tap in 0..kernel {
@@ -646,144 +1521,7 @@ fn causal_conv_silu(projected: &Tensor, conv: &Tensor, kernel: usize) -> Result<
             .reshape((1, 1, channels))?;
         mixed = (mixed + source.broadcast_mul(&weight)?)?;
     }
-    mixed.silu()
-}
-
-#[cfg(feature = "cuda")]
-fn cuda_conv_silu(input: &Tensor, weights: &Tensor) -> Result<Tensor> {
-    let (batch, length, channels) = input.dims3()?;
-    let (weight_channels, groups, kernel) = weights.dims3()?;
-    if weight_channels != channels || groups != 1 || kernel == 0 || input.dtype() != weights.dtype()
-    {
-        candle_core::bail!("Unsupported Qwen3.5 CUDA convolution shape or dtype")
-    }
-    let input = input.contiguous()?;
-    let weights = weights.contiguous()?;
-    let (input_storage, input_layout) = input.storage_and_layout();
-    let (weight_storage, weight_layout) = weights.storage_and_layout();
-    let (Storage::Cuda(input_storage), Storage::Cuda(weight_storage)) =
-        (&*input_storage, &*weight_storage)
-    else {
-        candle_core::bail!("Qwen3.5 convolution requires CUDA storage")
-    };
-    let (input_start, input_end) = input_layout.contiguous_offsets().ok_or_else(|| {
-        candle_core::Error::Msg("Qwen3.5 convolution input is not contiguous".into())
-    })?;
-    let (weight_start, weight_end) = weight_layout.contiguous_offsets().ok_or_else(|| {
-        candle_core::Error::Msg("Qwen3.5 convolution weights are not contiguous".into())
-    })?;
-    let device = input_storage.device().clone();
-    let count = batch * length * channels;
-    let config = LaunchConfig {
-        grid_dim: (count.div_ceil(256) as u32, 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let count_arg = count as i32;
-    let length_arg = length as i32;
-    let channels_arg = channels as i32;
-    let kernel_arg = kernel as i32;
-    let output = match input.dtype() {
-        DType::BF16 => {
-            let source = input_storage
-                .as_cuda_slice::<bf16>()?
-                .slice(input_start..input_end);
-            let filters = weight_storage
-                .as_cuda_slice::<bf16>()?
-                .slice(weight_start..weight_end);
-            let output = unsafe { device.alloc::<bf16>(count)? };
-            let function = device.get_or_load_custom_func("qwen35_conv_bf16", "sys1", CUDA_PTX)?;
-            let mut launch = function.builder();
-            launch.arg(&source);
-            launch.arg(&filters);
-            launch.arg(&output);
-            launch.arg(&count_arg);
-            launch.arg(&length_arg);
-            launch.arg(&channels_arg);
-            launch.arg(&kernel_arg);
-            unsafe { launch.launch(config) }.w()?;
-            Storage::Cuda(CudaStorage::wrap_cuda_slice(output, device))
-        }
-        DType::F32 => {
-            let source = input_storage
-                .as_cuda_slice::<f32>()?
-                .slice(input_start..input_end);
-            let filters = weight_storage
-                .as_cuda_slice::<f32>()?
-                .slice(weight_start..weight_end);
-            let output = unsafe { device.alloc::<f32>(count)? };
-            let function = device.get_or_load_custom_func("qwen35_conv_f32", "sys1", CUDA_PTX)?;
-            let mut launch = function.builder();
-            launch.arg(&source);
-            launch.arg(&filters);
-            launch.arg(&output);
-            launch.arg(&count_arg);
-            launch.arg(&length_arg);
-            launch.arg(&channels_arg);
-            launch.arg(&kernel_arg);
-            unsafe { launch.launch(config) }.w()?;
-            Storage::Cuda(CudaStorage::wrap_cuda_slice(output, device))
-        }
-        dtype => candle_core::bail!("Unsupported Qwen3.5 CUDA convolution dtype: {dtype:?}"),
-    };
-    Ok(Tensor::from_storage(
-        output,
-        (batch, length, channels),
-        BackpropOp::none(),
-        false,
-    ))
-}
-
-#[cfg(feature = "cuda")]
-fn cuda_delta_rule(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    g: &Tensor,
-    beta: &Tensor,
-) -> Result<Tensor> {
-    let (batch, heads, length, key_dim) = q.dims4()?;
-    let value_dim = v.dim(D::Minus1)?;
-    if key_dim != 128
-        || k.dims() != q.dims()
-        || v.dims() != [batch, heads, length, value_dim]
-        || g.dims() != [batch, heads, length]
-        || beta.dims() != [batch, heads, length]
-    {
-        candle_core::bail!("Unsupported Qwen3.5 CUDA delta-rule shape")
-    }
-    let input = Tensor::cat(&[q, k, v, &g.unsqueeze(3)?, &beta.unsqueeze(3)?], 3)?.contiguous()?;
-    let (storage, layout) = input.storage_and_layout();
-    let Storage::Cuda(storage) = &*storage else {
-        candle_core::bail!("Qwen3.5 delta rule requires CUDA storage")
-    };
-    let (start, end) = layout
-        .contiguous_offsets()
-        .ok_or_else(|| candle_core::Error::Msg("Qwen3.5 delta input is not contiguous".into()))?;
-    let source = storage.as_cuda_slice::<f32>()?.slice(start..end);
-    let device = storage.device().clone();
-    let output = unsafe { device.alloc::<f32>(batch * heads * length * value_dim)? };
-    let function = device.get_or_load_custom_func("qwen35_delta_f32", "sys1", CUDA_PTX)?;
-    let config = LaunchConfig {
-        grid_dim: ((batch * heads) as u32, value_dim.div_ceil(4) as u32, 1),
-        block_dim: (128, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let mut launch = function.builder();
-    launch.arg(&source);
-    launch.arg(&output);
-    let length = length as i32;
-    let value_dim = value_dim as i32;
-    launch.arg(&length);
-    launch.arg(&value_dim);
-    unsafe { launch.launch(config) }.w()?;
-    let output = Tensor::from_storage(
-        Storage::Cuda(CudaStorage::wrap_cuda_slice(output, device)),
-        (batch, heads, length as usize, value_dim as usize),
-        BackpropOp::none(),
-        false,
-    );
-    output.transpose(1, 2)
+    mixed.to_dtype(projected.dtype())
 }
 
 fn chunked_delta_rule(
@@ -797,7 +1535,7 @@ fn chunked_delta_rule(
     let key_dim = q.dim(D::Minus1)?;
     #[cfg(feature = "cuda")]
     if q.device().is_cuda() && key_dim == 128 {
-        return cuda_delta_rule(q, k, v, g, beta);
+        candle_core::bail!("CUDA delta-rule inputs must remain token-major")
     }
     #[cfg(feature = "metal")]
     if q.device().is_metal() && key_dim == 128 {
@@ -880,7 +1618,33 @@ fn chunked_delta_rule_fallback(
 }
 
 fn contiguous_matmul(left: &Tensor, right: &Tensor) -> Result<Tensor> {
-    left.contiguous()?.matmul(&right.contiguous()?)
+    crate::kernels::linear::matmul_compatible(&left.contiguous()?, &right.contiguous()?)
+}
+
+fn layer_profiling_enabled() -> bool {
+    static PROFILE: OnceLock<bool> = OnceLock::new();
+    *PROFILE.get_or_init(|| std::env::var_os("SYS1_PROFILE_LAYERS").is_some())
+}
+
+fn linear_profile_checkpoint(
+    x: &Tensor,
+    index: usize,
+    stage: &'static str,
+    started: &mut Option<Instant>,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    profiling::mark(x.device(), index, stage)?;
+    if let Some(started) = started.as_mut() {
+        x.device().synchronize()?;
+        tracing::info!(
+            layer = index,
+            stage,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.,
+            "Qwen3.5 linear attention profile"
+        );
+        *started = Instant::now();
+    }
+    Ok(())
 }
 
 enum Mixer {
@@ -889,6 +1653,7 @@ enum Mixer {
 }
 
 struct Layer {
+    index: usize,
     input_norm: RmsNorm,
     mixer: Mixer,
     post_norm: RmsNorm,
@@ -914,6 +1679,7 @@ impl Layer {
             other => candle_core::bail!("unsupported Qwen3.5 layer type {other}"),
         };
         Ok(Self {
+            index,
             input_norm: RmsNorm::load(
                 config.hidden_size,
                 config.rms_norm_eps,
@@ -929,14 +1695,69 @@ impl Layer {
         })
     }
 
-    fn forward(&self, x: &Tensor, shared: &Shared) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, rotary: Option<&RotaryTensors>) -> Result<Tensor> {
+        let profile = layer_profiling_enabled();
+        if profile {
+            x.device().synchronize()?;
+        }
+        #[cfg(feature = "cuda")]
+        profiling::mark(x.device(), self.index, "start")?;
+        let started = Instant::now();
         let normalized = self.input_norm.forward(x)?;
+        crate::numerics::capture(&format!("layer-{:02}-normalized", self.index), &normalized)?;
+        #[cfg(feature = "cuda")]
+        profiling::mark(x.device(), self.index, "norm")?;
+        if profile {
+            x.device().synchronize()?;
+        }
+        let norm_ms = started.elapsed().as_secs_f64() * 1_000.;
+        let started = Instant::now();
         let mixed = match &self.mixer {
-            Mixer::Full(layer) => layer.forward(&normalized, shared)?,
-            Mixer::Linear(layer) => layer.forward(&normalized)?,
+            Mixer::Full(layer) => layer.forward(
+                &normalized,
+                rotary.ok_or_else(|| {
+                    candle_core::Error::Msg("Missing Qwen3.5 rotary tensors".into())
+                })?,
+                self.index,
+            )?,
+            Mixer::Linear(layer) => layer.forward(&normalized, self.index)?,
         };
-        let x = (x + mixed)?;
-        &x + self.mlp.forward(&self.post_norm.forward(&x)?)?
+        crate::numerics::capture(&format!("layer-{:02}-mixed", self.index), &mixed)?;
+        #[cfg(feature = "cuda")]
+        profiling::mark(x.device(), self.index, "mixer_tail")?;
+        if profile {
+            x.device().synchronize()?;
+        }
+        let mixer_ms = started.elapsed().as_secs_f64() * 1_000.;
+        let started = Instant::now();
+        let (x, post_normalized) = self.post_norm.forward_residual(x, &mixed)?;
+        #[cfg(feature = "cuda")]
+        profiling::mark(x.device(), self.index, "residual_and_post_norm")?;
+        crate::numerics::capture(
+            &format!("layer-{:02}-post-normalized", self.index),
+            &post_normalized,
+        )?;
+        let mlp_output = self.mlp.forward(&post_normalized, self.index)?;
+        crate::numerics::capture(&format!("layer-{:02}-mlp-output", self.index), &mlp_output)?;
+        let output = (&x + mlp_output)?;
+        crate::numerics::capture(&format!("layer-{:02}-output", self.index), &output)?;
+        #[cfg(feature = "cuda")]
+        profiling::mark(x.device(), self.index, "output_residual")?;
+        if profile {
+            x.device().synchronize()?;
+            tracing::info!(
+                layer = self.index,
+                mixer = match &self.mixer {
+                    Mixer::Full(_) => "full",
+                    Mixer::Linear(_) => "linear",
+                },
+                norm_ms,
+                mixer_ms,
+                mlp_ms = started.elapsed().as_secs_f64() * 1_000.,
+                "Qwen3.5 layer profile"
+            );
+        }
+        Ok(output)
     }
 }
 
@@ -944,7 +1765,6 @@ pub struct Decoder {
     embedding: Embedding,
     layers: Vec<Layer>,
     norm: RmsNorm,
-    rope: RopeParams,
 }
 
 impl Decoder {
@@ -954,6 +1774,8 @@ impl Decoder {
         implementation: AttentionImplementation,
     ) -> Result<Self> {
         let embedding = embedding(config.vocab_size, config.hidden_size, vb.pp("embed_tokens"))?;
+        #[cfg(feature = "cuda")]
+        let embedding = maybe_cpu_input_embedding(embedding, config.hidden_size)?;
         let layers = (0..config.num_hidden_layers)
             .map(|index| {
                 Layer::load(
@@ -969,519 +1791,206 @@ impl Decoder {
             embedding,
             layers,
             norm,
-            rope: RopeParams::new(config)?,
         })
     }
 
     pub fn forward(&self, ids: &Tensor) -> Result<Tensor> {
         let length = ids.dim(1)?;
         let positions: Vec<_> = (0..length).map(|index| [index as u32; 3]).collect();
-        self.forward_embeds(&ids.apply(&self.embedding)?, &positions)
+        self.forward_embeds(&self.embed(ids)?, &positions)
     }
 
     pub fn embed(&self, ids: &Tensor) -> Result<Tensor> {
+        if self.embedding.embeddings().device().is_cpu() && ids.device().is_cuda() {
+            let cpu_ids = ids.to_device(&candle_core::Device::Cpu)?;
+            return cpu_ids.apply(&self.embedding)?.to_device(ids.device());
+        }
         ids.apply(&self.embedding)
     }
 
     pub fn forward_embeds(&self, embeds: &Tensor, positions: &[[u32; 3]]) -> Result<Tensor> {
-        let length = embeds.dim(1)?;
-        if positions.len() != length {
+        if positions.len() != embeds.dim(1)? {
             candle_core::bail!("Qwen3.5 position count does not match sequence length")
         }
-        let (cos, sin) = self
-            .rope
-            .tables(positions, embeds.dtype(), embeds.device())?;
-        let shared = Shared {
-            #[cfg(feature = "metal")]
-            causal: self.causal_mask(embeds)?,
-            cos,
-            sin,
-        };
-        let mut x = embeds.clone();
-        for layer in &self.layers {
-            x = layer.forward(&x, &shared)?;
+        let rotary = self
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.mixer {
+                Mixer::Full(attention) => Some(&attention.rotary),
+                Mixer::Linear(_) => None,
+            })
+            .map(|rotary| rotary.prepare(positions, embeds.dtype(), embeds.device()))
+            .transpose()?;
+        #[cfg(feature = "cuda")]
+        profiling::begin(embeds.device())?;
+        crate::numerics::capture("embedding", embeds)?;
+        let output = self.forward_layers(embeds, rotary.as_ref())?;
+        crate::numerics::capture("decoder-output", &output)?;
+        #[cfg(feature = "cuda")]
+        {
+            let (batch, length, _) = embeds.dims3()?;
+            profiling::finish(batch, length)?;
         }
-        self.norm.forward(&x)
-    }
-
-    #[cfg(feature = "metal")]
-    fn causal_mask(&self, embeds: &Tensor) -> Result<Option<Tensor>> {
-        let length = embeds.dim(1)?;
-        let uses_sdpa = embeds.device().is_metal()
-            && self.layers.iter().any(|layer| match &layer.mixer {
-                Mixer::Full(layer) => supports_metal_sdpa(embeds.dtype(), layer.head_dim),
-                Mixer::Linear(_) => false,
-            });
-        if !uses_sdpa {
-            return Ok(None);
-        }
-        let rows = Tensor::arange(0u32, length as u32, embeds.device())?.reshape((length, 1))?;
-        let columns = Tensor::arange(0u32, length as u32, embeds.device())?.reshape((1, length))?;
-        let future = columns.broadcast_gt(&rows)?.to_dtype(embeds.dtype())?;
-        Ok(Some(
-            (future * ATTENTION_MASK_VALUE)?.reshape((1, 1, length, length))?,
-        ))
+        Ok(output)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    fn reference_rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
-        let dtype = x.dtype();
-        let x = x.to_dtype(DType::F32)?;
-        let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
-        let scale = (variance + eps)?.sqrt()?.recip()?;
-        x.broadcast_mul(&scale)?
-            .broadcast_mul(&(&weight.to_dtype(DType::F32)? + 1.)?)?
-            .to_dtype(dtype)
+#[cfg(any(feature = "cuda", test))]
+fn long_down_actual_m(rows: usize, inner: usize, columns: usize, sm120: bool) -> bool {
+    sm120
+        && (2048..=8192).contains(&rows)
+        && columns >= 2048
+        && columns.checked_mul(3) == Some(inner)
+}
+
+#[test]
+fn long_down_geometry_policy_has_explicit_scope() {
+    for (rows, inner, columns, sm120, expected) in [
+        (2048, 12288, 4096, true, true),
+        (2105, 12288, 4096, true, true),
+        (8192, 12288, 4096, true, true),
+        (2047, 12288, 4096, true, false),
+        (8193, 12288, 4096, true, false),
+        (2105, 12288, 4096, false, false),
+        (2105, 4096, 12288, true, false),
+        (2105, 6144, 2048, true, true),
+        (2105, 192, 64, true, false),
+    ] {
+        assert_eq!(long_down_actual_m(rows, inner, columns, sm120), expected);
     }
+}
 
-    #[cfg(feature = "metal")]
-    #[test]
-    fn fused_post_finalize_matches_the_op_sequence() -> Result<()> {
-        let device = candle_core::Device::new_metal(0)?;
-        let (batch, length, heads, width) = (2usize, 13usize, 32usize, 128usize);
-        let spread = |count: usize, offset: f64, scale: f64| -> Result<Tensor> {
-            Tensor::arange(0u32, count as u32, &device)?
-                .to_dtype(DType::F32)?
-                .affine(scale, offset)?
-                .sin()
-        };
-        let output = spread(batch * heads * length * width, 0.0, 0.0011)?
-            .reshape((batch, heads, length, width))?
-            .transpose(1, 2)?;
-        assert!(
-            !output.is_contiguous(),
-            "the strided path is the one in production"
-        );
-        let gate = spread(batch * length * heads * width, 0.6, 0.0007)?
-            .reshape((batch, length, heads, width))?
-            .to_dtype(DType::BF16)?;
-        let norm = spread(width, 1.3, 0.01)?;
-        let variance = output.sqr()?.mean_keepdim(D::Minus1)?;
-        let denominator = (variance + 1e-6)?.sqrt()?;
-
-        let expected = output
-            .broadcast_div(&denominator)?
-            .broadcast_mul(&norm)?
-            .broadcast_mul(&gate.to_dtype(DType::F32)?.silu()?)?
-            .to_dtype(DType::BF16)?;
-        let actual =
-            crate::kernels::metal::post_finalize_bf16(&output, &denominator, &gate, &norm)?;
-
-        assert_eq!(actual.dims(), expected.dims());
-        assert_eq!(actual.dtype(), DType::BF16);
-        let expected = expected
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        let actual = actual
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        let difference = expected
-            .iter()
-            .zip(actual)
-            .map(|(left, right)| (left - right).abs())
-            .fold(0f32, f32::max);
-        assert!(difference <= 1e-3, "maximum difference was {difference}");
-        Ok(())
-    }
-
-    #[cfg(feature = "metal")]
-    #[test]
-    fn fused_swiglu_matches_candle() -> Result<()> {
-        let device = candle_core::Device::new_metal(0)?;
-        let count = 4096 * 7;
-        let values: Vec<f32> = (0..count)
-            .map(|index| ((index * 97 % 1601) as f32 - 800.0) / 73.0)
-            .collect();
-        for dtype in [DType::F32, DType::F16, DType::BF16] {
-            let gate = Tensor::from_vec(values.clone(), (7, 4096), &device)?.to_dtype(dtype)?;
-            let up = gate.affine(-0.5, 0.25)?;
-            let expected = (gate.silu()? * up.clone())?;
-            let actual = crate::kernels::metal::swiglu(&gate, &up)?;
-
-            assert_eq!(actual.dims(), expected.dims());
-            assert_eq!(actual.dtype(), dtype);
-            let expected = expected
-                .to_dtype(DType::F32)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-            let actual = actual
-                .to_dtype(DType::F32)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-            let difference = expected
-                .iter()
-                .zip(actual)
-                .map(|(left, right)| (left - right).abs())
-                .fold(0f32, f32::max);
-            let tolerance = match dtype {
-                DType::F32 => 1e-5,
-                DType::F16 => 1e-1,
-                _ => 5e-1,
-            };
-            assert!(
-                difference <= tolerance,
-                "{dtype:?}: maximum difference was {difference}"
-            );
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "metal")]
-    #[test]
-    fn fused_delta_inputs_match_the_op_sequence() -> Result<()> {
-        let device = candle_core::Device::new_metal(0)?;
-        let (batch, length) = (2usize, 37usize);
-        let (key_heads, value_heads, dim) = (16usize, 32usize, 128usize);
-        let key_width = key_heads * dim;
-        let mixed_width = 2 * key_width + value_heads * dim;
-
-        let spread = |count: usize, offset: f64| -> Result<Tensor> {
-            Tensor::arange(0u32, count as u32, &device)?
-                .to_dtype(DType::F32)?
-                .affine(0.0007, offset)?
-                .sin()
-        };
-        let mixed = spread(batch * length * mixed_width, 0.0)?
-            .reshape((batch, length, mixed_width))?
-            .to_dtype(DType::BF16)?;
-        let beta_projection = spread(batch * length * value_heads, 0.3)?
-            .reshape((batch, length, value_heads))?
-            .to_dtype(DType::BF16)?;
-        let gate_projection = spread(batch * length * value_heads, 0.8)?
-            .reshape((batch, length, value_heads))?
-            .to_dtype(DType::BF16)?;
-        let dt_bias = spread(value_heads, 1.1)?;
-        let decay = spread(value_heads, 1.7)?.neg()?.exp()?.neg()?;
-        let query_scale = (dim as f64).powf(-0.5);
-
-        let reshape_keys =
-            |tensor: Tensor| -> Result<Tensor> { tensor.reshape((batch, length, key_heads, dim)) };
-        let q = reshape_keys(mixed.narrow(D::Minus1, 0, key_width)?)?;
-        let k = reshape_keys(mixed.narrow(D::Minus1, key_width, key_width)?)?;
-        let v = mixed
-            .narrow(D::Minus1, 2 * key_width, value_heads * dim)?
-            .reshape((batch, length, value_heads, dim))?;
-        let l2 = |xs: Tensor| -> Result<Tensor> {
-            let denom = (xs.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?;
-            xs.broadcast_div(&denom)
-        };
-        let q = (l2(q.to_dtype(DType::F32)?)? * query_scale)?;
-        let k = l2(k.to_dtype(DType::F32)?)?;
-        let v = v.to_dtype(DType::F32)?;
-        let beta = sigmoid(&beta_projection.to_dtype(DType::F32)?)?;
-        let gate_input = gate_projection
-            .to_dtype(DType::F32)?
-            .broadcast_add(&dt_bias)?;
-        let softplus = (gate_input.relu()? + (gate_input.abs()?.neg()?.exp()? + 1.)?.log()?)?;
-        let g = softplus.broadcast_mul(&decay)?;
-        let expected = crate::kernels::metal::pack_delta_f32(
-            &q.transpose(1, 2)?,
-            &k.transpose(1, 2)?,
-            &v.transpose(1, 2)?,
-            &g.transpose(1, 2)?,
-            &beta.transpose(1, 2)?,
-        )?;
-
-        let actual = crate::kernels::metal::pack_delta_inputs_bf16(
-            &mixed,
-            &beta_projection,
-            &gate_projection,
-            &dt_bias,
-            &decay,
-            key_heads,
-            value_heads,
-            query_scale as f32,
-        )?;
-
-        assert_eq!(actual.dims(), expected.dims());
-        let expected = expected.flatten_all()?.to_vec1::<f32>()?;
-        let actual = actual.flatten_all()?.to_vec1::<f32>()?;
-        let difference = expected
-            .iter()
-            .zip(actual)
-            .map(|(left, right)| (left - right).abs())
-            .fold(0f32, f32::max);
-        assert!(difference <= 1e-6, "maximum difference was {difference}");
-        Ok(())
-    }
-
-    #[test]
-    fn rms_norm_matches_the_open_coded_reference() -> Result<()> {
-        let device = {
-            #[cfg(feature = "metal")]
-            {
-                candle_core::Device::new_metal(0)?
-            }
-            #[cfg(not(feature = "metal"))]
-            {
-                candle_core::Device::Cpu
-            }
-        };
-        let width = 4096;
-        let weight = Tensor::arange(0u32, width as u32, &device)?
-            .to_dtype(DType::F32)?
-            .affine(2.0 / width as f64, -1.0)?;
-        let values: Vec<f32> = (0..3 * width)
-            .map(|index| ((index * 71 % 503) as f32 - 251.0) / 37.0)
-            .collect();
-
-        for dtype in [DType::F32, DType::BF16] {
-            let x = Tensor::from_vec(values.clone(), (1, 3, width), &device)?.to_dtype(dtype)?;
-            let weight = weight.to_dtype(dtype)?;
-            let norm = RmsNorm {
-                alpha: (&weight.to_dtype(DType::F32)? + 1.)?,
-                eps: 1e-6,
-            };
-            let expected = reference_rms_norm(&x, &weight, 1e-6)?
-                .to_dtype(DType::F32)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-            let actual = norm
-                .forward(&x)?
-                .to_dtype(DType::F32)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-            let difference = expected
-                .iter()
-                .zip(actual)
-                .map(|(left, right)| (left - right).abs())
-                .fold(0f32, f32::max);
-            let tolerance = if dtype == DType::F32 { 1e-5 } else { 1e-2 };
-            assert!(
-                difference <= tolerance,
-                "{dtype:?}: maximum difference was {difference}"
-            );
-        }
-        Ok(())
-    }
-
+fn full_attention_norm_rotary(
+    input: &Tensor,
+    norm: &RmsNorm,
+    rotary: &RotaryTensors,
+) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
-    #[test]
-    fn conv_cuda_matches_candle_across_batches_and_padding() {
-        let (batch, length, channels, kernel) = (2, 7, 31, 4);
-        let cpu = candle_core::Device::Cpu;
-        let projected = Tensor::from_vec(
-            (0..batch * length * channels)
-                .map(|index| ((index * 17 % 41) as f32 - 20.) * 0.04)
-                .collect::<Vec<_>>(),
-            (batch, length, channels),
-            &cpu,
-        )
-        .unwrap();
-        let weights = Tensor::from_vec(
-            (0..channels * kernel)
-                .map(|index| ((index * 11 % 23) as f32 - 11.) * 0.02)
-                .collect::<Vec<_>>(),
-            (channels, 1, kernel),
-            &cpu,
-        )
-        .unwrap();
-        let cuda = candle_core::Device::new_cuda(0).unwrap();
-        for dtype in [DType::BF16, DType::F32] {
-            let projected = projected.to_dtype(dtype).unwrap();
-            let weights = weights.to_dtype(dtype).unwrap();
-            let expected = causal_conv_silu(&projected, &weights, kernel)
-                .unwrap()
-                .to_dtype(DType::F32)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap();
-            let actual = cuda_conv_silu(
-                &projected.to_device(&cuda).unwrap(),
-                &weights.to_device(&cuda).unwrap(),
-            )
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-            let max_error = expected
-                .iter()
-                .zip(actual)
-                .map(|(expected, actual)| (expected - actual).abs())
-                .fold(0f32, f32::max);
-            assert!(
-                max_error < 0.001,
-                "{dtype:?} convolution error: {max_error}"
-            );
+    if input.device().is_cuda()
+        && input.dtype() == DType::BF16
+        && norm.weight.dtype() == DType::BF16
+    {
+        let (batch, length, heads, width) = input.dims4()?;
+        let strides = input.stride();
+        let stride = strides[2];
+        if batch > 0
+            && length > 0
+            && heads > 0
+            && (32..=1024).contains(&width)
+            && strides[3] == 1
+            && stride >= width
+            && strides[1] == heads * stride
+            && strides[0] == length * heads * stride
+            && rotary.dimension <= width
+            && rotary.dimension.is_multiple_of(2)
+            && rotary.cos.dtype() == DType::BF16
+            && rotary.sin.dtype() == DType::BF16
+        {
+            return cuda_full_norm_rope(input, &norm.weight, rotary, norm.eps);
         }
     }
+    rotary.apply(&norm.forward(input)?)
+}
 
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn delta_cuda_matches_chunked_reference() {
-        let batch = 2;
-        let heads = 2;
-        let length = 290;
-        let key_dim = 128;
-        let value_dim = 16;
-        let values = |width: usize, factor: f32| {
-            (0..batch * heads * length * width)
-                .map(|index| ((index * 13 % 29) as f32 - 14.) * factor)
-                .collect::<Vec<_>>()
-        };
-        let cpu = candle_core::Device::Cpu;
-        let q = Tensor::from_vec(
-            values(key_dim, 0.001),
-            (batch, heads, length, key_dim),
-            &cpu,
-        )
-        .unwrap();
-        let k = Tensor::from_vec(
-            values(key_dim, 0.006),
-            (batch, heads, length, key_dim),
-            &cpu,
-        )
-        .unwrap();
-        let v = Tensor::from_vec(
-            values(value_dim, 0.008),
-            (batch, heads, length, value_dim),
-            &cpu,
-        )
-        .unwrap();
-        let g = Tensor::from_vec(
-            vec![-0.002f32; batch * heads * length],
-            (batch, heads, length),
-            &cpu,
-        )
-        .unwrap();
-        let beta = Tensor::from_vec(
-            vec![0.5f32; batch * heads * length],
-            (batch, heads, length),
-            &cpu,
-        )
-        .unwrap();
-        let reference = chunked_delta_rule(&q, &k, &v, &g, &beta)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        let cuda = candle_core::Device::new_cuda(0).unwrap();
-        let actual = cuda_delta_rule(
-            &q.to_device(&cuda).unwrap(),
-            &k.to_device(&cuda).unwrap(),
-            &v.to_device(&cuda).unwrap(),
-            &g.to_device(&cuda).unwrap(),
-            &beta.to_device(&cuda).unwrap(),
-        )
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap();
-        let max_error = reference
-            .iter()
-            .zip(actual)
-            .map(|(expected, actual)| (expected - actual).abs())
-            .fold(0f32, f32::max);
-        assert!(max_error < 1e-4, "Max delta-rule error: {max_error}");
+impl Decoder {
+    fn forward_layers(&self, embeds: &Tensor, rotary: Option<&RotaryTensors>) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if embeds.device().is_cuda() && embeds.dtype() == DType::BF16 {
+            return self.forward_deferred(embeds, rotary, None);
+        }
+
+        let mut x = embeds.clone();
+        for layer in &self.layers {
+            x = layer.forward(&x, rotary)?;
+        }
+        self.norm.forward(&x)
     }
+}
 
-    #[test]
-    fn chunked_delta_rule_matches_scalar_recurrence_across_chunk_boundary() {
-        let length = 70;
-        let key_dim = 4;
-        let value_dim = 3;
-        let make = |width: usize, factor: f32| {
-            (0..length * width)
-                .map(|index| ((index * 13 % 29) as f32 - 14.) * factor)
-                .collect::<Vec<_>>()
-        };
-        let q = make(key_dim, 0.01);
-        let k = make(key_dim, 0.012);
-        let v = make(value_dim, 0.02);
-        let beta = vec![0.45f32; length];
-        let g = vec![-0.1f32; length];
-        let device = candle_core::Device::Cpu;
-        let output = chunked_delta_rule(
-            &Tensor::from_vec(q.clone(), (1, 1, length, key_dim), &device).unwrap(),
-            &Tensor::from_vec(k.clone(), (1, 1, length, key_dim), &device).unwrap(),
-            &Tensor::from_vec(v.clone(), (1, 1, length, value_dim), &device).unwrap(),
-            &Tensor::from_vec(g.clone(), (1, 1, length), &device).unwrap(),
-            &Tensor::from_vec(beta.clone(), (1, 1, length), &device).unwrap(),
-        )
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1::<f32>()
-        .unwrap();
-        let mut state = vec![0f32; key_dim * value_dim];
-        for step in 0..length {
-            let decay = g[step].exp();
-            for value in &mut state {
-                *value *= decay;
-            }
-            for column in 0..value_dim {
-                let remembered = (0..key_dim)
-                    .map(|row| k[step * key_dim + row] * state[row * value_dim + column])
-                    .sum::<f32>();
-                let delta = (v[step * value_dim + column] - remembered) * beta[step];
-                for row in 0..key_dim {
-                    state[row * value_dim + column] += k[step * key_dim + row] * delta;
+#[derive(Clone)]
+struct Linear {
+    inner: CandleLinear,
+    #[cfg(feature = "cuda")]
+    nn_weight: std::sync::Arc<std::sync::Mutex<Option<Tensor>>>,
+}
+impl Linear {
+    fn new(weight: Tensor, bias: Option<Tensor>) -> Self {
+        Self {
+            inner: CandleLinear::new(weight, bias),
+            #[cfg(feature = "cuda")]
+            nn_weight: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+impl std::ops::Deref for Linear {
+    type Target = CandleLinear;
+    fn deref(&self) -> &CandleLinear {
+        &self.inner
+    }
+}
+impl candle_core::Module for Linear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        candle_core::Module::forward(&self.inner, x)
+    }
+}
+
+impl LinearAttention {
+    fn project_qkvz(&self, x: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
+        #[cfg(feature = "cuda")]
+        if let Some(output) = self.project_merged_hopper_qkvz(x)? {
+            return Ok(output);
+        }
+        #[cfg(all(feature = "cuda", sys1_cuda_fused_ffn))]
+        if x.device().is_cuda()
+            && x.dtype() == DType::BF16
+            && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120")
+        {
+            let (batch, length, _) = x.dims3()?;
+            let rows = batch
+                .checked_mul(length)
+                .ok_or_else(|| candle_core::Error::Msg("QKV/Z rows overflow".into()))?;
+            #[cfg(test)]
+            let enabled = QKVZ_DUAL_ENABLED.with(std::cell::Cell::get);
+            #[cfg(not(test))]
+            let enabled = true;
+            if let Some(tile) =
+                crate::kernels::cuda::fused_qkvz::select_tile(rows).filter(|_| enabled)
+            {
+                let packed = self
+                    .qkvz_weight
+                    .lock()
+                    .map_err(|_| {
+                        candle_core::Error::Msg("poisoned model-owned QKV/Z weight".into())
+                    })?
+                    .clone();
+                if let Some(packed) = packed {
+                    let (qkv, z) = crate::kernels::cuda::fused_qkvz::forward(x, &packed, tile)?;
+                    #[cfg(test)]
+                    QKVZ_DUAL_CALLS.with(|c| c.set(c.get() + 1));
+                    return Ok((qkv, Some(z)));
                 }
-                let expected = (0..key_dim)
-                    .map(|row| q[step * key_dim + row] * state[row * value_dim + column])
-                    .sum::<f32>();
-                assert!((output[step * value_dim + column] - expected).abs() < 1e-4);
             }
         }
+        Ok((linear_attention_projection_forward(x, &self.qkv)?, None))
     }
+}
 
-    #[test]
-    fn chunked_delta_rule_stays_finite_with_large_negative_gates() {
-        let device = candle_core::Device::Cpu;
-        let q = Tensor::ones((1, 1, 64, 4), DType::F32, &device).unwrap();
-        let k = Tensor::ones((1, 1, 64, 4), DType::F32, &device).unwrap();
-        let v = Tensor::ones((1, 1, 64, 3), DType::F32, &device).unwrap();
-        let g = Tensor::new(-8f32, &device)
-            .unwrap()
-            .broadcast_as((1, 1, 64))
-            .unwrap();
-        let beta = Tensor::new(0.5f32, &device)
-            .unwrap()
-            .broadcast_as((1, 1, 64))
-            .unwrap();
-        let output = chunked_delta_rule(&q, &k, &v, &g, &beta)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        assert!(output.iter().all(|value| value.is_finite()));
+fn full_attention_gate_mul(
+    attention: &Tensor,
+    gate: &Tensor,
+    batch: usize,
+    length: usize,
+    width: usize,
+) -> Result<Tensor> {
+    let flat = attention.reshape((batch, length, width))?;
+    #[cfg(feature = "cuda")]
+    if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("90")
+        && let Some(output) = crate::kernels::cuda::pointwise_mul::try_mul(&flat, gate)?
+    {
+        return Ok(output);
     }
-
-    #[cfg(feature = "metal")]
-    #[test]
-    fn chunked_delta_rule_runs_with_broadcast_gates_on_metal() {
-        let device = candle_core::Device::new_metal(0).unwrap();
-        let q = Tensor::ones((1, 1, 64, 4), DType::F32, &device).unwrap();
-        let k = Tensor::ones((1, 1, 64, 4), DType::F32, &device).unwrap();
-        let v = Tensor::ones((1, 1, 64, 3), DType::F32, &device).unwrap();
-        let g = Tensor::new(-8f32, &device)
-            .unwrap()
-            .broadcast_as((1, 1, 64))
-            .unwrap();
-        let beta = Tensor::new(0.5f32, &device)
-            .unwrap()
-            .broadcast_as((1, 1, 64))
-            .unwrap();
-        let output = chunked_delta_rule(&q, &k, &v, &g, &beta)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        assert!(output.iter().all(|value| value.is_finite()));
-    }
+    &flat * gate
 }
