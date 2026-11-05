@@ -29,3 +29,6 @@ pub mod tokenizer;
 pub fn validate_backend() -> anyhow::Result<()> {
     device::validate_available()
 }
+
+mod inference;
+mod protocols;

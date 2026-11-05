@@ -335,7 +335,7 @@ impl FullAttention {
                 &k.transpose(1, 2)?.contiguous()?,
                 &v.transpose(1, 2)?.contiguous()?,
                 None,
-                true,
+                self.causal,
                 scale,
                 1.0,
             )?
@@ -360,7 +360,7 @@ impl FullAttention {
             *sequences.lengths.iter().max().unwrap(),
             *sequences.lengths.iter().max().unwrap(),
             scale,
-            true,
+            self.causal,
         )?
         .unsqueeze(0)?;
         crate::numerics::layer_capture(capture_index, "full-attention", &attention)?;
@@ -370,10 +370,15 @@ impl FullAttention {
                 &k.to_dtype(DType::F32)?,
                 &v.to_dtype(DType::F32)?,
                 scale,
-                true,
+                self.causal,
             )?;
-            let ordinary =
-                crate::kernels::cuda::attention::ordinary_reference(&q, &k, &v, scale, true)?;
+            let ordinary = crate::kernels::cuda::attention::ordinary_reference(
+                &q,
+                &k,
+                &v,
+                scale,
+                self.causal,
+            )?;
             crate::numerics::layer_capture(capture_index, "full-reference-f32", &reference)?;
             crate::numerics::layer_capture(capture_index, "full-reference-ordinary", &ordinary)?;
         }

@@ -13,7 +13,7 @@ fn normalized(probabilities: &[f32]) -> Vec<f64> {
         .collect()
 }
 
-pub(super) fn choice_confidence(probabilities: &[f32]) -> f32 {
+pub(crate) fn choice_confidence(probabilities: &[f32]) -> f32 {
     let n = probabilities.len();
     if n == 1 {
         return 1.;
@@ -23,7 +23,7 @@ pub(super) fn choice_confidence(probabilities: &[f32]) -> f32 {
     ((n as f64 * top - 1.) / (n - 1) as f64).clamp(0., 1.) as f32
 }
 
-pub(super) fn score_confidence(probabilities: &[f32]) -> f32 {
+pub(crate) fn score_confidence(probabilities: &[f32]) -> f32 {
     let n = probabilities.len();
     if n == 1 {
         return 1.;

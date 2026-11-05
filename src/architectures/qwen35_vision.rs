@@ -366,7 +366,11 @@ pub mod images {
         pub token_count: usize,
     }
 
-    pub fn validate_config(path: &Path, vision: &VisionConfig) -> anyhow::Result<()> {
+    pub fn validate_config_with_limit(
+        path: &Path,
+        vision: &VisionConfig,
+        max_pixels: usize,
+    ) -> anyhow::Result<()> {
         let config: Value = serde_json::from_slice(&fs::read(path)?)?;
         let processor = config
             .get("image_processor")
@@ -385,7 +389,7 @@ pub mod images {
             "temporal_patch_size": vision.temporal_patch_size,
             "resample": 3,
             "rescale_factor": 1.0 / 255.0,
-            "size": {"shortest_edge": 65536, "longest_edge": 16777216}
+            "size": {"shortest_edge": 65536, "longest_edge": max_pixels}
         });
         for (key, value) in expected.as_object().unwrap() {
             anyhow::ensure!(
@@ -416,7 +420,17 @@ pub mod images {
         Ok((width.parse()?, height.parse()?))
     }
 
+    #[cfg(test)]
     fn resized_size(height: usize, width: usize, factor: usize) -> anyhow::Result<(usize, usize)> {
+        resized_size_with_limit(height, width, factor, 16_777_216)
+    }
+
+    fn resized_size_with_limit(
+        height: usize,
+        width: usize,
+        factor: usize,
+        max_pixels: usize,
+    ) -> anyhow::Result<(usize, usize)> {
         anyhow::ensure!(height > 0 && width > 0, "image dimensions must be positive");
         anyhow::ensure!(
             height.max(width) <= 200usize.saturating_mul(height.min(width)),
@@ -430,8 +444,8 @@ pub mod images {
         let mut h = round(height);
         let mut w = round(width);
         let pixels = h.saturating_mul(w);
-        if pixels > 16_777_216 {
-            let beta = (height as f64 * width as f64 / 16_777_216f64).sqrt();
+        if pixels > max_pixels {
+            let beta = (height as f64 * width as f64 / max_pixels as f64).sqrt();
             h = ((height as f64 / beta / factor as f64).floor() as usize).max(1) * factor;
             w = ((width as f64 / beta / factor as f64).floor() as usize).max(1) * factor;
         } else if pixels < 65_536 {
@@ -447,6 +461,15 @@ pub mod images {
         config: &VisionConfig,
         max_tokens: usize,
     ) -> anyhow::Result<Images> {
+        decode_images_with_limit(images, config, max_tokens, 16_777_216)
+    }
+
+    pub fn decode_images_with_limit(
+        images: &[MediaInput],
+        config: &VisionConfig,
+        max_tokens: usize,
+        max_pixels: usize,
+    ) -> anyhow::Result<Images> {
         let mut patches = Vec::new();
         let mut grids = Vec::with_capacity(images.len());
         let mut token_count = 0usize;
@@ -459,7 +482,7 @@ pub mod images {
         for image in images {
             let data = input_bytes(image, "image")?;
             let (width, height) = dimensions(&data)?;
-            let (new_h, new_w) = resized_size(height, width, size * merge)?;
+            let (new_h, new_w) = resized_size_with_limit(height, width, size * merge, max_pixels)?;
             let image_tokens = (new_h / (size * merge)).saturating_mul(new_w / (size * merge));
             token_count = token_count.saturating_add(image_tokens);
             anyhow::ensure!(

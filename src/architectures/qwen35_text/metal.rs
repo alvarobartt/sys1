@@ -154,6 +154,7 @@ impl Mlp {
 }
 
 struct FullAttention {
+    causal: bool,
     q: Linear,
     k: Linear,
     v: Linear,
@@ -176,6 +177,7 @@ impl FullAttention {
         let rotary_dim =
             (config.head_dim as f64 * config.rope_parameters.partial_rotary_factor) as usize;
         Ok(Self {
+            causal: config.full_attention_causal,
             q: linear(
                 config.hidden_size,
                 config.num_attention_heads * config.head_dim * 2,
@@ -259,13 +261,13 @@ impl FullAttention {
             let mask = shared
                 .causal
                 .as_ref()
-                .ok_or_else(|| candle_core::Error::Msg("missing Qwen3.5 causal mask".into()))?
-                .broadcast_as((batch, self.heads, length, length))?;
+                .map(|m| m.broadcast_as((batch, self.heads, length, length)))
+                .transpose()?;
             let attention = candle_nn::ops::sdpa(
                 &q.transpose(1, 2)?.contiguous()?,
                 &k.transpose(1, 2)?.contiguous()?,
                 &v.transpose(1, 2)?.contiguous()?,
-                Some(&mask),
+                mask.as_ref(),
                 false,
                 scale,
                 1.0,
@@ -292,8 +294,13 @@ impl FullAttention {
                     let mask = Tensor::from_vec(
                         (start..start + count)
                             .flat_map(|row| {
-                                (0..length)
-                                    .map(move |col| if col > row { f32::NEG_INFINITY } else { 0. })
+                                (0..length).map(move |col| {
+                                    if self.causal && col > row {
+                                        f32::NEG_INFINITY
+                                    } else {
+                                        0.
+                                    }
+                                })
                             })
                             .collect::<Vec<_>>(),
                         (1, 1, count, length),
@@ -764,6 +771,13 @@ impl Decoder {
     }
 
     fn causal_mask(&self, embeds: &Tensor) -> Result<Option<Tensor>> {
+        if self
+            .layers
+            .iter()
+            .any(|layer| matches!(&layer.mixer, Mixer::Full(a) if !a.causal))
+        {
+            return Ok(None);
+        }
         let length = embeds.dim(1)?;
         let uses_sdpa = embeds.device().is_metal()
             && self.layers.iter().any(|layer| match &layer.mixer {

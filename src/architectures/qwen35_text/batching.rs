@@ -1,7 +1,7 @@
 const LENGTH_RATIO_NUMERATOR: usize = 5;
 const LENGTH_RATIO_DENOMINATOR: usize = 4;
 #[cfg(any(feature = "cuda", test))]
-pub(super) fn activation_bytes_per_token(
+pub(crate) fn activation_bytes_per_token(
     dtype_bytes: usize,
     hidden: usize,
     intermediate: usize,
@@ -31,7 +31,7 @@ pub(super) fn activation_bytes_per_token(
     linear_f32.saturating_add(linear_low_precision).max(mlp)
 }
 
-pub(super) fn cuda_token_budget(
+pub(crate) fn cuda_token_budget(
     free_bytes: usize,
     bytes_per_token: usize,
     max_length: usize,
@@ -40,7 +40,7 @@ pub(super) fn cuda_token_budget(
 }
 
 #[allow(dead_code)]
-pub(super) fn cuda_token_budget_for_attention(
+pub(crate) fn cuda_token_budget_for_attention(
     free_bytes: usize,
     bytes_per_token: usize,
     max_length: usize,
@@ -53,11 +53,11 @@ pub(super) fn cuda_token_budget_for_attention(
     }
 }
 
-pub(super) fn estimated_memory_tokens(free_bytes: usize, bytes_per_token: usize) -> usize {
+pub(crate) fn estimated_memory_tokens(free_bytes: usize, bytes_per_token: usize) -> usize {
     free_bytes.saturating_sub(free_bytes / 4) / bytes_per_token.max(1)
 }
 
-pub(super) fn estimated_active_rows(
+pub(crate) fn estimated_active_rows(
     token_budget: usize,
     max_length: usize,
     row_length: usize,
@@ -70,7 +70,7 @@ pub(super) fn estimated_active_rows(
 }
 
 #[allow(dead_code)]
-pub(super) fn estimated_active_rows_for_attention(
+pub(crate) fn estimated_active_rows_for_attention(
     token_budget: usize,
     max_length: usize,
     row_length: usize,
@@ -87,17 +87,17 @@ pub(super) fn estimated_active_rows_for_attention(
 }
 
 #[cfg(any(feature = "cuda", test))]
-pub(super) fn refreshed_token_budget(current: usize, live: usize) -> usize {
+pub(crate) fn refreshed_token_budget(current: usize, live: usize) -> usize {
     current.min(live).max(1)
 }
 
-pub(super) fn token_budget_after_oom(current: usize, failed_padded_tokens: usize) -> usize {
+pub(crate) fn token_budget_after_oom(current: usize, failed_padded_tokens: usize) -> usize {
     current
         .min(failed_padded_tokens.saturating_sub(1) / 2)
         .max(1)
 }
 
-pub(super) fn buckets(
+pub(crate) fn buckets(
     lengths: &[(usize, usize)],
     max_length: usize,
     token_budget: usize,
@@ -106,7 +106,7 @@ pub(super) fn buckets(
 }
 
 #[allow(dead_code)]
-pub(super) fn buckets_for_attention(
+pub(crate) fn buckets_for_attention(
     lengths: &[(usize, usize)],
     max_length: usize,
     token_budget: usize,
@@ -149,7 +149,7 @@ pub(super) fn buckets_for_attention(
     result
 }
 
-pub(super) fn packed_buckets(
+pub(crate) fn packed_buckets(
     lengths: &[(usize, usize)],
     max_length: usize,
     budget: usize,
@@ -185,7 +185,7 @@ pub(super) fn packed_buckets(
 }
 
 #[cfg(feature = "cuda")]
-pub(super) fn c64_scratch_bytes_per_token(key_dim: usize, value_dim: usize, heads: usize) -> usize {
+pub(crate) fn c64_scratch_bytes_per_token(key_dim: usize, value_dim: usize, heads: usize) -> usize {
     let base = heads
         .saturating_mul(key_dim.saturating_add(value_dim).saturating_add(64 + 2))
         .saturating_mul(4);
@@ -210,7 +210,7 @@ pub(super) fn c64_scratch_bytes_per_token(key_dim: usize, value_dim: usize, head
     .saturating_add(prepack.div_ceil(2))
 }
 
-pub(super) fn aggregate_work_multiplier() -> usize {
+pub(crate) fn aggregate_work_multiplier() -> usize {
     if matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90")) {
         4
     } else {
@@ -218,7 +218,7 @@ pub(super) fn aggregate_work_multiplier() -> usize {
     }
 }
 
-pub(super) fn long_work_budget(
+pub(crate) fn long_work_budget(
     max_length: usize,
     memory_budget: usize,
     row_length: usize,
@@ -231,7 +231,7 @@ pub(super) fn long_work_budget(
     })
 }
 
-pub(super) fn packed_buckets_long_work(
+pub(crate) fn packed_buckets_long_work(
     lengths: &[(usize, usize)],
     max_length: usize,
     memory_budget: usize,

@@ -1,5 +1,7 @@
+pub(crate) mod batching;
 #[cfg(feature = "cuda")]
 mod cuda;
+pub(crate) mod inference;
 #[cfg(feature = "cuda")]
 pub(crate) use cuda::compensated_bf16_projection;
 #[cfg(all(test, feature = "cuda"))]
@@ -28,6 +30,8 @@ pub struct Config {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct TextConfig {
+    #[serde(skip, default = "causal_attention")]
+    pub full_attention_causal: bool,
     pub dtype: Option<String>,
     pub vocab_size: usize,
     pub hidden_size: usize,
@@ -66,6 +70,10 @@ pub struct VisionConfig {
     pub spatial_merge_size: usize,
     pub out_hidden_size: usize,
     pub num_position_embeddings: usize,
+}
+
+fn causal_attention() -> bool {
+    true
 }
 
 impl Config {
@@ -363,6 +371,7 @@ impl RotaryTensors {
 }
 
 struct FullAttention {
+    causal: bool,
     #[cfg(feature = "cuda")]
     merged_qkv: Option<Linear>,
     q: Linear,
@@ -584,6 +593,7 @@ impl FullAttention {
             }
         };
         Ok(Self {
+            causal: config.full_attention_causal,
             #[cfg(feature = "cuda")]
             merged_qkv,
             q,
@@ -618,7 +628,7 @@ impl FullAttention {
                 &k.transpose(1, 2)?.contiguous()?,
                 &v.transpose(1, 2)?.contiguous()?,
                 None,
-                true,
+                self.causal,
                 scale,
                 1.0,
             )?
@@ -634,7 +644,7 @@ impl FullAttention {
             crate::numerics::layer_capture(capture_index, "full-gated", &gated)?;
             return gated.apply(&self.output);
         }
-        let attention = attention_forward(&q, &k, &v, scale, true, self.implementation)?;
+        let attention = attention_forward(&q, &k, &v, scale, self.causal, self.implementation)?;
         crate::numerics::layer_capture(capture_index, "full-attention", &attention)?;
         #[cfg(feature = "cuda")]
         if crate::numerics::full_attention_reference_enabled(capture_index) {
@@ -643,10 +653,15 @@ impl FullAttention {
                 &k.to_dtype(DType::F32)?,
                 &v.to_dtype(DType::F32)?,
                 scale,
-                true,
+                self.causal,
             )?;
-            let ordinary =
-                crate::kernels::cuda::attention::ordinary_reference(&q, &k, &v, scale, true)?;
+            let ordinary = crate::kernels::cuda::attention::ordinary_reference(
+                &q,
+                &k,
+                &v,
+                scale,
+                self.causal,
+            )?;
             crate::numerics::layer_capture(capture_index, "full-reference-f32", &reference)?;
             crate::numerics::layer_capture(capture_index, "full-reference-ordinary", &ordinary)?;
         }

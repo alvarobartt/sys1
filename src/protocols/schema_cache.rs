@@ -1,4 +1,4 @@
-use super::clef_head::Question;
+use super::Question;
 use crate::schema::ApiError;
 use serde_json::{Map, Value};
 use std::{
@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub(super) struct CompiledSchema {
+pub(crate) struct CompiledSchema {
     pub ids: Vec<u32>,
     pub questions: Vec<Question>,
 }
@@ -56,7 +56,7 @@ struct State {
     bytes: usize,
 }
 
-pub(super) struct SchemaCache {
+pub(crate) struct SchemaCache {
     state: Mutex<State>,
     maximum_entries: usize,
     maximum_bytes: usize,

@@ -3,7 +3,7 @@ use anyhow::{Context, bail, ensure};
 use candle_core::{DType, safetensors::MmapedSafetensors};
 use std::{fs, path::Path};
 
-pub(super) fn parse(value: &str) -> anyhow::Result<DType> {
+pub(crate) fn parse(value: &str) -> anyhow::Result<DType> {
     match value {
         "float32" | "f32" | "fp32" => Ok(DType::F32),
         "float16" | "f16" | "fp16" => Ok(DType::F16),
@@ -69,7 +69,7 @@ fn stored(path: &Path) -> anyhow::Result<Vec<(DType, usize)>> {
 
 /// Explicit override, then config dtype, then the predominant floating-point
 /// weight dtype. Backend selection must never silently narrow BF16 to FP16.
-pub(super) fn resolve(
+pub(crate) fn resolve(
     path: &Path,
     architecture: Architecture,
     requested: Option<DType>,
