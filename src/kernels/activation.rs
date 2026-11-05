@@ -55,8 +55,41 @@ pub(crate) fn mul_silu(input: &Tensor, up: &Tensor) -> Result<Tensor> {
     silu(input)? * up
 }
 
+pub(crate) fn softplus(input: &Tensor) -> Result<Tensor> {
+    if input.device().is_cpu() {
+        let values = input
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let values = values
+            .into_iter()
+            .map(|x| x.max(0.) + (-x.abs()).exp().ln_1p())
+            .collect::<Vec<_>>();
+        return Tensor::from_vec(values, input.shape(), input.device())?.to_dtype(input.dtype());
+    }
+    input.relu()? + (input.abs()?.neg()?.exp()? + 1.)?.log()?
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cpu_softplus_preserves_small_negative_gate_values() -> Result<()> {
+        let device = candle_core::Device::Cpu;
+        let values = [-50f32, -20., -0.0001, 0., 20., 80.];
+        let input = Tensor::from_slice(&values, (2, 3), &device)?;
+        let output = softplus(&input)?;
+        assert_eq!(output.dims(), &[2, 3]);
+        for (input, actual) in values.iter().zip(output.flatten_all()?.to_vec1::<f32>()?) {
+            let x = f64::from(*input);
+            let expected = x.max(0.) + (-x.abs()).exp().ln_1p();
+            assert!(actual > 0. && actual.is_finite());
+            assert!(
+                (f64::from(actual) - expected).abs() <= 4. * f64::from(f32::EPSILON) * expected
+            );
+        }
+        Ok(())
+    }
+
     use super::*;
     #[test]
     fn cuda_bf16_silu_sigmoid_use_single_output_rounding() -> Result<()> {

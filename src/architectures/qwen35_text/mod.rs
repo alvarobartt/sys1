@@ -1333,7 +1333,7 @@ impl LinearAttention {
         let a = project(&self.a)?.to_dtype(DType::F32)?;
         crate::numerics::layer_capture(capture_index, "linear-a-projection", &a)?;
         let gate_input = a.broadcast_add(&self.dt_bias)?;
-        let softplus = (gate_input.relu()? + (gate_input.abs()?.neg()?.exp()? + 1.)?.log()?)?;
+        let softplus = crate::kernels::activation::softplus(&gate_input)?;
         Ok((softplus.broadcast_mul(&self.a_log)?, beta))
     }
 
@@ -1566,12 +1566,23 @@ fn chunked_delta_rule_fallback(
     g: &Tensor,
     beta: &Tensor,
 ) -> Result<Tensor> {
+    let output_dtype = q.dtype();
+    let accumulation = if q.device().is_cpu() {
+        DType::F64
+    } else {
+        DType::F32
+    };
+    let q = q.to_dtype(accumulation)?;
+    let k = k.to_dtype(accumulation)?;
+    let v = v.to_dtype(accumulation)?;
+    let g = g.to_dtype(accumulation)?;
+    let beta = beta.to_dtype(accumulation)?;
     let (batch, heads, length, key_dim) = q.dims4()?;
     let value_dim = v.dim(D::Minus1)?;
-    let mut state = Tensor::zeros((batch, heads, key_dim, value_dim), DType::F32, q.device())?;
+    let mut state = Tensor::zeros((batch, heads, key_dim, value_dim), accumulation, q.device())?;
     let mut outputs = Vec::with_capacity(length.div_ceil(32));
-    let full_lower = Tensor::tril2(32, DType::F32, q.device())?;
-    let full_identity = Tensor::eye(32, DType::F32, q.device())?;
+    let full_lower = Tensor::tril2(32, accumulation, q.device())?;
+    let full_identity = Tensor::eye(32, accumulation, q.device())?;
     let full_strictly_lower = (&full_lower - &full_identity)?;
     for start in (0..length).step_by(32) {
         let count = (length - start).min(32);
@@ -1587,8 +1598,8 @@ fn chunked_delta_rule_fallback(
                 full_strictly_lower.clone(),
             )
         } else {
-            let lower = Tensor::tril2(count, DType::F32, q.device())?;
-            let identity = Tensor::eye(count, DType::F32, q.device())?;
+            let lower = Tensor::tril2(count, accumulation, q.device())?;
+            let identity = Tensor::eye(count, accumulation, q.device())?;
             let strictly_lower = (&lower - &identity)?;
             (lower, identity, strictly_lower)
         };
@@ -1629,7 +1640,9 @@ fn chunked_delta_rule_fallback(
         )?;
         state = (state.broadcast_mul(&last.exp()?.unsqueeze(3)?)? + updated)?;
     }
-    Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 2)?.transpose(1, 2)
+    Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 2)?
+        .transpose(1, 2)?
+        .to_dtype(output_dtype)
 }
 
 fn contiguous_matmul(left: &Tensor, right: &Tensor) -> Result<Tensor> {
