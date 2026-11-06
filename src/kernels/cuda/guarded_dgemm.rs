@@ -13,9 +13,6 @@ use std::sync::{Arc, Mutex};
 const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/cuda.ptx"));
 
 const CACHE_ENTRIES: usize = 96;
-#[cfg(sys1_cuda_fp64_emulation)]
-const CACHE_BYTES: usize = 128 * 1024 * 1024;
-#[cfg(not(sys1_cuda_fp64_emulation))]
 const CACHE_BYTES: usize = 1152 * 1024 * 1024;
 struct Entry {
     source: Tensor,
@@ -236,17 +233,6 @@ fn project_impl(input: &Tensor, linear: &candle_nn::Linear, coefficient: f64) ->
         false,
     );
 
-    #[cfg(sys1_cuda_fp64_emulation)]
-    let dot = if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("86")
-        && inner == 1024
-        && columns == 2048
-        && (8192..=16384).contains(&rows)
-    {
-        crate::kernels::cuda::emulated_dgemm::dot(&wide_input, &wide_weight)?
-    } else {
-        wide_input.matmul(&wide_weight.t()?)?
-    };
-    #[cfg(not(sys1_cuda_fp64_emulation))]
     let dot = wide_input.matmul(&wide_weight.t()?)?;
     let (ds, dl) = dot.storage_and_layout();
     let (as_, al) = weight_absolute.storage_and_layout();
@@ -298,38 +284,28 @@ fn project_impl(input: &Tensor, linear: &candle_nn::Linear, coefficient: f64) ->
 }
 
 pub(crate) fn head_cache_memory() -> (usize, usize, usize) {
-    let sm86_emulation =
-        cfg!(sys1_cuda_fp64_emulation) && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("86");
-    if !sm86_emulation && !matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90")) {
+    if !matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90")) {
         return (0, 0, 0);
     }
     let resident = CACHE
         .lock()
         .ok()
-        .and_then(|s| {
-            s.as_ref().map(|c| {
+        .and_then(|state| {
+            state.as_ref().map(|cache| {
                 (
-                    c.entries.len(),
-                    c.entries.iter().map(|e| e.bytes).sum::<usize>(),
+                    cache.entries.len(),
+                    cache.entries.iter().map(|entry| entry.bytes).sum::<usize>(),
                 )
             })
         })
         .unwrap_or((0, 0));
-    #[cfg(sys1_cuda_fp64_emulation)]
-    let (workspace_resident, workspace_capacity) = (
-        crate::kernels::cuda::emulated_dgemm::resident_workspace_bytes(),
-        crate::kernels::cuda::emulated_dgemm::WORKSPACE_BYTES,
-    );
-    #[cfg(not(sys1_cuda_fp64_emulation))]
-    let (workspace_resident, workspace_capacity) = (0usize, 0usize);
     (
         resident.0,
-        resident.1.saturating_add(workspace_resident),
-        CACHE_BYTES
-            .saturating_sub(resident.1)
-            .saturating_add(workspace_capacity.saturating_sub(workspace_resident)),
+        resident.1,
+        CACHE_BYTES.saturating_sub(resident.1),
     )
 }
+
 #[cfg(test)]
 static HEAD_ROUTE163_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 

@@ -65,50 +65,13 @@ pub(crate) fn cuda_bf16_projection(
         return crate::kernels::cuda::head_blaslt::project_gdn_ba(input, linear);
     }
 
-    #[cfg(sys1_cuda_fp64_emulation)]
     if !tensor_core
         && input.dtype() == DType::BF16
         && linear.bias().is_some()
-        && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("86")
-        && (16385..=32768).contains(&rows)
-        && inner == 1024
-        && columns == 2048
-    {
-        let (batch, length, _) = input.dims3()?;
-        let flattened = input.contiguous()?.reshape((1, rows, inner))?;
-        let chunk_rows = rows.div_ceil(rows.div_ceil(16384));
-        let mut parts = Vec::with_capacity(rows.div_ceil(chunk_rows));
-        for start in (0..rows).step_by(chunk_rows) {
-            let count = chunk_rows.min(rows - start);
-            parts.push(cuda_bf16_projection(
-                &flattened.narrow(1, start, count)?,
-                linear,
-                false,
-            )?);
-        }
-        return Tensor::cat(&parts, 1)?.reshape((batch, length, columns));
-    }
-
-    #[cfg(sys1_cuda_fp64_emulation)]
-    if !tensor_core
-        && input.dtype() == DType::BF16
-        && linear.bias().is_some()
-        && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("86")
-        && (8192..=16384).contains(&rows)
-        && inner == 1024
-        && columns == 2048
-    {
-        return crate::kernels::cuda::guarded_dgemm::project(
-            input,
-            linear,
-            guarded_double_radius_coefficient_impl(inner, true),
-        );
-    }
-
-    if !tensor_core
-        && input.dtype() == DType::BF16
-        && linear.bias().is_some()
-        && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120")
+        && matches!(
+            option_env!("SYS1_CUDA_COMPUTE_CAP"),
+            Some("86" | "89" | "120")
+        )
         && rows >= 128
         && inner == 1024
         && columns == 2048

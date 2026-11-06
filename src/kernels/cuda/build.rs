@@ -6,45 +6,6 @@ mod assets;
 pub(crate) fn compile() {
     println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
     let capability = compute_capability();
-    if capability == 86 {
-        let version = Command::new("nvcc")
-            .arg("--version")
-            .output()
-            .expect("failed to inspect CUDA toolkit for FP64 emulation");
-        assert!(version.status.success(), "nvcc --version failed");
-        let version = String::from_utf8_lossy(&version.stdout);
-        let major = version
-            .split("release ")
-            .nth(1)
-            .and_then(|v| v.split('.').next())
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0);
-        let cuda_root = [
-            "CUDA_HOME",
-            "CUDA_PATH",
-            "CUDA_ROOT",
-            "CUDA_TOOLKIT_ROOT_DIR",
-        ]
-        .iter()
-        .find_map(env::var_os)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/usr/local/cuda"));
-        let header = cuda_root.join("include/cublas_api.h");
-        println!("cargo:rerun-if-changed={}", header.display());
-        let header = fs::read_to_string(header).unwrap_or_default();
-        if major >= 13
-            && [
-                "cublasSetFixedPointEmulationMantissaControl",
-                "cublasSetFixedPointEmulationMantissaBitOffset",
-                "cublasSetFixedPointEmulationMaxMantissaBitCount",
-            ]
-            .iter()
-            .all(|name| header.contains(name))
-        {
-            println!("cargo:rustc-cfg=sys1_cuda_fp64_emulation");
-        }
-    }
-
     compile_assets(capability);
     println!("cargo:rustc-env=SYS1_CUDA_COMPUTE_CAP={capability}");
     #[cfg(feature = "cuda")]

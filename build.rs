@@ -11,7 +11,6 @@ mod metal;
 fn main() {
     for name in [
         "sys1_cuda_fused_ffn",
-        "sys1_cuda_fp64_emulation",
         "sys1_cuda_direct_ffn",
         "sys1_cuda_fa4_sm90",
         "sys1_cuda_gdn_sm80",

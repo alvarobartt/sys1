@@ -15,8 +15,6 @@ pub(crate) mod span_mean;
 #[cfg(test)]
 pub(crate) mod stable_attention;
 
-#[cfg(sys1_cuda_fp64_emulation)]
-pub(crate) mod emulated_dgemm;
 #[cfg(sys1_cuda_fused_ffn)]
 pub(crate) mod fused_gate_up;
 #[cfg(sys1_cuda_fused_ffn)]
