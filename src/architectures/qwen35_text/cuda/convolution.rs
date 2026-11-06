@@ -291,14 +291,13 @@ pub(crate) fn cuda_conv_qkv_impl(
     let length_arg = length as i32;
     let kernel_arg = kernel as i32;
 
-    let lookup157 = option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("90")
-        && batch * length >= 513
+    let use_lookup = option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("90")
         && kernel == 4
         && key_heads == 16
         && value_heads == 32
         && x0 % 4 == 0
         && w0 % 8 == 0;
-    let mut prepared = if prepare_qv && lookup157 {
+    let mut prepared = if prepare_qv && use_lookup {
         if let Some(sequences) = sequences {
             gated_delta::prepare_qv(input.device(), &sequences.lengths)?
         } else {
@@ -310,7 +309,7 @@ pub(crate) fn cuda_conv_qkv_impl(
     let name = if prepared.is_some() {
         "qwen35_convcast_qkv_packed"
     } else {
-        match (lookup157, sequences.is_some()) {
+        match (use_lookup, sequences.is_some()) {
             (true, true) => "qwen35_conv_lookup_packed",
             (true, false) => "qwen35_conv_lookup_uniform",
             (false, true) => "qwen35_conv_qkv_packed",
@@ -373,7 +372,7 @@ pub(crate) fn cuda_conv_qkv_impl(
             }
             Ok(())
         };
-    if lookup157 {
+    if use_lookup {
         #[cfg(test)]
         CONV_LOOKUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::kernels::cuda::activation::with_sigmoid_lookup(&device, |table| run(Some(table)))?;

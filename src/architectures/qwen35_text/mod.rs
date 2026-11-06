@@ -777,8 +777,10 @@ impl LinearAttention {
             #[cfg(feature = "cuda")]
             if x.device().is_cuda()
                 && x.dtype() == DType::BF16
-                && matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("89" | "120"))
-                && batch.saturating_mul(length) >= 512
+                && matches!(
+                    option_env!("SYS1_CUDA_COMPUTE_CAP"),
+                    Some("80" | "86" | "89" | "90" | "120")
+                )
                 && self.key_dim == 128
                 && self.value_dim == 128
             {
