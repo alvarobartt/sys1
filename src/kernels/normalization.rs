@@ -4,7 +4,11 @@ use candle_nn::LayerNorm;
 use rayon::prelude::*;
 
 pub(crate) fn layer_norm(input: &Tensor, layer: &LayerNorm) -> Result<Tensor> {
-    if cpu_f32(input) && layer.bias().is_none() && layer.remove_mean() {
+    if cfg!(target_arch = "x86_64")
+        && cpu_f32(input)
+        && layer.bias().is_none()
+        && layer.remove_mean()
+    {
         return normalize_f32(input, layer.weight(), layer.eps());
     }
     input.apply(layer)
