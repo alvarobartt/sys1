@@ -26,4 +26,10 @@ jobs:
           key: lint-v2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: lint-v2-${{ runner.os }}-
       - run: cargo fmt --check
+      - name: Check device formatting
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/clang-format"
+          "${RUNNER_TEMP}/clang-format/bin/pip" install clang-format==18.1.8
+          git ls-files -z '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' '*.cu' '*.cuh' '*.metal' \
+            | xargs -0 "${RUNNER_TEMP}/clang-format/bin/clang-format" --dry-run --Werror
       - run: cargo clippy --locked --no-default-features --features cpu --all-targets -- -D warnings
