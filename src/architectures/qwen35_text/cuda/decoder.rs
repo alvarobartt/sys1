@@ -9,36 +9,20 @@ impl Layer {
         sequences: Option<&PackedSequences>,
     ) -> Result<(Tensor, Tensor)> {
         let x = &residual;
-        let profile = layer_profiling_enabled();
-        if profile {
-            x.device().synchronize()?;
-        }
-        profiling::mark(x.device(), self.index, "start")?;
-        let started = Instant::now();
-        let had_update = update.is_some();
+
         let (x, normalized) = match update {
             Some(mlp) => self.input_norm.forward_residual(x, &mlp)?,
             None => (x.clone(), self.input_norm.forward(x)?),
         };
 
         drop(residual);
-        if had_update && self.index > 0 {
-            crate::numerics::capture(&format!("layer-{:02}-output", self.index - 1), &x)?;
-        }
-        crate::numerics::capture(&format!("layer-{:02}-normalized", self.index), &normalized)?;
-        profiling::mark(x.device(), self.index, "norm")?;
-        if profile {
-            x.device().synchronize()?;
-        }
-        let norm_ms = started.elapsed().as_secs_f64() * 1_000.;
-        let started = Instant::now();
+
         let mixed = match (&self.mixer, sequences) {
             (Mixer::Full(layer), Some(sequences)) => layer.forward_packed(
                 &normalized,
                 rotary.ok_or_else(|| {
                     candle_core::Error::Msg("Missing Qwen3.5 rotary tensors".into())
                 })?,
-                self.index,
                 sequences,
             )?,
             (Mixer::Full(layer), None) => layer.forward(
@@ -46,44 +30,17 @@ impl Layer {
                 rotary.ok_or_else(|| {
                     candle_core::Error::Msg("Missing Qwen3.5 rotary tensors".into())
                 })?,
-                self.index,
             )?,
             (Mixer::Linear(layer), Some(sequences)) => {
-                layer.forward_packed(&normalized, self.index, sequences)?
+                layer.forward_packed(&normalized, sequences)?
             }
-            (Mixer::Linear(layer), None) => layer.forward(&normalized, self.index)?,
+            (Mixer::Linear(layer), None) => layer.forward(&normalized)?,
         };
-        crate::numerics::capture(&format!("layer-{:02}-mixed", self.index), &mixed)?;
-        profiling::mark(x.device(), self.index, "mixer_tail")?;
-        if profile {
-            x.device().synchronize()?;
-        }
-        let mixer_ms = started.elapsed().as_secs_f64() * 1_000.;
-        let started = Instant::now();
-        let (x, post_normalized) = self.post_norm.forward_residual(&x, &mixed)?;
-        profiling::mark(x.device(), self.index, "residual_and_post_norm")?;
-        crate::numerics::capture(
-            &format!("layer-{:02}-post-normalized", self.index),
-            &post_normalized,
-        )?;
-        let mlp_output = self.mlp.forward(&post_normalized, self.index)?;
-        crate::numerics::capture(&format!("layer-{:02}-mlp-output", self.index), &mlp_output)?;
 
-        profiling::mark(x.device(), self.index, "mlp_residual_deferred")?;
-        if profile {
-            x.device().synchronize()?;
-            tracing::info!(
-                layer = self.index,
-                mixer = match &self.mixer {
-                    Mixer::Full(_) => "full",
-                    Mixer::Linear(_) => "linear",
-                },
-                norm_ms,
-                mixer_ms,
-                mlp_ms = started.elapsed().as_secs_f64() * 1_000.,
-                "Qwen3.5 layer profile"
-            );
-        }
+        let (x, post_normalized) = self.post_norm.forward_residual(&x, &mixed)?;
+
+        let mlp_output = self.mlp.forward(&post_normalized)?;
+
         Ok((x, mlp_output))
     }
 }
@@ -104,10 +61,8 @@ impl Decoder {
         }
         match update {
             Some(mlp) => {
-                let (hidden, output) = self.norm.forward_residual(&residual, &mlp)?;
-                if let Some(last) = self.layers.last() {
-                    crate::numerics::capture(&format!("layer-{:02}-output", last.index), &hidden)?;
-                }
+                let (_, output) = self.norm.forward_residual(&residual, &mlp)?;
+
                 Ok(output)
             }
             None => self.norm.forward(&residual),
@@ -339,10 +294,8 @@ impl Decoder {
     }
 
     pub(crate) fn forward_packed(&self, ids: &Tensor, lengths: &[usize]) -> Result<Tensor> {
-        if !self.supports_packed() || crate::numerics::enabled() {
-            candle_core::bail!(
-                "packed decoder requires supported Flash attention outside capture mode"
-            )
+        if !self.supports_packed() {
+            candle_core::bail!("packed decoder requires supported Flash attention")
         }
         let sequences = PackedSequences::new(lengths, ids.device())?;
         if ids.dims() != [1, sequences.total] {
@@ -365,9 +318,9 @@ impl Decoder {
             })
             .map(|rotary| rotary.prepare(&positions, embeds.dtype(), embeds.device()))
             .transpose()?;
-        profiling::begin(embeds.device())?;
+
         let output = self.forward_deferred(&embeds, rotary.as_ref(), Some(&sequences))?;
-        profiling::finish(1, sequences.total)?;
+
         Ok(output)
     }
 }

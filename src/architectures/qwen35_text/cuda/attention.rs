@@ -316,14 +316,10 @@ impl FullAttention {
         &self,
         x: &Tensor,
         rotary: &RotaryTensors,
-        capture_index: usize,
         sequences: &PackedSequences,
     ) -> Result<Tensor> {
-        if crate::numerics::enabled() {
-            candle_core::bail!("packed inference is not a singleton capture path")
-        }
         let (batch, length, _) = x.dims3()?;
-        let (q, k, v, gate) = self.project_finish(x, rotary, capture_index)?;
+        let (q, k, v, gate) = self.project_finish(x, rotary)?;
         let scale = (self.head_dim as f32).powf(-0.5);
         #[cfg(feature = "metal")]
         if x.device().is_metal()
@@ -340,7 +336,7 @@ impl FullAttention {
                 1.0,
             )?
             .transpose(1, 2)?;
-            crate::numerics::layer_capture(capture_index, "full-attention", &attention)?;
+
             let gated = full_attention_gate_mul(
                 &attention,
                 &gate,
@@ -348,7 +344,7 @@ impl FullAttention {
                 length,
                 self.heads * self.head_dim,
             )?;
-            crate::numerics::layer_capture(capture_index, "full-gated", &gated)?;
+
             return gated.apply(&self.output);
         }
         let attention = crate::kernels::cuda::attention::flash_attn_varlen(
@@ -363,28 +359,9 @@ impl FullAttention {
             self.causal,
         )?
         .unsqueeze(0)?;
-        crate::numerics::layer_capture(capture_index, "full-attention", &attention)?;
-        if crate::numerics::full_attention_reference_enabled(capture_index) {
-            let reference = crate::kernels::cuda::attention::ordinary_reference(
-                &q.to_dtype(DType::F32)?,
-                &k.to_dtype(DType::F32)?,
-                &v.to_dtype(DType::F32)?,
-                scale,
-                self.causal,
-            )?;
-            let ordinary = crate::kernels::cuda::attention::ordinary_reference(
-                &q,
-                &k,
-                &v,
-                scale,
-                self.causal,
-            )?;
-            crate::numerics::layer_capture(capture_index, "full-reference-f32", &reference)?;
-            crate::numerics::layer_capture(capture_index, "full-reference-ordinary", &ordinary)?;
-        }
+
         let gated =
             full_attention_gate_mul(&attention, &gate, batch, length, self.heads * self.head_dim)?;
-        crate::numerics::layer_capture(capture_index, "full-gated", &gated)?;
 
         linear_attention_projection_forward(&gated, &self.output)
     }

@@ -1,32 +1,15 @@
 use super::*;
 
 impl LinearAttention {
-    pub(crate) fn forward_packed(
-        &self,
-        x: &Tensor,
-        capture_index: usize,
-        sequences: &PackedSequences,
-    ) -> Result<Tensor> {
-        let mut profile = if layer_profiling_enabled() {
-            x.device().synchronize()?;
-            Some(Instant::now())
-        } else {
-            None
-        };
-        if !x.device().is_cuda()
-            || x.dtype() != DType::BF16
-            || self.key_dim != 128
-            || crate::numerics::enabled()
-        {
-            candle_core::bail!("unsupported packed recurrent architecture/capture mode")
+    pub(crate) fn forward_packed(&self, x: &Tensor, sequences: &PackedSequences) -> Result<Tensor> {
+        if !x.device().is_cuda() || x.dtype() != DType::BF16 || self.key_dim != 128 {
+            candle_core::bail!("unsupported packed recurrent architecture")
         }
         let (batch, length, _) = x.dims3()?;
         let key_width = self.key_heads * self.key_dim;
         let value_width = self.value_heads * self.value_dim;
         let (projected, early_z) = self.project_qkvz(x)?;
         let mut prepared_qv = None;
-        crate::numerics::layer_capture(capture_index, "linear-projected", &projected)?;
-        linear_profile_checkpoint(x, capture_index, "qkv_projection", &mut profile)?;
 
         if matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90"))
             && self.value_dim == 128
@@ -38,9 +21,8 @@ impl LinearAttention {
                 sequences,
             )?
         {
-            linear_profile_checkpoint(x, capture_index, "convolution_qkv_fused", &mut profile)?;
-            let (g, beta) = self.reference_gates_packed_tensor16(x, capture_index, sequences)?;
-            linear_profile_checkpoint(x, capture_index, "qk_and_gates", &mut profile)?;
+            let (g, beta) = self.reference_gates_packed_tensor16(x, sequences)?;
+
             if let Some(output) = gated_delta::try_forward_prepared_source(
                 &projected,
                 &self.conv,
@@ -49,23 +31,8 @@ impl LinearAttention {
                 &sequences.lengths,
                 ticket,
             )? {
-                crate::numerics::layer_capture(capture_index, "linear-delta", &output)?;
-                linear_profile_checkpoint(x, capture_index, "delta_rule", &mut profile)?;
-                let result = self.finish_delta(
-                    x,
-                    output,
-                    batch,
-                    length,
-                    value_width,
-                    capture_index,
-                    early_z,
-                )?;
-                linear_profile_checkpoint(
-                    x,
-                    capture_index,
-                    "finalize_and_projection",
-                    &mut profile,
-                )?;
+                let result = self.finish_delta(x, output, batch, length, value_width, early_z)?;
+
                 return Ok(result);
             }
         }
@@ -85,7 +52,7 @@ impl LinearAttention {
                 let vstorage_enabled = VSTORAGE_MODEL_REPLAY.with(std::cell::Cell::get);
                 #[cfg(not(test))]
                 let vstorage_enabled = true;
-                let values = if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("90") {
+                if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("90") {
                     let (values, prepared) = cuda_conv_qkv_prepared(
                         &projected,
                         &self.conv,
@@ -113,14 +80,7 @@ impl LinearAttention {
                         self.value_heads,
                         Some(sequences),
                     )?
-                };
-
-                if crate::numerics::enabled() {
-                    let mixed = cuda_conv_silu_packed_sequences(&projected, &self.conv, sequences)?;
-                    crate::numerics::layer_capture(capture_index, "linear-conv", &mixed)?;
                 }
-                linear_profile_checkpoint(x, capture_index, "convolution_qkv_fused", &mut profile)?;
-                values
             } else {
                 let mixed = if x.device().is_cuda() && matches!(x.dtype(), DType::BF16 | DType::F32)
                 {
@@ -138,8 +98,7 @@ impl LinearAttention {
                 };
                 #[cfg(not(any(feature = "cuda", feature = "metal")))]
                 let mixed = causal_conv_silu(&projected, &self.conv, self.kernel)?;
-                crate::numerics::layer_capture(capture_index, "linear-conv", &mixed)?;
-                linear_profile_checkpoint(x, capture_index, "convolution", &mut profile)?;
+
                 let (q, k, v) = {
                     if x.device().is_cuda()
                         && x.dtype() == DType::BF16
@@ -275,8 +234,7 @@ impl LinearAttention {
                 };
                 #[cfg(not(any(feature = "cuda", feature = "metal")))]
                 let mixed = causal_conv_silu(&projected, &self.conv, self.kernel)?;
-                crate::numerics::layer_capture(capture_index, "linear-conv", &mixed)?;
-                linear_profile_checkpoint(x, capture_index, "convolution", &mut profile)?;
+
                 let (q, k, v) = {
                     if x.device().is_cuda()
                         && x.dtype() == DType::BF16
@@ -395,13 +353,8 @@ impl LinearAttention {
                 (q, k, v)
             }
         };
-        let (g, beta) = self.reference_gates_packed_tensor16(x, capture_index, sequences)?;
-        crate::numerics::layer_capture(capture_index, "linear-q", &q)?;
-        crate::numerics::layer_capture(capture_index, "linear-k", &k)?;
-        crate::numerics::layer_capture(capture_index, "linear-v", &v)?;
-        crate::numerics::layer_capture(capture_index, "linear-g", &g)?;
-        crate::numerics::layer_capture(capture_index, "linear-beta", &beta)?;
-        linear_profile_checkpoint(x, capture_index, "qk_and_gates", &mut profile)?;
+        let (g, beta) = self.reference_gates_packed_tensor16(x, sequences)?;
+
         if x.device().is_cuda() && self.key_dim == 128 {
             let output = if x.dtype() == DType::BF16
                 && matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90"))
@@ -413,7 +366,6 @@ impl LinearAttention {
                     &v,
                     (&g, &beta),
                     sequences,
-                    false,
                     prepared_qv.take(),
                 )?
             } else if x.dtype() == DType::BF16
@@ -421,37 +373,21 @@ impl LinearAttention {
                 && self.value_dim == 128
             {
                 if v.dtype() == DType::BF16 {
-                    cuda_vstore_gdn_varlen(&q, &k, &v, &g, &beta, sequences, false)?
+                    cuda_vstore_gdn_varlen(&q, &k, &v, &g, &beta, sequences)?
                 } else {
-                    cuda_c64bfout_varlen(&q, &k, &v, &g, &beta, sequences, false)?
+                    cuda_c64bfout_varlen(&q, &k, &v, &g, &beta, sequences)?
                 }
             } else if x.dtype() == DType::BF16
                 && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120")
                 && self.value_dim <= 128
             {
-                cuda_c64_varlen(&q, &k, &v, &g, &beta, sequences, false)?
+                cuda_c64_varlen(&q, &k, &v, &g, &beta, sequences)?
             } else {
                 cuda_delta_rule_packed_sequences(&q, &k, &v, &g, &beta, sequences, true)?
             };
-            crate::numerics::layer_capture(capture_index, "linear-delta", &output)?;
-            if crate::numerics::enabled() {
-                crate::numerics::layer_capture(
-                    capture_index,
-                    "linear-delta-rounded",
-                    &output.to_dtype(x.dtype())?,
-                )?;
-            }
-            linear_profile_checkpoint(x, capture_index, "delta_rule", &mut profile)?;
-            let result = self.finish_delta(
-                x,
-                output,
-                batch,
-                length,
-                value_width,
-                capture_index,
-                early_z,
-            )?;
-            linear_profile_checkpoint(x, capture_index, "finalize_and_projection", &mut profile)?;
+
+            let result = self.finish_delta(x, output, batch, length, value_width, early_z)?;
+
             return Ok(result);
         }
         let q = q.transpose(1, 2)?;
@@ -460,31 +396,15 @@ impl LinearAttention {
         let beta = beta.transpose(1, 2)?;
         let g = g.transpose(1, 2)?;
         let output = chunked_delta_rule(&q, &k, &v, &g, &beta)?;
-        if crate::numerics::enabled() {
-            crate::numerics::layer_capture(
-                capture_index,
-                "linear-delta-rounded",
-                &output.to_dtype(x.dtype())?,
-            )?;
-        }
-        linear_profile_checkpoint(x, capture_index, "delta_rule", &mut profile)?;
-        let result = self.finish_delta(
-            x,
-            output,
-            batch,
-            length,
-            value_width,
-            capture_index,
-            early_z,
-        )?;
-        linear_profile_checkpoint(x, capture_index, "finalize_and_projection", &mut profile)?;
+
+        let result = self.finish_delta(x, output, batch, length, value_width, early_z)?;
+
         Ok(result)
     }
 
     pub(crate) fn reference_gates_packed_tensor16(
         &self,
         x: &Tensor,
-        capture_index: usize,
         sequences: &PackedSequences,
     ) -> Result<(Tensor, Tensor)> {
         if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120") && x.dtype() == DType::BF16 {
@@ -503,7 +423,7 @@ impl LinearAttention {
                 );
             }
         }
-        self.reference_gates(x, capture_index)
+        self.reference_gates(x)
     }
 }
 

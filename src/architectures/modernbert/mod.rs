@@ -157,13 +157,10 @@ impl Attention {
         mask: Option<&Tensor>,
         lengths: &[usize],
         window: Option<usize>,
-        capture_first_layer: bool,
     ) -> Result<Tensor> {
         let (batch, length, hidden) = xs.dims3()?;
         let projected = projection_forward(&xs.to_dtype(self.compute_dtype)?, &self.qkv)?;
-        if capture_first_layer {
-            crate::numerics::capture("modernbert-qkv-projected", &projected)?;
-        }
+
         let qkv = projected.reshape((batch, length, 3, self.heads, self.head_size))?;
         #[cfg(feature = "cuda")]
         let fused_rope = xs.device().is_cuda()
@@ -191,21 +188,6 @@ impl Attention {
             (q, k, v)
         };
         let scale = (self.head_size as f64).powf(-0.5);
-        if capture_first_layer {
-            for (name, value) in [
-                ("modernbert-attention-q", &q),
-                ("modernbert-attention-k", &k),
-                ("modernbert-attention-v", &v),
-            ] {
-                crate::numerics::capture(
-                    name,
-                    &value
-                        .transpose(1, 2)?
-                        .contiguous()?
-                        .reshape((batch, length, hidden))?,
-                )?;
-            }
-        }
 
         #[cfg(feature = "metal")]
         let attention =
@@ -245,13 +227,9 @@ impl Attention {
         let mixed = attention
             .transpose(1, 2)?
             .reshape((batch, length, hidden))?;
-        if capture_first_layer {
-            crate::numerics::capture("modernbert-attention-mixed", &mixed)?;
-        }
+
         let output = projection_forward(&mixed, &self.projection)?;
-        if capture_first_layer {
-            crate::numerics::capture("modernbert-attention-output", &output)?;
-        }
+
         Ok(output)
     }
 }
@@ -549,29 +527,17 @@ impl Mlp {
 
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.forward_with_capture(xs, false)
-    }
-}
-
-impl Mlp {
-    fn forward_with_capture(&self, xs: &Tensor, capture_first_layer: bool) -> Result<Tensor> {
         let projected = projection_forward(&xs.to_dtype(self.compute_dtype)?, &self.input)?;
-        if capture_first_layer {
-            crate::numerics::capture("modernbert-mlp-projected", &projected)?;
-        }
+
         #[cfg(feature = "cuda")]
         if projected.device().is_cuda() {
             let product = geglu(&projected)?;
-            if capture_first_layer {
-                crate::numerics::capture("modernbert-mlp-product", &product)?;
-            }
+
             return projection_forward(&product, &self.output);
         }
         let parts = projected.chunk(2, D::Minus1)?;
         let product = (&crate::kernels::activation::gelu_erf(&parts[0])? * &parts[1])?;
-        if capture_first_layer {
-            crate::numerics::capture("modernbert-mlp-product", &product)?;
-        }
+
         crate::kernels::linear::forward_compatible(&product, &self.output)
     }
 }
@@ -639,15 +605,12 @@ impl Layer {
         local_mask: Option<&Tensor>,
         lengths: &[usize],
         local_window: usize,
-        capture_first_layer: bool,
     ) -> Result<Tensor> {
         let normalized = match &self.attention_norm {
             Some(norm) => xs.apply(norm)?,
             None => xs.clone(),
         };
-        if capture_first_layer {
-            crate::numerics::capture("modernbert-normalized", &normalized)?;
-        }
+
         let mask = match (self.uses_local_attention, local_mask, global_mask) {
             (true, Some(local_mask), Some(global_mask)) => {
                 Some(global_mask.broadcast_add(local_mask)?)
@@ -663,20 +626,13 @@ impl Layer {
                 mask.as_ref(),
                 lengths,
                 self.uses_local_attention.then_some(local_window),
-                capture_first_layer,
             )?
             .to_dtype(xs.dtype())?;
         let xs = (attention + xs)?;
         let normalized = xs.apply(&self.mlp_norm)?;
-        if capture_first_layer {
-            crate::numerics::capture("modernbert-post-normalized", &normalized)?;
-        }
-        let mlp = self
-            .mlp
-            .forward_with_capture(&normalized, capture_first_layer)?;
-        if capture_first_layer {
-            crate::numerics::capture("modernbert-mlp-output", &mlp)?;
-        }
+
+        let mlp = self.mlp.forward(&normalized)?;
+
         let dtype = xs.dtype();
         xs + mlp.to_dtype(dtype)?
     }
@@ -759,19 +715,6 @@ impl Encoder {
         lengths: &[usize],
         has_padding: bool,
     ) -> Result<Tensor> {
-        crate::numerics::begin()?;
-        let capture = crate::numerics::enabled();
-        if capture {
-            crate::numerics::json("modernbert-input-ids", &ids.to_vec2::<u32>()?)?;
-            crate::numerics::capture("modernbert-input-mask", mask)?;
-            crate::numerics::json(
-                "modernbert-input-layout",
-                &serde_json::json!({
-                    "lengths": lengths, "has_padding": has_padding,
-                    "scope": "diagnostic first layer only; not whole-model parity or latency"
-                }),
-            )?;
-        }
         let length = ids.dim(1)?;
         let uses_eager_masks = matches!(
             self.implementation,
@@ -785,14 +728,13 @@ impl Encoder {
             .transpose()?;
         let local_window = self.local_attention_size / 2;
         let mut xs = ids.apply(&self.embeddings)?.apply(&self.norm)?;
-        for (index, layer) in self.layers.iter().enumerate() {
+        for layer in &self.layers {
             xs = layer.forward(
                 &xs,
                 global_mask.as_ref(),
                 local_mask.as_ref(),
                 lengths,
                 local_window,
-                capture && index == 0,
             )?;
         }
         xs.apply(&self.final_norm)

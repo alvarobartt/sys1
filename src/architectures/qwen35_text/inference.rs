@@ -100,6 +100,14 @@ fn validate_declared_dtypes(
     Ok(())
 }
 
+fn validate_device_dtype(dtype: DType, capability: Option<(i32, i32)>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        dtype != DType::BF16 || capability.is_none_or(|(major, _)| major >= 8),
+        "Qwen3.5 BF16 inference requires CUDA compute capability 8.0 or newer; use --dtype f32 if the model fits in memory"
+    );
+    Ok(())
+}
+
 pub(crate) struct Backbone {
     pub(crate) context: crate::protocols::Context,
     pub(crate) causal: bool,
@@ -112,13 +120,6 @@ pub(crate) struct Backbone {
     pub(crate) batch_token_budget: AtomicUsize,
 }
 
-impl std::ops::Deref for Backbone {
-    type Target = crate::protocols::Context;
-    fn deref(&self) -> &Self::Target {
-        &self.context
-    }
-}
-
 impl Backbone {
     pub(crate) fn load<H>(
         path: &Path,
@@ -127,12 +128,7 @@ impl Backbone {
         attention: AttentionImplementation,
         causal: bool,
         max_pixels: usize,
-        load_head: impl FnOnce(
-            &text::Config,
-            VarBuilder,
-            AttentionImplementation,
-            &tokenizer::Tokenizer,
-        ) -> anyhow::Result<H>,
+        load_head: impl FnOnce(&text::Config, VarBuilder, AttentionImplementation) -> anyhow::Result<H>,
     ) -> anyhow::Result<(Self, H)> {
         let dtype =
             crate::models::dtype::resolve(path, crate::models::Architecture::Qwen35, Some(dtype))?;
@@ -155,13 +151,8 @@ impl Backbone {
             !device.is_cpu() || dtype == DType::F32,
             "Qwen3.5 on CPU requires f32; use --dtype f32 explicitly"
         );
-        let capability = if attention == AttentionImplementation::Eager
-            || (attention == AttentionImplementation::Auto && dtype == DType::F32)
-        {
-            None
-        } else {
-            cuda_capability(&device)?
-        };
+        let capability = cuda_capability(&device)?;
+        validate_device_dtype(dtype, capability)?;
         let attention = if attention == AttentionImplementation::Auto && device.is_metal() {
             AttentionImplementation::Auto
         } else {
@@ -209,189 +200,16 @@ impl Backbone {
             attention,
         )
         .context("Qwen3.5 vision tower")?;
-        let head = load_head(&config, vb, attention, &tokenizer)?;
+        let head = load_head(&config, vb, attention)?;
         #[cfg(feature = "cuda")]
         let (batch_bytes_per_token, batch_token_budget) = if let Device::Cuda(cuda) = &device {
-            let key_width =
-                config.text_config.linear_num_key_heads * config.text_config.linear_key_head_dim;
-            let value_width = config.text_config.linear_num_value_heads
-                * config.text_config.linear_value_head_dim;
-            let bytes_per_token = batching::activation_bytes_per_token(
-                dtype.size_in_bytes(),
-                config.text_config.hidden_size,
-                config.text_config.intermediate_size,
-                key_width,
-                value_width,
-                config.text_config.linear_num_value_heads,
-            );
-            let packed_admission = dtype == DType::BF16
-                && matches!(
-                    option_env!("SYS1_CUDA_COMPUTE_CAP"),
-                    Some("80" | "86" | "89" | "90" | "120")
-                )
-                && decoder.supports_packed();
-            if packed_admission {
-                crate::kernels::cuda::memory::configure(cuda);
-            }
-            let c64_scratch_bytes_per_token = if packed_admission
-                && matches!(
-                    option_env!("SYS1_CUDA_COMPUTE_CAP"),
-                    Some("80" | "90" | "120")
-                )
-                && config.text_config.linear_value_head_dim <= 128
-            {
-                batching::c64_scratch_bytes_per_token(
-                    config.text_config.linear_key_head_dim,
-                    config.text_config.linear_value_head_dim,
-                    config.text_config.linear_num_value_heads,
-                )
-            } else {
-                0
-            };
-            let base_activation_bytes_per_token = bytes_per_token;
-            let bytes_per_token = bytes_per_token.saturating_add(c64_scratch_bytes_per_token);
-            let (free_bytes, _) = crate::kernels::cuda::memory::snapshot(cuda)
-                .context("Failed to query CUDA memory after loading Qwen3.5")?;
-            let maximum_projection_width = config
-                .text_config
-                .intermediate_size
-                .max(config.text_config.hidden_size)
-                .max(key_width.saturating_mul(2).saturating_add(value_width))
-                .max(
-                    config
-                        .text_config
-                        .num_attention_heads
-                        .saturating_mul(config.text_config.head_dim)
-                        .saturating_mul(2),
-                );
-            let index_token_capacity = (i32::MAX as usize) / maximum_projection_width.max(1);
-            let (_, _, head_cache_growth_reserve_bytes) =
-                crate::kernels::cuda::guarded_dgemm::head_cache163_memory();
-            let free_bytes = free_bytes.saturating_sub(head_cache_growth_reserve_bytes);
-            let before_layout_tokens = if packed_admission {
-                batching::estimated_memory_tokens(free_bytes, bytes_per_token)
-                    .max(1)
-                    .min(max_length.saturating_mul(
-                        if matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90")) {
-                            4
-                        } else if matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("86" | "120"))
-                        {
-                            2
-                        } else {
-                            1
-                        },
-                    ))
-                    .min(index_token_capacity.max(1))
-            } else {
-                batching::cuda_token_budget(free_bytes, bytes_per_token, max_length)
-            };
-            let nn_weight_bytes =
-                decoder.prepare_nn_weights(before_layout_tokens, bytes_per_token)?;
-            let (free_bytes, total_bytes) = crate::kernels::cuda::memory::snapshot(cuda)
-                .context("Failed to query CUDA memory after preparing optional layouts")?;
-            let (head_cache_entries, head_cache_resident_bytes, head_cache_growth_reserve_bytes) =
-                crate::kernels::cuda::guarded_dgemm::head_cache163_memory();
-            let memory_available_before_head_reserve = free_bytes;
-            let free_bytes = free_bytes.saturating_sub(head_cache_growth_reserve_bytes);
-            let budget = if packed_admission {
-                batching::estimated_memory_tokens(free_bytes, bytes_per_token)
-                    .max(1)
-                    .min(max_length.saturating_mul(
-                        if matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90")) {
-                            4
-                        } else if matches!(
-                            option_env!("SYS1_CUDA_COMPUTE_CAP"),
-                            Some("86" | "90" | "120")
-                        ) {
-                            2
-                        } else {
-                            1
-                        },
-                    ))
-                    .min(index_token_capacity.max(1))
-            } else {
-                batching::cuda_token_budget(free_bytes, bytes_per_token, max_length)
-            };
-            tracing::info!(
-                free_bytes,
-                total_bytes,
-                occupied_device_bytes =
-                    total_bytes.saturating_sub(memory_available_before_head_reserve),
-                optional_weight_layout_bytes = nn_weight_bytes,
-                memory_available_before_head_reserve,
-                head_cache_entries,
-                head_cache_resident_bytes,
-                head_cache_growth_reserve_bytes,
-                reserved_headroom_bytes = free_bytes / 4,
-                usable_activation_bytes = free_bytes.saturating_sub(free_bytes / 4),
-                bytes_per_token,
-                base_activation_bytes_per_token,
-                c64_scratch_bytes_per_token,
-                estimated_memory_tokens =
-                    batching::estimated_memory_tokens(free_bytes, bytes_per_token),
-                batch_token_budget = budget,
-                short_work_token_budget = if packed_admission
-                    && matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90"))
-                {
-                    budget.min(max_length)
-                } else {
-                    budget
-                },
-                long_work_token_budget = budget,
-                long_work_threshold_tokens = if packed_admission {
-                    match option_env!("SYS1_CUDA_COMPUTE_CAP") {
-                        Some("80") => 128usize,
-                        Some("90") => 128usize,
-                        _ => 0,
-                    }
-                } else {
-                    0
-                },
-                packed_token_admission = packed_admission,
-                max_context_tokens = max_length,
-                active_rows_at_512_tokens = batching::estimated_active_rows_for_attention(
-                    if packed_admission && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("90") {
-                        batching::long_work_budget(max_length, budget, 512, 128)
-                    } else {
-                        budget
-                    },
-                    max_length,
-                    512,
-                    packed_admission
-                ),
-                active_rows_at_2048_tokens = batching::estimated_active_rows_for_attention(
-                    if packed_admission && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("90") {
-                        batching::long_work_budget(max_length, budget, 2048, 128)
-                    } else {
-                        budget
-                    },
-                    max_length,
-                    2048,
-                    packed_admission
-                ),
-                active_rows_at_8192_tokens = batching::estimated_active_rows_for_attention(
-                    if packed_admission && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("90") {
-                        batching::long_work_budget(max_length, budget, 8192, 128)
-                    } else {
-                        budget
-                    },
-                    max_length,
-                    8192,
-                    packed_admission
-                ),
-                active_rows_at_16384_tokens = batching::estimated_active_rows_for_attention(
-                    if packed_admission && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("90") {
-                        batching::long_work_budget(max_length, budget, 16384, 128)
-                    } else {
-                        budget
-                    },
-                    max_length,
-                    16384,
-                    packed_admission
-                ),
-                "Qwen3.5 CUDA activation capacity estimate (not KV cache; rows also limited by server batch cap; singleton OOM remains possible)"
-            );
-            (bytes_per_token, budget)
+            super::cuda::admission::initialize_admission(
+                &decoder,
+                &config.text_config,
+                dtype,
+                max_length,
+                cuda,
+            )?
         } else {
             (1, max_length)
         };
@@ -423,9 +241,9 @@ impl Backbone {
         patches: &[f32],
         grids: &[[usize; 3]],
     ) -> Result<Tensor, ApiError> {
-        let patch_width = self.vision_config.in_channels
-            * self.vision_config.temporal_patch_size
-            * self.vision_config.patch_size.pow(2);
+        let patch_width = self.context.vision_config.in_channels
+            * self.context.vision_config.temporal_patch_size
+            * self.context.vision_config.patch_size.pow(2);
         let patches = Tensor::from_vec(
             patches.to_vec(),
             (patches.len() / patch_width, patch_width),
@@ -445,20 +263,21 @@ impl Backbone {
             match crate::kernels::cuda::memory::snapshot(cuda) {
                 Ok((free_bytes, total_bytes)) => {
                     let (_, _, head_cache_growth_reserve_bytes) =
-                        crate::kernels::cuda::guarded_dgemm::head_cache163_memory();
+                        crate::kernels::cuda::guarded_dgemm::head_cache_memory();
                     let free_bytes = free_bytes.saturating_sub(head_cache_growth_reserve_bytes);
                     let live = if self.packed_text_supported() {
                         batching::estimated_memory_tokens(free_bytes, self.batch_bytes_per_token)
                             .max(1)
                             .min(
-                                self.max_length
+                                self.context
+                                    .max_length
                                     .saturating_mul(batching::aggregate_work_multiplier()),
                             )
                     } else {
                         batching::cuda_token_budget(
                             free_bytes,
                             self.batch_bytes_per_token,
-                            self.max_length,
+                            self.context.max_length,
                         )
                     };
                     let selected = batching::refreshed_token_budget(current, live);
@@ -521,6 +340,23 @@ impl Backbone {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bf16_requires_ampere_or_newer_on_cuda() {
+        assert!(validate_device_dtype(DType::BF16, Some((7, 5))).is_err());
+        for capability in [
+            None,
+            Some((8, 0)),
+            Some((8, 6)),
+            Some((8, 9)),
+            Some((9, 0)),
+            Some((12, 0)),
+        ] {
+            validate_device_dtype(DType::BF16, capability).unwrap();
+        }
+        validate_device_dtype(DType::F16, Some((7, 5))).unwrap();
+        validate_device_dtype(DType::F32, Some((7, 5))).unwrap();
+    }
+
     #[test]
     fn checkpoint_dtype_rejects_unsafe_fp16_conversion() {
         for source in ["bfloat16", "float32"] {

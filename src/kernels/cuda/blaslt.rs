@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use candle_core::cuda_backend::{
     CudaStorage,
     cudarc::{
@@ -389,6 +387,7 @@ pub(crate) fn matmul_bf16(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
     matmul_bf16_impl(input, weight, None, None, false)
 }
 
+#[cfg(test)]
 pub(crate) fn project_fixed512(input: &Tensor, linear: &candle_nn::Linear) -> Result<Tensor> {
     if linear.bias().is_some() {
         candle_core::bail!("Fixed512 cuBLASLt requires unbiased projections")

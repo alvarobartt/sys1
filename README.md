@@ -40,7 +40,6 @@ Then run it with any of the supported models (more coming soon!).
 - [`convaiinnovations/laya-typed-decisions`](https://huggingface.co/convaiinnovations/laya-typed-decisions) for typed-decisions workflows
 - [`Cloudflare/clef`](https://huggingface.co/Cloudflare/clef) for text, image, and video decisions
 - [`Cloudflare/clef-flash`](https://huggingface.co/Cloudflare/clef-flash) for text, image, and video decisions (smaller and faster than the 27B variant)
-- [`perplexity-ai/pplx-decider-flash-v1.2`](https://huggingface.co/perplexity-ai/pplx-decider-flash-v1.2) for text and image decisions
 
 ```bash
 sys1 --model-id convaiinnovations/laya --dtype auto

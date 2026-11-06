@@ -297,7 +297,7 @@ fn project_impl(input: &Tensor, linear: &candle_nn::Linear, coefficient: f64) ->
     ))
 }
 
-pub(crate) fn head_cache163_memory() -> (usize, usize, usize) {
+pub(crate) fn head_cache_memory() -> (usize, usize, usize) {
     let sm86_emulation =
         cfg!(sys1_cuda_fp64_emulation) && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("86");
     if !sm86_emulation && !matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90")) {

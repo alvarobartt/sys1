@@ -27,14 +27,13 @@ pub(crate) use recurrence::*;
 mod packed;
 pub(crate) use packed::*;
 
+pub(super) mod admission;
 mod attention;
 mod decoder;
 mod linear_attention;
 pub(crate) use attention::*;
 
 pub(crate) mod prepared_convolution;
-
-pub(crate) mod profiling;
 
 pub(crate) const CUDA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/cuda.ptx"));
 

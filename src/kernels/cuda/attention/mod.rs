@@ -48,6 +48,7 @@ pub(crate) fn supported_test_device(device: &candle_core::Device) -> candle_core
     Ok((8..=9).contains(&capability.0) || capability == (12, 0))
 }
 
+#[cfg(test)]
 pub(crate) fn ordinary_reference(
     q: &candle_core::Tensor,
     k: &candle_core::Tensor,

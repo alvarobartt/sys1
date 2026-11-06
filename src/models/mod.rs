@@ -1,7 +1,6 @@
 mod clef;
 pub(crate) mod dtype;
 mod laya;
-mod pplx;
 
 use crate::schema::{ApiError, DecisionRequest, DecisionResponse};
 
@@ -13,7 +12,6 @@ use std::{fs, path::Path};
 
 pub use clef::Clef;
 pub use laya::Laya;
-pub use pplx::Pplx;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum AttentionImplementation {
@@ -183,7 +181,6 @@ struct LayaIdentity {
 pub enum Model {
     Laya(Box<Laya>),
     Clef(Box<Clef>),
-    Pplx(Box<Pplx>),
 }
 
 pub trait DecisionModel: Send + Sync {
@@ -213,7 +210,7 @@ pub trait DecisionModel: Send + Sync {
 
 impl DecisionModel for Model {
     fn supports_images(&self) -> bool {
-        matches!(self, Self::Clef(_) | Self::Pplx(_))
+        matches!(self, Self::Clef(_))
     }
 
     fn supports_videos(&self) -> bool {
@@ -227,7 +224,6 @@ impl DecisionModel for Model {
         match self {
             Self::Laya(model) => model.predict_batch(requests),
             Self::Clef(model) => model.predict_batch(requests),
-            Self::Pplx(model) => model.predict_batch(requests),
         }
     }
     fn predict_batch_incremental(
@@ -238,7 +234,6 @@ impl DecisionModel for Model {
         match self {
             Self::Laya(model) => model.predict_batch_incremental(requests, complete),
             Self::Clef(model) => model.predict_batch_incremental(requests, complete),
-            Self::Pplx(model) => model.predict_batch_incremental(requests, complete),
         }
     }
 }
@@ -254,20 +249,6 @@ pub fn load(
         Architecture::Laya => Laya::load(path, dtype, max_model_len, attention)
             .map(Box::new)
             .map(Model::Laya),
-        Architecture::Qwen35 if path.join("decision_config.json").is_file() => {
-            anyhow::ensure!(
-                !path.join("joint_head_config.json").exists(),
-                "Ambiguous Qwen3.5 decision head"
-            );
-            Pplx::load(
-                path,
-                dtype.map_or_else(|| model_default_dtype(path, architecture), Ok)?,
-                max_model_len,
-                attention,
-            )
-            .map(Box::new)
-            .map(Model::Pplx)
-        }
         Architecture::Qwen35 => Clef::load(
             path,
             match dtype {

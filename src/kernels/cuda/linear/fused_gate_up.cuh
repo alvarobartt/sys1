@@ -35,10 +35,8 @@ union alignas(16) Shared {
     typename ProductEpi::SharedStorage end;
 };
 
-template <bool Debug>
 __device__ __forceinline__ void fused_gate_up_body(const E *packed, const E *x,
-    const __nv_bfloat16 *lookup, __nv_bfloat16 *output, __nv_bfloat16 *debug_gate,
-    __nv_bfloat16 *debug_up, int rows, int n, int k) {
+    const __nv_bfloat16 *lookup, __nv_bfloat16 *output, int rows, int n, int k) {
     extern __shared__ __align__(16) unsigned char buffer[];
     auto &shared = *reinterpret_cast<Shared *>(buffer);
     const cutlass::gemm::GemmCoord tiled((rows + 127) / 128, n / 128, 1);
@@ -64,7 +62,6 @@ __device__ __forceinline__ void fused_gate_up_body(const E *packed, const E *x,
     static_assert(Mma::FragmentC::kElements == 128 && ProductFragment::kElements == 64,
         "paired MMA ownership");
     ProductFragment products;
-    const int warp_m = warp % Mma::WarpCount::kM, warp_n = warp / Mma::WarpCount::kM;
 #pragma unroll
     for (int i = 0; i < 64; i++) {
         const auto gate = __float2bfloat16_rn(accum[i]);
@@ -72,15 +69,7 @@ __device__ __forceinline__ void fused_gate_up_body(const E *packed, const E *x,
         const auto product = __float2bfloat16_rn(
             __fmul_rn(__bfloat162float(lookup[__bfloat16_as_ushort(gate)]), __bfloat162float(up)));
         products[i] = __bfloat162float(product);
-        if constexpr (Debug) {
-            const int r = warp_m * 64 + ((i / 4) % 4) * 16 + lane / 4 + ((i % 4) / 2) * 8;
-            const int c = warp_n * 32 + (i / 16) * 8 + (lane % 4) * 2 + i % 2;
-            if (token_base + r < rows) {
-                const size_t pos = size_t(token_base + r) * n + feature_base + c;
-                debug_gate[pos] = gate;
-                debug_up[pos] = up;
-            }
-        }
+
     }
     using Destination = typename ProductEpi::OutputTileIterator;
     typename Destination::Params params{Row(n)};
@@ -93,13 +82,7 @@ __device__ __forceinline__ void fused_gate_up_body(const E *packed, const E *x,
 static_assert(sizeof(Shared) == 73728, "Rust dynamic shared memory must match native layout");
 extern "C" __global__ __launch_bounds__(Threads) void fused_ffn_bf16(const E *weight,
     const E *input, const __nv_bfloat16 *table, __nv_bfloat16 *output, int rows, int n, int k) {
-    fused_gate_up_body<false>(weight, input, table, output, nullptr, nullptr, rows, n, k);
-}
-
-extern "C" __global__ __launch_bounds__(Threads) void fused_ffn_debug_bf16(const E *weight,
-    const E *input, const __nv_bfloat16 *table, __nv_bfloat16 *output, __nv_bfloat16 *gate,
-    __nv_bfloat16 *up, int rows, int n, int k) {
-    fused_gate_up_body<true>(weight, input, table, output, gate, up, rows, n, k);
+    fused_gate_up_body(weight, input, table, output, rows, n, k);
 }
 
 #include "fused_qkvz.cuh"

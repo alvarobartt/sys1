@@ -1059,11 +1059,7 @@ impl Mlp {
 
 impl Mlp {
     #[cfg(all(feature = "cuda", sys1_cuda_direct_ffn))]
-    pub(crate) fn direct_product(
-        &self,
-        x: &Tensor,
-        capture_index: usize,
-    ) -> Result<Option<Tensor>> {
+    pub(crate) fn direct_product(&self, x: &Tensor) -> Result<Option<Tensor>> {
         let rows = x.elem_count() / x.dim(D::Minus1)?.max(1);
         if !x.device().is_cuda() || x.dtype() != DType::BF16 || !(2048..=32768).contains(&rows) {
             return Ok(None);
@@ -1071,24 +1067,11 @@ impl Mlp {
         let Some(weight) = self.direct_weight.as_ref() else {
             return Ok(None);
         };
-        let result = crate::kernels::cuda::sm86::fused_gate_up::forward(
-            x,
-            weight,
-            crate::numerics::enabled(),
-        )?;
+        let result = crate::kernels::cuda::sm86::fused_gate_up::forward(x, weight)?;
         #[cfg(test)]
         DIRECT_MLP_CALLS.with(|slot| slot.set(slot.get() + 1));
-        if let Some((gate, up)) = result.projections {
-            crate::numerics::layer_capture(capture_index, "mlp-gate-projected", &gate)?;
-            crate::numerics::layer_capture(capture_index, "mlp-up-projected", &up)?;
-            crate::numerics::layer_capture(
-                capture_index,
-                "mlp-gate-activated",
-                &crate::kernels::activation::silu(&gate)?,
-            )?;
-        }
-        profiling::mark(x.device(), capture_index, "mlp_direct_gate_up_product")?;
-        Ok(Some(result.product))
+
+        Ok(Some(result))
     }
 }
 
@@ -1611,7 +1594,7 @@ mod tests {
                 for iteration in 0..6 {
                     for index in if iteration % 2 == 0 { [0, 1] } else { [1, 0] } {
                         device.synchronize()?;
-                        let started = Instant::now();
+                        let started = std::time::Instant::now();
                         let _ = run(if index == 0 { 0 } else { candidate })?;
                         device.synchronize()?;
                         samples[index].push(started.elapsed().as_secs_f64() * 1000.);
@@ -1699,7 +1682,7 @@ mod tests {
             for iteration in 0..6 {
                 for index in if iteration % 2 == 0 { [0, 1] } else { [1, 0] } {
                     device.synchronize()?;
-                    let started = Instant::now();
+                    let started = std::time::Instant::now();
                     let _ = run(index == 1)?;
                     device.synchronize()?;
                     samples[index].push(started.elapsed().as_secs_f64() * 1000.);
@@ -1775,7 +1758,7 @@ mod tests {
                 for iteration in 0..6 {
                     for index in if iteration % 2 == 0 { [0, 1] } else { [1, 0] } {
                         device.synchronize()?;
-                        let started = Instant::now();
+                        let started = std::time::Instant::now();
                         let _ = run(if index == 0 {
                             SimtProjection::Compensated
                         } else {

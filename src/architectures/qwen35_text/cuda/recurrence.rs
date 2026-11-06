@@ -493,7 +493,6 @@ pub(crate) fn cuda_chunk64_direct(
     g: &Tensor,
     beta: &Tensor,
     tile_columns: usize,
-    profiling: bool,
 ) -> Result<Tensor> {
     if [q, k, v, g, beta].iter().any(|x| x.dtype() != DType::F32) {
         candle_core::bail!("chunked recurrence requires FP32 inputs");
@@ -629,10 +628,7 @@ pub(crate) fn cuda_chunk64_direct(
             snapshots,
             ..
         } = workspace;
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-        }
-        let mut stage_started = Instant::now();
+
         let w = grow_chunk_buffer(w, &device, w_count)?;
         let u = grow_chunk_buffer(u, &device, u_count)?;
         let c = grow_chunk_buffer(c, &device, c_count)?;
@@ -651,21 +647,7 @@ pub(crate) fn cuda_chunk64_direct(
         }
         let snapshots = grow_chunk_buffer(snapshots, &device, snapshot_count)?;
         let mut output = unsafe { device.alloc::<f32>(output_count)? };
-        if profiling {
-            println!(
-                "C64_FLAGS_WORKSPACE retained_bytes={} output_bytes={} single_entry_per_process=true owned_stream_identity=true output_never_reused=true amortized_warm_operator_not_serving=true",
-                (w.len() + u.len() + c.len() + decays.len() + snapshots.len()) * 4,
-                output_count * 4
-            );
-        }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_FLAGS_STAGE part=scratch batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-            stage_started = Instant::now();
-        }
+
         let length_arg = length as i32;
         let heads_arg = heads as i32;
         let key_heads_arg = key_heads as i32;
@@ -700,25 +682,11 @@ pub(crate) fn cuda_chunk64_direct(
             }
             .w()?;
         }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_FLAGS_STAGE part=prepare batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-            stage_started = Instant::now();
-        }
+
         {
             let name = "qwen35_c64flag_uniform32_f32";
             let function = device.get_or_load_custom_func(name, "sys1_chunk_delta", CUDA_PTX)?;
-            if profiling {
-                println!(
-                    "C64_FLAGS_RESOURCE kernel={name} registers={} local_bytes={} shared_bytes={} diagnostic_not_serving=true",
-                    function.num_regs().w()?,
-                    function.local_size_bytes().w()?,
-                    function.shared_size_bytes().w()?
-                );
-            }
+
             function.set_attribute(candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,carry_shared as i32).w()?;
             let mut launch = function.builder();
             launch.arg(&query);
@@ -747,13 +715,6 @@ pub(crate) fn cuda_chunk64_direct(
             }
             .w()?;
         }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_FLAGS_STAGE part=state batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-        }
 
         let output = Tensor::from_storage(
             Storage::Cuda(CudaStorage::wrap_cuda_slice(output, device.clone())),
@@ -778,7 +739,6 @@ pub(crate) fn cuda_c64_varlen(
     g: &Tensor,
     beta: &Tensor,
     sequences: &PackedSequences,
-    profiling: bool,
 ) -> Result<Tensor> {
     if [q, k, v, g, beta].iter().any(|x| x.dtype() != DType::F32) {
         candle_core::bail!("chunked recurrence requires FP32 inputs");
@@ -958,10 +918,7 @@ pub(crate) fn cuda_c64_varlen(
             snapshots,
             ..
         } = workspace;
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-        }
-        let mut stage_started = Instant::now();
+
         let w = grow_chunk_buffer(w, &device, w_count)?;
         let u = grow_chunk_buffer(u, &device, u_count)?;
         let c = grow_chunk_buffer(c, &device, c_count)?;
@@ -979,21 +936,7 @@ pub(crate) fn cuda_c64_varlen(
         }
         let snapshots = grow_chunk_buffer(snapshots, &device, snapshot_count)?;
         let mut output = unsafe { device.alloc::<f32>(output_count)? };
-        if profiling {
-            println!(
-                "C64_CARRY_WORKSPACE retained_bytes={} output_bytes={} single_entry_per_process=true owned_stream_identity=true output_never_reused=true amortized_warm_operator_not_serving=true",
-                (w.len() + u.len() + c.len() + decays.len() + snapshots.len()) * 4,
-                output_count * 4
-            );
-        }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_CARRY_STAGE part=scratch batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-            stage_started = Instant::now();
-        }
+
         let sequence_count = sequences.lengths.len() as i32;
         let length_arg = length as i32;
         let heads_arg = heads as i32;
@@ -1032,14 +975,7 @@ pub(crate) fn cuda_c64_varlen(
             }
             .w()?;
         }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_CARRY_STAGE part=prepare batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-            stage_started = Instant::now();
-        }
+
         {
             if sequences.c64_short_count > 0 {
                 let function = device.get_or_load_custom_func(
@@ -1076,14 +1012,7 @@ pub(crate) fn cuda_c64_varlen(
             }
             let name = "qwen35_c64flag_varlen32_f32";
             let function = device.get_or_load_custom_func(name, "sys1_chunk_delta", CUDA_PTX)?;
-            if profiling {
-                println!(
-                    "C64_CARRY_RESOURCE kernel={name} registers={} local_bytes={} shared_bytes={} diagnostic_not_serving=true",
-                    function.num_regs().w()?,
-                    function.local_size_bytes().w()?,
-                    function.shared_size_bytes().w()?
-                );
-            }
+
             function.set_attribute(candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,carry_shared as i32).w()?;
             let mut launch = function.builder();
             launch.arg(&query);
@@ -1114,13 +1043,6 @@ pub(crate) fn cuda_c64_varlen(
                 })
             }
             .w()?;
-        }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_CARRY_STAGE part=state batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
         }
 
         let output = Tensor::from_storage(
@@ -1431,7 +1353,6 @@ pub(crate) fn cuda_c64bfout_uniform(
     g: &Tensor,
     beta: &Tensor,
     tile_columns: usize,
-    profiling: bool,
 ) -> Result<Tensor> {
     if q.dims().len() == 4
         && v.dims().len() == 4
@@ -1465,7 +1386,6 @@ pub(crate) fn cuda_c64bfout_uniform(
                 &packed_g,
                 &packed_beta,
                 &sequences,
-                profiling,
             )?
             .reshape((batch, length, 32, 128));
         }
@@ -1619,10 +1539,7 @@ pub(crate) fn cuda_c64bfout_uniform(
             snapshots,
             ..
         } = workspace;
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-        }
-        let mut stage_started = Instant::now();
+
         let w = grow_chunk_buffer(w, &device, w_count)?;
         let u = grow_chunk_buffer(u, &device, u_count)?;
         let c = grow_chunk_buffer(c, &device, c_count)?;
@@ -1643,21 +1560,7 @@ pub(crate) fn cuda_c64bfout_uniform(
         }
         let snapshots = grow_chunk_buffer(snapshots, &device, snapshot_count)?;
         let mut output = unsafe { device.alloc::<bf16>(output_count)? };
-        if profiling {
-            println!(
-                "C64_FLAGS_WORKSPACE retained_bytes={} output_bytes={} single_entry_per_process=true owned_stream_identity=true output_never_reused=true amortized_warm_operator_not_serving=true",
-                (w.len() + u.len() + c.len() + decays.len() + snapshots.len()) * 4,
-                output_count * 2
-            );
-        }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_FLAGS_STAGE part=scratch batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-            stage_started = Instant::now();
-        }
+
         let length_arg = length as i32;
         let heads_arg = heads as i32;
         let key_heads_arg = key_heads as i32;
@@ -1707,14 +1610,7 @@ pub(crate) fn cuda_c64bfout_uniform(
             }
             .w()?;
         }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_FLAGS_STAGE part=prepare batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-            stage_started = Instant::now();
-        }
+
         {
             let name = if low_precision_state {
                 "qwen35_c64fp16phase3vec2_n64_uniform_f32"
@@ -1724,14 +1620,7 @@ pub(crate) fn cuda_c64bfout_uniform(
                 "qwen35_c64bfout_uniform32_f32"
             };
             let function = device.get_or_load_custom_func(name, "sys1_chunk_delta", CUDA_PTX)?;
-            if profiling {
-                println!(
-                    "C64_FLAGS_RESOURCE kernel={name} registers={} local_bytes={} shared_bytes={} diagnostic_not_serving=true",
-                    function.num_regs().w()?,
-                    function.local_size_bytes().w()?,
-                    function.shared_size_bytes().w()?
-                );
-            }
+
             function.set_attribute(candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,carry_shared as i32).w()?;
             let mut launch = function.builder();
             launch.arg(&query);
@@ -1760,13 +1649,6 @@ pub(crate) fn cuda_c64bfout_uniform(
             }
             .w()?;
         }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_FLAGS_STAGE part=state batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-        }
 
         let output = Tensor::from_storage(
             Storage::Cuda(CudaStorage::wrap_cuda_slice(output, device.clone())),
@@ -1791,9 +1673,8 @@ pub(crate) fn cuda_c64bfout_varlen(
     g: &Tensor,
     beta: &Tensor,
     sequences: &PackedSequences,
-    profiling: bool,
 ) -> Result<Tensor> {
-    cuda_c64bfout_varlen_prepared(q, k, v, (g, beta), sequences, profiling, None)
+    cuda_c64bfout_varlen_prepared(q, k, v, (g, beta), sequences, None)
 }
 
 pub(crate) fn cuda_c64bfout_varlen_prepared(
@@ -1802,7 +1683,6 @@ pub(crate) fn cuda_c64bfout_varlen_prepared(
     v: &Tensor,
     gates: (&Tensor, &Tensor),
     sequences: &PackedSequences,
-    profiling: bool,
     prepared: Option<gated_delta::PreparedQv>,
 ) -> Result<Tensor> {
     let (g, beta) = gates;
@@ -2047,10 +1927,7 @@ pub(crate) fn cuda_c64bfout_varlen_prepared(
             snapshots,
             ..
         } = workspace;
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-        }
-        let mut stage_started = Instant::now();
+
         let w = grow_chunk_buffer(w, &device, w_count)?;
         let u = grow_chunk_buffer(u, &device, u_count)?;
         let c = grow_chunk_buffer(c, &device, c_count)?;
@@ -2084,21 +1961,6 @@ pub(crate) fn cuda_c64bfout_varlen_prepared(
             None
         };
 
-        if profiling {
-            println!(
-                "C64_CARRY_WORKSPACE retained_bytes={} output_bytes={} single_entry_per_process=true owned_stream_identity=true output_never_reused=true amortized_warm_operator_not_serving=true",
-                (w.len() + u.len() + c.len() + decays.len() + snapshots.len()) * 4,
-                output_count * 2
-            );
-        }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_CARRY_STAGE part=scratch batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-            stage_started = Instant::now();
-        }
         let sequence_count = sequences.lengths.len() as i32;
         let length_arg = length as i32;
         let heads_arg = heads as i32;
@@ -2167,14 +2029,7 @@ pub(crate) fn cuda_c64bfout_varlen_prepared(
             }
             .w()?;
         }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_CARRY_STAGE part=prepare batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-            stage_started = Instant::now();
-        }
+
         {
             if sequences.c64_short_count > 0 {
                 let short_tokens = sequences
@@ -2263,14 +2118,7 @@ pub(crate) fn cuda_c64bfout_varlen_prepared(
                 "qwen35_c64bfout_varlen32_f32"
             };
             let function = device.get_or_load_custom_func(name, "sys1_chunk_delta", CUDA_PTX)?;
-            if profiling {
-                println!(
-                    "C64_CARRY_RESOURCE kernel={name} registers={} local_bytes={} shared_bytes={} diagnostic_not_serving=true",
-                    function.num_regs().w()?,
-                    function.local_size_bytes().w()?,
-                    function.shared_size_bytes().w()?
-                );
-            }
+
             function.set_attribute(candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,carry_shared as i32).w()?;
             let mut launch = function.builder();
             launch.arg(&query);
@@ -2328,13 +2176,6 @@ pub(crate) fn cuda_c64bfout_varlen_prepared(
                 })
             }
             .w()?;
-        }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_CARRY_STAGE part=state batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
         }
 
         let output = Tensor::from_storage(
@@ -2578,7 +2419,6 @@ pub(crate) fn cuda_vstore_gdn_varlen(
     g: &Tensor,
     beta: &Tensor,
     sequences: &PackedSequences,
-    profiling: bool,
 ) -> Result<Tensor> {
     if option_env!("SYS1_CUDA_COMPUTE_CAP") != Some("120") {
         candle_core::bail!("vstore full GDN probe requires SM120");
@@ -2793,10 +2633,7 @@ pub(crate) fn cuda_vstore_gdn_varlen(
             snapshots,
             ..
         } = workspace;
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-        }
-        let mut stage_started = Instant::now();
+
         let w = grow_chunk_buffer(w, &device, w_count)?;
         let u = grow_chunk_buffer(u, &device, u_count)?;
         let c = grow_chunk_buffer(c, &device, c_count)?;
@@ -2815,21 +2652,7 @@ pub(crate) fn cuda_vstore_gdn_varlen(
         }
         let snapshots = grow_chunk_buffer(snapshots, &device, snapshot_count)?;
         let mut output = unsafe { device.alloc::<bf16>(output_count)? };
-        if profiling {
-            println!(
-                "C64_CARRY_WORKSPACE retained_bytes={} output_bytes={} single_entry_per_process=true owned_stream_identity=true output_never_reused=true amortized_warm_operator_not_serving=true",
-                (w.len() + u.len() + c.len() + decays.len() + snapshots.len()) * 4,
-                output_count * 2
-            );
-        }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_CARRY_STAGE part=scratch batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-            stage_started = Instant::now();
-        }
+
         let sequence_count = sequences.lengths.len() as i32;
         let length_arg = length as i32;
         let heads_arg = heads as i32;
@@ -2879,14 +2702,7 @@ pub(crate) fn cuda_vstore_gdn_varlen(
             }
             .w()?;
         }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_CARRY_STAGE part=prepare batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-            stage_started = Instant::now();
-        }
+
         {
             if sequences.c64_short_count > 0 {
                 let short_tokens = sequences
@@ -2956,14 +2772,7 @@ pub(crate) fn cuda_vstore_gdn_varlen(
                 "qwen35_c64bfout_varlen32_f32"
             };
             let function = device.get_or_load_custom_func(name, "sys1_chunk_delta", CUDA_PTX)?;
-            if profiling {
-                println!(
-                    "C64_CARRY_RESOURCE kernel={name} registers={} local_bytes={} shared_bytes={} diagnostic_not_serving=true",
-                    function.num_regs().w()?,
-                    function.local_size_bytes().w()?,
-                    function.shared_size_bytes().w()?
-                );
-            }
+
             function.set_attribute(candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,carry_shared as i32).w()?;
             let mut launch = function.builder();
             launch.arg(&query);
@@ -2995,13 +2804,6 @@ pub(crate) fn cuda_vstore_gdn_varlen(
             }
             .w()?;
         }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_CARRY_STAGE part=state batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-        }
 
         let output = Tensor::from_storage(
             Storage::Cuda(CudaStorage::wrap_cuda_slice(output, device.clone())),
@@ -3026,7 +2828,6 @@ pub(crate) fn cuda_vstore_gdn_uniform(
     g: &Tensor,
     beta: &Tensor,
     tile_columns: usize,
-    profiling: bool,
 ) -> Result<Tensor> {
     if option_env!("SYS1_CUDA_COMPUTE_CAP") != Some("120") {
         candle_core::bail!("vstore full GDN probe requires SM120");
@@ -3166,10 +2967,7 @@ pub(crate) fn cuda_vstore_gdn_uniform(
             snapshots,
             ..
         } = workspace;
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-        }
-        let mut stage_started = Instant::now();
+
         let w = grow_chunk_buffer(w, &device, w_count)?;
         let u = grow_chunk_buffer(u, &device, u_count)?;
         let c = grow_chunk_buffer(c, &device, c_count)?;
@@ -3189,21 +2987,7 @@ pub(crate) fn cuda_vstore_gdn_uniform(
         }
         let snapshots = grow_chunk_buffer(snapshots, &device, snapshot_count)?;
         let mut output = unsafe { device.alloc::<bf16>(output_count)? };
-        if profiling {
-            println!(
-                "C64_FLAGS_WORKSPACE retained_bytes={} output_bytes={} single_entry_per_process=true owned_stream_identity=true output_never_reused=true amortized_warm_operator_not_serving=true",
-                (w.len() + u.len() + c.len() + decays.len() + snapshots.len()) * 4,
-                output_count * 2
-            );
-        }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_FLAGS_STAGE part=scratch batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-            stage_started = Instant::now();
-        }
+
         let length_arg = length as i32;
         let heads_arg = heads as i32;
         let key_heads_arg = key_heads as i32;
@@ -3249,14 +3033,7 @@ pub(crate) fn cuda_vstore_gdn_uniform(
             }
             .w()?;
         }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_FLAGS_STAGE part=prepare batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
-            stage_started = Instant::now();
-        }
+
         {
             let name = if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120") {
                 "qwen35_c64zguard_n32_uniform32_f32"
@@ -3264,14 +3041,7 @@ pub(crate) fn cuda_vstore_gdn_uniform(
                 "qwen35_c64bfout_uniform32_f32"
             };
             let function = device.get_or_load_custom_func(name, "sys1_chunk_delta", CUDA_PTX)?;
-            if profiling {
-                println!(
-                    "C64_FLAGS_RESOURCE kernel={name} registers={} local_bytes={} shared_bytes={} diagnostic_not_serving=true",
-                    function.num_regs().w()?,
-                    function.local_size_bytes().w()?,
-                    function.shared_size_bytes().w()?
-                );
-            }
+
             function.set_attribute(candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,carry_shared as i32).w()?;
             let mut launch = function.builder();
             launch.arg(&query);
@@ -3299,13 +3069,6 @@ pub(crate) fn cuda_vstore_gdn_uniform(
                 })
             }
             .w()?;
-        }
-        if profiling {
-            device.cuda_stream().synchronize().w()?;
-            println!(
-                "C64_FLAGS_STAGE part=state batch={batch} length={length} columns={tile_columns} ms={} diagnostic_not_serving=true",
-                stage_started.elapsed().as_secs_f64() * 1000.
-            );
         }
 
         let output = Tensor::from_storage(

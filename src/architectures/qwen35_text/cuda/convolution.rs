@@ -311,8 +311,8 @@ pub(crate) fn cuda_conv_qkv_impl(
         "qwen35_convcast_qkv_packed"
     } else {
         match (lookup157, sequences.is_some()) {
-            (true, true) => "qwen35_conv_lookup156_packed",
-            (true, false) => "qwen35_conv_lookup156_uniform",
+            (true, true) => "qwen35_conv_lookup_packed",
+            (true, false) => "qwen35_conv_lookup_uniform",
             (false, true) => "qwen35_conv_qkv_packed",
             (false, false) => "qwen35_conv_qkv_uniform",
         }

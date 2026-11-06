@@ -16,7 +16,7 @@ struct JointAdapter {
 }
 impl Adapter for JointAdapter {
     fn encode(&self, backbone: &Backbone, request: &DecisionRequest) -> Result<Encoded, ApiError> {
-        self.protocol.encode(backbone, request)
+        self.protocol.encode(&backbone.context, request)
     }
     fn score(
         &self,
@@ -71,7 +71,7 @@ impl Clef {
             attention,
             true,
             16_777_216,
-            |config, vb, attention, _tokenizer| {
+            |config, vb, attention| {
                 let head_config = joint::Config::load(&path.join("joint_head_config.json"))?;
                 anyhow::ensure!(
                     head_config.hidden_size == config.text_config.hidden_size,

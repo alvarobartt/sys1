@@ -22,7 +22,6 @@ pub(crate) struct Encoded {
     pub(crate) questions: Vec<Question>,
     pub(crate) criteria: Vec<Value>,
 }
-pub(crate) mod inline;
 pub(crate) mod ordinal;
 
 pub(crate) struct Context {

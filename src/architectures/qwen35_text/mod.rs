@@ -17,7 +17,7 @@ use crate::models::AttentionImplementation;
 use candle_core::{D, DType, Result, Tensor};
 use candle_nn::{Embedding, Linear as CandleLinear, VarBuilder, embedding, ops::softmax_last_dim};
 use serde::Deserialize;
-use std::{fs, path::Path, sync::OnceLock, time::Instant};
+use std::{fs, path::Path};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -189,7 +189,7 @@ impl Mlp {
         })
     }
 
-    fn forward(&self, x: &Tensor, capture_index: usize) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let fused_product: Option<Tensor> = {
             #[cfg(all(feature = "cuda", sys1_cuda_fused_ffn))]
             {
@@ -197,28 +197,11 @@ impl Mlp {
                 if x.device().is_cuda() && x.dtype() == DType::BF16 && (512..=32768).contains(&rows)
                 {
                     if let Some(weight) = self.cached_fused()? {
-                        let result = crate::kernels::cuda::fused_gate_up::forward(
-                            x,
-                            &weight,
-                            crate::numerics::enabled(),
-                        )?;
+                        let result = crate::kernels::cuda::fused_gate_up::forward(x, &weight)?;
                         #[cfg(test)]
                         FUSED_MLP_CALLS.with(|slot| slot.set(slot.get() + 1));
-                        if let Some((gate, up)) = result.projections {
-                            crate::numerics::layer_capture(
-                                capture_index,
-                                "mlp-gate-projected",
-                                &gate,
-                            )?;
-                            crate::numerics::layer_capture(capture_index, "mlp-up-projected", &up)?;
-                            crate::numerics::layer_capture(
-                                capture_index,
-                                "mlp-gate-activated",
-                                &crate::kernels::activation::silu(&gate)?,
-                            )?;
-                        }
-                        profiling::mark(x.device(), capture_index, "mlp_fused_gate_up_product")?;
-                        Some(result.product)
+
+                        Some(result)
                     } else {
                         None
                     }
@@ -234,50 +217,35 @@ impl Mlp {
         #[cfg(all(feature = "cuda", sys1_cuda_direct_ffn))]
         let fused_product = match fused_product {
             Some(product) => Some(product),
-            None => self.direct_product(x, capture_index)?,
+            None => self.direct_product(x)?,
         };
         let product = if let Some(product) = fused_product {
             product
         } else if x.device().is_cuda() && x.dtype() == DType::BF16 {
             let gate = linear_attention_projection_forward(x, &self.gate)?;
-            #[cfg(feature = "cuda")]
-            profiling::mark(x.device(), capture_index, "mlp_gate_projection")?;
-            crate::numerics::layer_capture(capture_index, "mlp-gate-projected", &gate)?;
 
-            if crate::numerics::enabled() {
-                let activated = crate::kernels::activation::silu(&gate)?;
-                crate::numerics::layer_capture(capture_index, "mlp-gate-activated", &activated)?;
-            }
             let up = linear_attention_projection_forward(x, &self.up)?;
-            #[cfg(feature = "cuda")]
-            profiling::mark(x.device(), capture_index, "mlp_up_projection")?;
-            crate::numerics::layer_capture(capture_index, "mlp-up-projected", &up)?;
+
             crate::kernels::activation::mul_silu(&gate, &up)?
         } else {
             let activated = {
                 let gate = linear_attention_projection_forward(x, &self.gate)?;
-                crate::numerics::layer_capture(capture_index, "mlp-gate-projected", &gate)?;
-                let activated = crate::kernels::activation::silu(&gate)?;
-                crate::numerics::layer_capture(capture_index, "mlp-gate-activated", &activated)?;
-                activated
+
+                crate::kernels::activation::silu(&gate)?
             };
             let up = linear_attention_projection_forward(x, &self.up)?;
-            crate::numerics::layer_capture(capture_index, "mlp-up-projected", &up)?;
+
             (activated * up)?
         };
-        #[cfg(feature = "cuda")]
-        profiling::mark(x.device(), capture_index, "mlp_activation_product")?;
-        crate::numerics::layer_capture(capture_index, "mlp-product", &product)?;
 
         #[cfg(feature = "cuda")]
         if product.device().is_cuda() && product.dtype() == DType::BF16 {
             #[cfg(feature = "cuda")]
             if let Some(output) = try_nn_projection(&product, &self.down)? {
-                profiling::mark(x.device(), capture_index, "mlp_down_projection")?;
                 return Ok(output);
             }
             let output = cuda_bf16_projection(&product, &self.down, false)?;
-            profiling::mark(x.device(), capture_index, "mlp_down_projection")?;
+
             return Ok(output);
         }
         crate::kernels::linear::forward_compatible(&product, &self.down)
@@ -418,7 +386,6 @@ impl FullAttention {
         &self,
         x: &Tensor,
         rotary: &RotaryTensors,
-        capture_index: usize,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let (batch, length, _) = x.dims3()?;
         #[cfg(feature = "cuda")]
@@ -442,22 +409,6 @@ impl FullAttention {
                 #[cfg(test)]
                 FULL_QKV_MERGED_SELECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                if crate::numerics::enabled()
-                    && capture_index < 4
-                    && std::env::var_os("SYS1_NUMERICS_INPUTS_ONLY").is_none()
-                {
-                    let q_columns = 2 * self.heads * self.head_dim;
-                    crate::numerics::layer_capture(
-                        capture_index,
-                        "full-qg-projected",
-                        &projected.narrow(2, 0, q_columns)?,
-                    )?;
-                    crate::numerics::layer_capture(
-                        capture_index,
-                        "full-k-projected",
-                        &projected.narrow(2, q_columns, self.kv_heads * self.head_dim)?,
-                    )?;
-                }
                 let (q, k, v, gate) = cuda_full_qkv_finish(
                     &projected,
                     None,
@@ -467,26 +418,14 @@ impl FullAttention {
                     self.kv_heads,
                     self.q_norm.eps,
                 )?;
-                crate::numerics::layer_capture(capture_index, "full-q", &q)?;
-                crate::numerics::layer_capture(capture_index, "full-k", &k)?;
-                crate::numerics::layer_capture(capture_index, "full-v", &v)?;
-                crate::numerics::layer_capture(capture_index, "full-gate", &gate)?;
+
                 return Ok((q, k, v, gate));
             }
 
             let qg = linear_attention_projection_forward(x, &self.q)?;
             let k = full_attention_kv_forward(x, &self.k)?;
             let v = full_attention_kv_forward(x, &self.v)?;
-            crate::numerics::layer_capture(
-                capture_index,
-                "full-qg-projected",
-                &qg.reshape((batch, length, self.heads, 2, self.head_dim))?,
-            )?;
-            crate::numerics::layer_capture(
-                capture_index,
-                "full-k-projected",
-                &k.reshape((batch, length, self.kv_heads, self.head_dim))?,
-            )?;
+
             let (q, k, v, gate) = cuda_full_qkv_finish(
                 &qg,
                 Some((&k, &v)),
@@ -496,10 +435,7 @@ impl FullAttention {
                 self.kv_heads,
                 self.q_norm.eps,
             )?;
-            crate::numerics::layer_capture(capture_index, "full-q", &q)?;
-            crate::numerics::layer_capture(capture_index, "full-k", &k)?;
-            crate::numerics::layer_capture(capture_index, "full-v", &v)?;
-            crate::numerics::layer_capture(capture_index, "full-gate", &gate)?;
+
             return Ok((q, k, v, gate));
         }
         let qg = linear_attention_projection_forward(x, &self.q)?.reshape((
@@ -509,7 +445,7 @@ impl FullAttention {
             2,
             self.head_dim,
         ))?;
-        crate::numerics::layer_capture(capture_index, "full-qg-projected", &qg)?;
+
         let q = full_attention_norm_rotary(&qg.narrow(3, 0, 1)?.squeeze(3)?, &self.q_norm, rotary)?;
         let gate = sigmoid(&qg.narrow(3, 1, 1)?.squeeze(3)?.reshape((
             batch,
@@ -522,7 +458,7 @@ impl FullAttention {
             self.kv_heads,
             self.head_dim,
         ))?;
-        crate::numerics::layer_capture(capture_index, "full-k-projected", &k_projected)?;
+
         let k = full_attention_norm_rotary(&k_projected, &self.k_norm, rotary)?;
         let v = full_attention_kv_forward(x, &self.v)?.reshape((
             batch,
@@ -530,10 +466,7 @@ impl FullAttention {
             self.kv_heads,
             self.head_dim,
         ))?;
-        crate::numerics::layer_capture(capture_index, "full-q", &q)?;
-        crate::numerics::layer_capture(capture_index, "full-k", &k)?;
-        crate::numerics::layer_capture(capture_index, "full-v", &v)?;
-        crate::numerics::layer_capture(capture_index, "full-gate", &gate)?;
+
         Ok((q, k, v, gate))
     }
 
@@ -614,9 +547,9 @@ impl FullAttention {
         })
     }
 
-    fn forward(&self, x: &Tensor, rotary: &RotaryTensors, capture_index: usize) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, rotary: &RotaryTensors) -> Result<Tensor> {
         let (batch, length, _) = x.dims3()?;
-        let (q, k, v, gate) = self.project_finish(x, rotary, capture_index)?;
+        let (q, k, v, gate) = self.project_finish(x, rotary)?;
         let scale = (self.head_dim as f32).powf(-0.5);
         #[cfg(feature = "metal")]
         if x.device().is_metal()
@@ -633,7 +566,7 @@ impl FullAttention {
                 1.0,
             )?
             .transpose(1, 2)?;
-            crate::numerics::layer_capture(capture_index, "full-attention", &attention)?;
+
             let gated = full_attention_gate_mul(
                 &attention,
                 &gate,
@@ -641,33 +574,13 @@ impl FullAttention {
                 length,
                 self.heads * self.head_dim,
             )?;
-            crate::numerics::layer_capture(capture_index, "full-gated", &gated)?;
+
             return gated.apply(&self.output);
         }
         let attention = attention_forward(&q, &k, &v, scale, self.causal, self.implementation)?;
-        crate::numerics::layer_capture(capture_index, "full-attention", &attention)?;
-        #[cfg(feature = "cuda")]
-        if crate::numerics::full_attention_reference_enabled(capture_index) {
-            let reference = crate::kernels::cuda::attention::ordinary_reference(
-                &q.to_dtype(DType::F32)?,
-                &k.to_dtype(DType::F32)?,
-                &v.to_dtype(DType::F32)?,
-                scale,
-                self.causal,
-            )?;
-            let ordinary = crate::kernels::cuda::attention::ordinary_reference(
-                &q,
-                &k,
-                &v,
-                scale,
-                self.causal,
-            )?;
-            crate::numerics::layer_capture(capture_index, "full-reference-f32", &reference)?;
-            crate::numerics::layer_capture(capture_index, "full-reference-ordinary", &ordinary)?;
-        }
+
         let gated =
             full_attention_gate_mul(&attention, &gate, batch, length, self.heads * self.head_dim)?;
-        crate::numerics::layer_capture(capture_index, "full-gated", &gated)?;
 
         linear_attention_projection_forward(&gated, &self.output)
     }
@@ -854,19 +767,11 @@ impl LinearAttention {
         })
     }
 
-    fn forward(&self, x: &Tensor, capture_index: usize) -> Result<Tensor> {
-        let mut profile = if layer_profiling_enabled() {
-            x.device().synchronize()?;
-            Some(Instant::now())
-        } else {
-            None
-        };
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (batch, length, _) = x.dims3()?;
         let key_width = self.key_heads * self.key_dim;
         let value_width = self.value_heads * self.value_dim;
         let (projected, early_z) = self.project_qkvz(x)?;
-        crate::numerics::layer_capture(capture_index, "linear-projected", &projected)?;
-        linear_profile_checkpoint(x, capture_index, "qkv_projection", &mut profile)?;
 
         let (q, k, v) = {
             #[cfg(feature = "cuda")]
@@ -881,7 +786,7 @@ impl LinearAttention {
                 let vstorage_enabled = VSTORAGE_MODEL_REPLAY.with(std::cell::Cell::get);
                 #[cfg(not(test))]
                 let vstorage_enabled = true;
-                let values = if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120")
+                if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120")
                     && vstorage_enabled
                     && length >= 512
                 {
@@ -902,14 +807,7 @@ impl LinearAttention {
                         self.value_heads,
                         None,
                     )?
-                };
-
-                if crate::numerics::enabled() {
-                    let mixed = cuda_conv_silu(&projected, &self.conv)?;
-                    crate::numerics::layer_capture(capture_index, "linear-conv", &mixed)?;
                 }
-                linear_profile_checkpoint(x, capture_index, "convolution_qkv_fused", &mut profile)?;
-                values
             } else {
                 #[cfg(feature = "cuda")]
                 let mixed = if x.device().is_cuda() && matches!(x.dtype(), DType::BF16 | DType::F32)
@@ -928,8 +826,7 @@ impl LinearAttention {
                 };
                 #[cfg(not(any(feature = "cuda", feature = "metal")))]
                 let mixed = causal_conv_silu(&projected, &self.conv, self.kernel)?;
-                crate::numerics::layer_capture(capture_index, "linear-conv", &mixed)?;
-                linear_profile_checkpoint(x, capture_index, "convolution", &mut profile)?;
+
                 let (q, k, v) = {
                     #[cfg(feature = "cuda")]
                     if x.device().is_cuda()
@@ -1069,8 +966,7 @@ impl LinearAttention {
                 };
                 #[cfg(not(any(feature = "cuda", feature = "metal")))]
                 let mixed = causal_conv_silu(&projected, &self.conv, self.kernel)?;
-                crate::numerics::layer_capture(capture_index, "linear-conv", &mixed)?;
-                linear_profile_checkpoint(x, capture_index, "convolution", &mut profile)?;
+
                 let (q, k, v) = {
                     #[cfg(feature = "cuda")]
                     if x.device().is_cuda()
@@ -1192,13 +1088,8 @@ impl LinearAttention {
                 (q, k, v)
             }
         };
-        let (g, beta) = self.reference_gates(x, capture_index)?;
-        crate::numerics::layer_capture(capture_index, "linear-q", &q)?;
-        crate::numerics::layer_capture(capture_index, "linear-k", &k)?;
-        crate::numerics::layer_capture(capture_index, "linear-v", &v)?;
-        crate::numerics::layer_capture(capture_index, "linear-g", &g)?;
-        crate::numerics::layer_capture(capture_index, "linear-beta", &beta)?;
-        linear_profile_checkpoint(x, capture_index, "qk_and_gates", &mut profile)?;
+        let (g, beta) = self.reference_gates(x)?;
+
         #[cfg(feature = "cuda")]
         if x.device().is_cuda() && self.key_dim == 128 {
             let output = if x.dtype() == DType::BF16
@@ -1206,16 +1097,16 @@ impl LinearAttention {
                 && self.value_dim == 128
                 && length >= 128
             {
-                cuda_c64bfout_uniform(&q, &k, &v, &g, &beta, 32, false)?
+                cuda_c64bfout_uniform(&q, &k, &v, &g, &beta, 32)?
             } else if x.dtype() == DType::BF16
                 && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120")
                 && self.value_dim == 128
             {
                 if length >= 512 {
                     if v.dtype() == DType::BF16 {
-                        cuda_vstore_gdn_uniform(&q, &k, &v, &g, &beta, 32, false)?
+                        cuda_vstore_gdn_uniform(&q, &k, &v, &g, &beta, 32)?
                     } else {
-                        cuda_c64bfout_uniform(&q, &k, &v, &g, &beta, 32, false)?
+                        cuda_c64bfout_uniform(&q, &k, &v, &g, &beta, 32)?
                     }
                 } else {
                     cuda_delta_rule_token_major_bfout(&q, &k, &v, &g, &beta, true)?
@@ -1225,29 +1116,13 @@ impl LinearAttention {
                 && length >= 512
                 && self.value_dim <= 128
             {
-                cuda_chunk64_direct(&q, &k, &v, &g, &beta, 32, false)?
+                cuda_chunk64_direct(&q, &k, &v, &g, &beta, 32)?
             } else {
                 cuda_delta_rule_token_major(&q, &k, &v, &g, &beta)?
             };
-            crate::numerics::layer_capture(capture_index, "linear-delta", &output)?;
-            if crate::numerics::enabled() {
-                crate::numerics::layer_capture(
-                    capture_index,
-                    "linear-delta-rounded",
-                    &output.to_dtype(x.dtype())?,
-                )?;
-            }
-            linear_profile_checkpoint(x, capture_index, "delta_rule", &mut profile)?;
-            let result = self.finish_delta(
-                x,
-                output,
-                batch,
-                length,
-                value_width,
-                capture_index,
-                early_z,
-            )?;
-            linear_profile_checkpoint(x, capture_index, "finalize_and_projection", &mut profile)?;
+
+            let result = self.finish_delta(x, output, batch, length, value_width, early_z)?;
+
             return Ok(result);
         }
         #[cfg(feature = "metal")]
@@ -1270,28 +1145,13 @@ impl LinearAttention {
         };
         #[cfg(not(feature = "metal"))]
         let output = chunked_delta_rule(&q, &k, &v, &g, &beta)?;
-        if crate::numerics::enabled() {
-            crate::numerics::layer_capture(
-                capture_index,
-                "linear-delta-rounded",
-                &output.to_dtype(x.dtype())?,
-            )?;
-        }
-        linear_profile_checkpoint(x, capture_index, "delta_rule", &mut profile)?;
-        let result = self.finish_delta(
-            x,
-            output,
-            batch,
-            length,
-            value_width,
-            capture_index,
-            early_z,
-        )?;
-        linear_profile_checkpoint(x, capture_index, "finalize_and_projection", &mut profile)?;
+
+        let result = self.finish_delta(x, output, batch, length, value_width, early_z)?;
+
         Ok(result)
     }
 
-    fn reference_gates(&self, x: &Tensor, capture_index: usize) -> Result<(Tensor, Tensor)> {
+    fn reference_gates(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
         #[cfg(feature = "cuda")]
         if x.device().is_cuda() && x.dtype() == DType::BF16 {
             let ba = self
@@ -1306,16 +1166,6 @@ impl LinearAttention {
             } else {
                 cuda_gate_projection_bf16(x, ba)?
             };
-            if crate::numerics::enabled() {
-                let b = projected.narrow(D::Minus1, 0, self.value_heads)?;
-                let a = projected.narrow(D::Minus1, self.value_heads, self.value_heads)?;
-                crate::numerics::layer_capture(capture_index, "linear-b-projection", &b)?;
-                crate::numerics::layer_capture(
-                    capture_index,
-                    "linear-a-projection",
-                    &a.to_dtype(DType::F32)?,
-                )?;
-            }
 
             return cuda_packed_ba_nonlinearity(&projected, &projected, &self.dt_bias, &self.a_log);
         }
@@ -1327,11 +1177,11 @@ impl LinearAttention {
             crate::kernels::linear::forward_compatible(x, linear)
         };
         let b = project(&self.b)?;
-        crate::numerics::layer_capture(capture_index, "linear-b-projection", &b)?;
+
         let beta = rounded_beta(&b)?;
         drop(b);
         let a = project(&self.a)?.to_dtype(DType::F32)?;
-        crate::numerics::layer_capture(capture_index, "linear-a-projection", &a)?;
+
         let gate_input = a.broadcast_add(&self.dt_bias)?;
         let softplus = crate::kernels::activation::softplus(&gate_input)?;
         Ok((softplus.broadcast_mul(&self.a_log)?, beta))
@@ -1348,7 +1198,6 @@ impl LinearAttention {
         batch: usize,
         length: usize,
         value_width: usize,
-        capture_index: usize,
         early_z: Option<Tensor>,
     ) -> Result<Tensor> {
         let gate = match early_z {
@@ -1371,17 +1220,12 @@ impl LinearAttention {
         } else {
             gate.reshape((batch, length, self.value_heads, self.value_dim))?
         };
-        if crate::numerics::enabled() && merged_gate {
-            let captured_gate = gate.reshape((batch, length, self.value_heads, self.value_dim))?;
-            crate::numerics::layer_capture(capture_index, "linear-z-projected", &captured_gate)?;
-        } else {
-            crate::numerics::layer_capture(capture_index, "linear-z-projected", &gate)?;
-        }
+
         #[cfg(feature = "cuda")]
         if x.device().is_cuda() && x.dtype() == DType::BF16 && self.value_dim == 128 {
             let finalized = cuda_post_finalize_bf16(&output, &gate, &self.norm, self.eps)?
                 .reshape((batch, length, value_width))?;
-            crate::numerics::layer_capture(capture_index, "linear-finalized", &finalized)?;
+
             return linear_attention_projection_forward(&finalized, &self.output);
         }
         #[cfg(feature = "metal")]
@@ -1402,7 +1246,7 @@ impl LinearAttention {
         }
         let finalized = gated_norm_reference(&output, &gate, &self.norm, self.eps, x.dtype())?
             .reshape((batch, length, value_width))?;
-        crate::numerics::layer_capture(capture_index, "linear-finalized", &finalized)?;
+
         crate::kernels::linear::forward_compatible(&finalized, &self.output)
     }
 }
@@ -1649,39 +1493,12 @@ fn contiguous_matmul(left: &Tensor, right: &Tensor) -> Result<Tensor> {
     crate::kernels::linear::matmul_compatible(&left.contiguous()?, &right.contiguous()?)
 }
 
-fn layer_profiling_enabled() -> bool {
-    static PROFILE: OnceLock<bool> = OnceLock::new();
-    *PROFILE.get_or_init(|| std::env::var_os("SYS1_PROFILE_LAYERS").is_some())
-}
-
-fn linear_profile_checkpoint(
-    x: &Tensor,
-    index: usize,
-    stage: &'static str,
-    started: &mut Option<Instant>,
-) -> Result<()> {
-    #[cfg(feature = "cuda")]
-    profiling::mark(x.device(), index, stage)?;
-    if let Some(started) = started.as_mut() {
-        x.device().synchronize()?;
-        tracing::info!(
-            layer = index,
-            stage,
-            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.,
-            "Qwen3.5 linear attention profile"
-        );
-        *started = Instant::now();
-    }
-    Ok(())
-}
-
 enum Mixer {
     Full(FullAttention),
     Linear(LinearAttention),
 }
 
 struct Layer {
-    index: usize,
     input_norm: RmsNorm,
     mixer: Mixer,
     post_norm: RmsNorm,
@@ -1707,7 +1524,6 @@ impl Layer {
             other => candle_core::bail!("unsupported Qwen3.5 layer type {other}"),
         };
         Ok(Self {
-            index,
             input_norm: RmsNorm::load(
                 config.hidden_size,
                 config.rms_norm_eps,
@@ -1724,67 +1540,24 @@ impl Layer {
     }
 
     fn forward(&self, x: &Tensor, rotary: Option<&RotaryTensors>) -> Result<Tensor> {
-        let profile = layer_profiling_enabled();
-        if profile {
-            x.device().synchronize()?;
-        }
-        #[cfg(feature = "cuda")]
-        profiling::mark(x.device(), self.index, "start")?;
-        let started = Instant::now();
         let normalized = self.input_norm.forward(x)?;
-        crate::numerics::capture(&format!("layer-{:02}-normalized", self.index), &normalized)?;
-        #[cfg(feature = "cuda")]
-        profiling::mark(x.device(), self.index, "norm")?;
-        if profile {
-            x.device().synchronize()?;
-        }
-        let norm_ms = started.elapsed().as_secs_f64() * 1_000.;
-        let started = Instant::now();
+
         let mixed = match &self.mixer {
             Mixer::Full(layer) => layer.forward(
                 &normalized,
                 rotary.ok_or_else(|| {
                     candle_core::Error::Msg("Missing Qwen3.5 rotary tensors".into())
                 })?,
-                self.index,
             )?,
-            Mixer::Linear(layer) => layer.forward(&normalized, self.index)?,
+            Mixer::Linear(layer) => layer.forward(&normalized)?,
         };
-        crate::numerics::capture(&format!("layer-{:02}-mixed", self.index), &mixed)?;
-        #[cfg(feature = "cuda")]
-        profiling::mark(x.device(), self.index, "mixer_tail")?;
-        if profile {
-            x.device().synchronize()?;
-        }
-        let mixer_ms = started.elapsed().as_secs_f64() * 1_000.;
-        let started = Instant::now();
+
         let (x, post_normalized) = self.post_norm.forward_residual(x, &mixed)?;
-        #[cfg(feature = "cuda")]
-        profiling::mark(x.device(), self.index, "residual_and_post_norm")?;
-        crate::numerics::capture(
-            &format!("layer-{:02}-post-normalized", self.index),
-            &post_normalized,
-        )?;
-        let mlp_output = self.mlp.forward(&post_normalized, self.index)?;
-        crate::numerics::capture(&format!("layer-{:02}-mlp-output", self.index), &mlp_output)?;
+
+        let mlp_output = self.mlp.forward(&post_normalized)?;
+
         let output = (&x + mlp_output)?;
-        crate::numerics::capture(&format!("layer-{:02}-output", self.index), &output)?;
-        #[cfg(feature = "cuda")]
-        profiling::mark(x.device(), self.index, "output_residual")?;
-        if profile {
-            x.device().synchronize()?;
-            tracing::info!(
-                layer = self.index,
-                mixer = match &self.mixer {
-                    Mixer::Full(_) => "full",
-                    Mixer::Linear(_) => "linear",
-                },
-                norm_ms,
-                mixer_ms,
-                mlp_ms = started.elapsed().as_secs_f64() * 1_000.,
-                "Qwen3.5 layer profile"
-            );
-        }
+
         Ok(output)
     }
 }
@@ -1849,16 +1622,9 @@ impl Decoder {
             })
             .map(|rotary| rotary.prepare(positions, embeds.dtype(), embeds.device()))
             .transpose()?;
-        #[cfg(feature = "cuda")]
-        profiling::begin(embeds.device())?;
-        crate::numerics::capture("embedding", embeds)?;
+
         let output = self.forward_layers(embeds, rotary.as_ref())?;
-        crate::numerics::capture("decoder-output", &output)?;
-        #[cfg(feature = "cuda")]
-        {
-            let (batch, length, _) = embeds.dims3()?;
-            profiling::finish(batch, length)?;
-        }
+
         Ok(output)
     }
 }
@@ -2309,7 +2075,7 @@ mod tests {
             let x = Tensor::from_vec(values, (2, 3, 33), &device)?.to_dtype(dtype)?;
             #[cfg(target_os = "macos")]
             if dtype == DType::F16 {
-                assert!(layer.forward(&x, 0).is_err());
+                assert!(layer.forward(&x).is_err());
                 continue;
             }
             let reference = |input: &Tensor, linear: &Linear| -> Result<Tensor> {
@@ -2326,7 +2092,7 @@ mod tests {
                 &(reference(&x, &layer.gate)?.silu()? * reference(&x, &layer.up)?)?,
                 &layer.down,
             )?;
-            let actual = layer.forward(&x, 0)?;
+            let actual = layer.forward(&x)?;
             assert_eq!(actual.dtype(), dtype);
             let values = |x: &Tensor| x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>();
             assert_eq!(

@@ -22,7 +22,6 @@ pub(crate) mod kernels;
 pub(crate) mod media;
 mod metrics;
 pub mod models;
-pub(crate) mod numerics;
 pub mod schema;
 pub mod tokenizer;
 

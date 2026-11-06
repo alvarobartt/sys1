@@ -43,19 +43,15 @@ pub(crate) fn prepare(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         .context()
         .bind_to_thread()
         .map_err(error)?;
-    for name in ["fused_ffn_bf16", "fused_ffn_debug_bf16"] {
+    {
+        let name = "fused_ffn_bf16";
         let function = cuda.get_or_load_custom_func(name, "sys1_fused_ffn", PTX)?;
         function.set_attribute(candle_core::cuda_backend::cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,SHARED as i32).w()?;
     }
     Ok(packed)
 }
 
-pub(crate) struct Output {
-    pub product: Tensor,
-    pub projections: Option<(Tensor, Tensor)>,
-}
-
-pub(crate) fn forward(input: &Tensor, weight: &Tensor, capture: bool) -> Result<Output> {
+pub(crate) fn forward(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
     let (batch, length, k) = input.dims3()?;
     let rows = batch
         .checked_mul(length)
@@ -98,18 +94,8 @@ pub(crate) fn forward(input: &Tensor, weight: &Tensor, capture: bool) -> Result<
         .checked_mul(n)
         .ok_or_else(|| error("output overflow"))?;
     let mut output = unsafe { device.alloc::<bf16>(count)? };
-    let mut diagnostics = if capture {
-        Some((unsafe { device.alloc::<bf16>(count)? }, unsafe {
-            device.alloc::<bf16>(count)?
-        }))
-    } else {
-        None
-    };
-    let name = if capture {
-        "fused_ffn_debug_bf16"
-    } else {
-        "fused_ffn_bf16"
-    };
+
+    let name = "fused_ffn_bf16";
     let function = device.get_or_load_custom_func(name, "sys1_fused_ffn", PTX)?;
     let swizzle = if rows >= 16384 { 32u32 } else { 8u32 };
     let ri = i32::try_from(rows).map_err(error)?;
@@ -121,10 +107,7 @@ pub(crate) fn forward(input: &Tensor, weight: &Tensor, capture: bool) -> Result<
         launch.arg(&x);
         launch.arg(table);
         launch.arg(&mut output);
-        if let Some((gate, up)) = &mut diagnostics {
-            launch.arg(gate);
-            launch.arg(up);
-        }
+
         launch.arg(&ri);
         launch.arg(&ni);
         launch.arg(&ki);
@@ -142,16 +125,10 @@ pub(crate) fn forward(input: &Tensor, weight: &Tensor, capture: bool) -> Result<
         .w()?;
         Ok(())
     })?;
-    let wrap = |buffer| {
-        Tensor::from_storage(
-            Storage::Cuda(CudaStorage::wrap_cuda_slice(buffer, device.clone())),
-            (batch, length, n),
-            BackpropOp::none(),
-            false,
-        )
-    };
-    Ok(Output {
-        product: wrap(output),
-        projections: diagnostics.map(|(g, u)| (wrap(g), wrap(u))),
-    })
+    Ok(Tensor::from_storage(
+        Storage::Cuda(CudaStorage::wrap_cuda_slice(output, device)),
+        (batch, length, n),
+        BackpropOp::none(),
+        false,
+    ))
 }

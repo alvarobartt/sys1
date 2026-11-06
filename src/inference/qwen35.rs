@@ -5,21 +5,8 @@ use crate::{
     schema::{ApiError, DecisionRequest, DecisionResponse},
 };
 use candle_core::Tensor;
-use serde_json::json;
-use std::ops::Deref;
 
 pub(crate) trait Adapter: Send + Sync {
-    fn plan(
-        &self,
-        backbone: &Backbone,
-        request: &DecisionRequest,
-    ) -> Result<Vec<Encoded>, ApiError> {
-        Ok(vec![self.encode(backbone, request)?])
-    }
-    fn splits_requests(&self) -> bool {
-        false
-    }
-
     fn encode(&self, backbone: &Backbone, request: &DecisionRequest) -> Result<Encoded, ApiError>;
     fn score(
         &self,
@@ -65,12 +52,6 @@ pub(crate) struct Qwen35<A> {
     backbone: Backbone,
     adapter: A,
 }
-impl<A> Deref for Qwen35<A> {
-    type Target = Backbone;
-    fn deref(&self) -> &Backbone {
-        &self.backbone
-    }
-}
 impl<A: Adapter> Qwen35<A> {
     pub(crate) fn new(backbone: Backbone, adapter: A) -> Self {
         Self { backbone, adapter }
@@ -86,58 +67,35 @@ impl<A: Adapter> Qwen35<A> {
         self.adapter.response(encoded, logits)
     }
     fn predict_one(&self, request: DecisionRequest) -> Result<DecisionResponse, ApiError> {
-        crate::numerics::begin().map_err(|error| ApiError::internal(error.to_string()))?;
-        if crate::numerics::enabled() {
-            crate::numerics::json("request", &json!({"model": request.model, "state": request.state, "questions": request.questions}))
-                .map_err(|error| ApiError::internal(error.to_string()))?;
-        }
-        let encoded = self.adapter.plan(&self.backbone, &request)?;
-        let mut merged = None::<DecisionResponse>;
-        for chunk in encoded {
-            let result = self.predict_encoded(&chunk)?;
-            if let Some(response) = &mut merged {
-                response.answers.extend(result.answers);
-                response.usage.input_tokens += result.usage.input_tokens;
-            } else {
-                merged = Some(result);
-            }
-        }
-        merged.ok_or_else(|| ApiError::internal("Decision request produced no sequences"))
+        self.predict_encoded(&self.encode(&request)?)
     }
     fn predict_encoded(&self, encoded: &Encoded) -> Result<DecisionResponse, ApiError> {
-        let ids = Tensor::from_vec(encoded.ids.clone(), (1, encoded.ids.len()), &self.device)
-            .map_err(|error| ApiError::internal(error.to_string()))?;
-        crate::numerics::json("token-ids", &encoded.ids)
-            .map_err(|error| ApiError::internal(error.to_string()))?;
-        if crate::numerics::enabled() {
-            let questions: Vec<_> = encoded
-                .questions
-                .iter()
-                .map(|question| {
-                    json!({
-                        "question_id": question.id,
-                        "question_type": question.kind,
-                        "question_span": question.question_span,
-                        "option_spans": question.option_spans,
-                        "option_ids": question.option_ids,
-                    })
-                })
-                .collect();
-            crate::numerics::json("questions", &questions)
-                .map_err(|error| ApiError::internal(error.to_string()))?;
-        }
+        let ids = Tensor::from_vec(
+            encoded.ids.clone(),
+            (1, encoded.ids.len()),
+            &self.backbone.device,
+        )
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+
         let hidden = if encoded.images.is_some() || encoded.videos.is_some() {
             let image_features = encoded
                 .images
                 .as_ref()
-                .map(|images| self.visual_features(&images.patches, &images.grids))
+                .map(|images| {
+                    self.backbone
+                        .visual_features(&images.patches, &images.grids)
+                })
                 .transpose()?;
             let video_features = encoded
                 .videos
                 .as_ref()
-                .map(|videos| self.visual_features(&videos.patches, &videos.grids))
+                .map(|videos| {
+                    self.backbone
+                        .visual_features(&videos.patches, &videos.grids)
+                })
                 .transpose()?;
             let embeddings = self
+                .backbone
                 .decoder
                 .embed(&ids)
                 .and_then(|tensor| tensor.squeeze(0))
@@ -177,11 +135,13 @@ impl<A: Adapter> Qwen35<A> {
             let embeddings = Tensor::cat(&chunks.iter().collect::<Vec<_>>(), 0)
                 .and_then(|tensor| tensor.unsqueeze(0))
                 .map_err(|error| ApiError::internal(error.to_string()))?;
-            self.decoder
+            self.backbone
+                .decoder
                 .forward_embeds(&embeddings, &encoded.positions)
                 .map_err(|error| ApiError::internal(error.to_string()))?
         } else {
-            self.decoder
+            self.backbone
+                .decoder
                 .forward(&ids)
                 .map_err(|error| ApiError::internal(error.to_string()))?
         };
@@ -216,8 +176,8 @@ impl<A: Adapter> Qwen35<A> {
                 .flat_map(|r| r.ids.iter().copied())
                 .collect::<Vec<_>>();
             let total = flat.len();
-            let ids = Tensor::from_vec(flat, (1, total), &self.device)?;
-            let hidden = self.decoder.forward_packed(&ids, &lengths)?;
+            let ids = Tensor::from_vec(flat, (1, total), &self.backbone.device)?;
+            let hidden = self.backbone.decoder.forward_packed(&ids, &lengths)?;
             self.adapter.score_packed(encoded, &hidden)
         };
         match run() {
@@ -234,14 +194,14 @@ impl<A: Adapter> Qwen35<A> {
     }
 
     fn predict_text_bucket(&self, encoded: &[&Encoded]) -> Vec<Result<DecisionResponse, ApiError>> {
-        if !self.causal && !self.packed_text_supported() && encoded.len() > 1 {
+        if !self.backbone.causal && !self.backbone.packed_text_supported() && encoded.len() > 1 {
             return encoded
                 .iter()
                 .map(|item| self.predict_text_bucket(&[item]).remove(0))
                 .collect();
         }
         #[cfg(feature = "cuda")]
-        if encoded.len() > 1 && self.packed_text_supported() {
+        if encoded.len() > 1 && self.backbone.packed_text_supported() {
             return self.predict_packed_text_bucket(encoded);
         }
 
@@ -251,7 +211,8 @@ impl<A: Adapter> Qwen35<A> {
             flattened.extend_from_slice(&item.ids);
             flattened.resize(flattened.len() + length - item.ids.len(), 0);
         }
-        let ids = match Tensor::from_vec(flattened, (encoded.len(), length), &self.device) {
+        let ids = match Tensor::from_vec(flattened, (encoded.len(), length), &self.backbone.device)
+        {
             Ok(ids) => ids,
             Err(error) => {
                 return (0..encoded.len())
@@ -259,7 +220,7 @@ impl<A: Adapter> Qwen35<A> {
                     .collect();
             }
         };
-        let hidden = match self.decoder.forward(&ids) {
+        let hidden = match self.backbone.decoder.forward(&ids) {
             Ok(hidden) => hidden,
             Err(error) => {
                 return (0..encoded.len())
@@ -276,8 +237,9 @@ impl<A: Adapter> Qwen35<A> {
                     .and_then(|value| value.narrow(1, 0, item.ids.len()))
                     .and_then(|value| value.squeeze(0))
                     .map_err(|error| ApiError::internal(error.to_string()))?;
-                let item_ids = Tensor::from_vec(item.ids.clone(), item.ids.len(), &self.device)
-                    .map_err(|error| ApiError::internal(error.to_string()))?;
+                let item_ids =
+                    Tensor::from_vec(item.ids.clone(), item.ids.len(), &self.backbone.device)
+                        .map_err(|error| ApiError::internal(error.to_string()))?;
                 self.response(item, &item_ids, &item_hidden)
             })
             .collect()
@@ -314,7 +276,7 @@ impl<A: Adapter> DecisionModel for Qwen35<A> {
         requests: Vec<DecisionRequest>,
         complete: &mut dyn FnMut(usize, Result<DecisionResponse, ApiError>),
     ) {
-        if requests.len() <= 1 || !self.device.is_cuda() || crate::numerics::enabled() {
+        if requests.len() <= 1 || !self.backbone.device.is_cuda() {
             for (slot, request) in requests.into_iter().enumerate() {
                 complete(slot, self.predict_one(request));
             }
@@ -339,11 +301,7 @@ impl<A: Adapter> DecisionModel for Qwen35<A> {
                 match item {
                     Ok(encoded) => prepared.push((slot, encoded)),
                     Err(error) => {
-                        if self.adapter.splits_requests() {
-                            complete(slot, self.predict_one(requests[slot].clone()));
-                        } else {
-                            complete(slot, Err(error));
-                        }
+                        complete(slot, Err(error));
                     }
                 }
             }
@@ -357,11 +315,7 @@ impl<A: Adapter> DecisionModel for Qwen35<A> {
                 match self.encode(&request) {
                     Ok(encoded) => prepared.push((slot, encoded)),
                     Err(error) => {
-                        if self.adapter.splits_requests() {
-                            complete(slot, self.predict_one(request));
-                        } else {
-                            complete(slot, Err(error));
-                        }
+                        complete(slot, Err(error));
                     }
                 }
             }
@@ -374,11 +328,19 @@ impl<A: Adapter> DecisionModel for Qwen35<A> {
             .collect();
         let mut remaining = lengths;
         while !remaining.is_empty() {
-            let batch_token_budget = self.refresh_batch_token_budget();
-            let planned = if self.packed_text_supported() {
-                batching::packed_buckets(&remaining, self.max_length, batch_token_budget)
+            let batch_token_budget = self.backbone.refresh_batch_token_budget();
+            let planned = if self.backbone.packed_text_supported() {
+                batching::packed_buckets(
+                    &remaining,
+                    self.backbone.context.max_length,
+                    batch_token_budget,
+                )
             } else {
-                batching::buckets(&remaining, self.max_length, batch_token_budget)
+                batching::buckets(
+                    &remaining,
+                    self.backbone.context.max_length,
+                    batch_token_budget,
+                )
             };
             let bucket = planned
                 .into_iter()
@@ -387,7 +349,7 @@ impl<A: Adapter> DecisionModel for Qwen35<A> {
             remaining.retain(|(index, _)| !bucket.contains(index));
             let inputs: Vec<_> = bucket.iter().map(|&index| &prepared[index].1).collect();
             let mut responses = self.predict_text_bucket(&inputs);
-            let failed_padded_tokens = if self.packed_text_supported() {
+            let failed_padded_tokens = if self.backbone.packed_text_supported() {
                 inputs.iter().map(|r| r.ids.len()).sum()
             } else {
                 inputs
@@ -400,7 +362,8 @@ impl<A: Adapter> DecisionModel for Qwen35<A> {
             let batch_oom = responses
                 .iter()
                 .any(|response| response.as_ref().is_err_and(is_cuda_out_of_memory));
-            let reduced_budget = batch_oom.then(|| self.record_batch_oom(failed_padded_tokens));
+            let reduced_budget =
+                batch_oom.then(|| self.backbone.record_batch_oom(failed_padded_tokens));
             for (position, response) in responses.iter_mut().enumerate() {
                 let out_of_memory =
                     inputs.len() > 1 && response.as_ref().is_err_and(is_cuda_out_of_memory);
@@ -418,7 +381,7 @@ impl<A: Adapter> DecisionModel for Qwen35<A> {
                         .next()
                         .unwrap();
                 } else if inputs.len() > 1
-                    && !(self.packed_text_supported() && !self.adapter.confirm_batches())
+                    && !(self.backbone.packed_text_supported() && !self.adapter.confirm_batches())
                     && response
                         .as_ref()
                         .is_ok_and(|r| self.adapter.needs_confirmation(r))

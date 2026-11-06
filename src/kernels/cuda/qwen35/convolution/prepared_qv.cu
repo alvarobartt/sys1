@@ -21,9 +21,9 @@ __device__ __forceinline__ void qwen35_convcast_qv_impl(const __nv_bfloat16 *mix
     const unsigned int source = token * (2 * key_width + value_width) + head * 128 + lane * 4;
     const unsigned int target = row * 128 + lane * 4;
     float q[4], k[4];
-    qwen35_convlookup156_element4(
+    qwen35_conv_lookup_element4(
         mixed, weights, q, token, head * 128 + lane * 4, begin, channels, kernel, table);
-    qwen35_convlookup156_element4(mixed, weights, k, token, key_width + head * 128 + lane * 4,
+    qwen35_conv_lookup_element4(mixed, weights, k, token, key_width + head * 128 + lane * 4,
         begin, channels, kernel, table);
     float qs = __fmul_rn(q[0], q[0]), ks = __fmul_rn(k[0], k[0]);
 #pragma unroll
@@ -86,7 +86,7 @@ __device__ __forceinline__ void qwen35_convcast_qv_impl(const __nv_bfloat16 *mix
     const unsigned int vo = token * value_width + head * repeat * 128;
     for (int j = lane * 4; j < repeat * 128; j += 128) {
         float out[4];
-        qwen35_convlookup156_element4(mixed, weights, out, token,
+        qwen35_conv_lookup_element4(mixed, weights, out, token,
             2 * key_width + head * repeat * 128 + j, begin, channels, kernel, table);
         *reinterpret_cast<float4 *>(value + vo + j) = make_float4(out[0], out[1], out[2], out[3]);
         unsigned hv[4];

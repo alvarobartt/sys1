@@ -380,8 +380,6 @@ impl JointProtocol {
         encoded: &Encoded,
         logits: Vec<Vec<f32>>,
     ) -> Result<DecisionResponse, ApiError> {
-        crate::numerics::json("logits", &logits)
-            .map_err(|error| ApiError::internal(error.to_string()))?;
         let mut answers = Map::new();
         for ((question, criterion), scores) in
             encoded.questions.iter().zip(&encoded.criteria).zip(logits)

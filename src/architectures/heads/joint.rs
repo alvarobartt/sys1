@@ -17,7 +17,7 @@ fn grouped_final_scores(
     prior_scale: &Tensor,
     joint_scale: &Tensor,
     gate: &Tensor,
-) -> candle_core::Result<(Tensor, Tensor)> {
+) -> candle_core::Result<Tensor> {
     if raw_priors.is_empty()
         || raw_priors
             .iter()
@@ -46,7 +46,7 @@ fn grouped_final_scores(
     let joint = (field_cos.broadcast_mul(joint_scale)? + residual)?;
     let scores = (&prior + joint.broadcast_mul(gate)?)?;
 
-    Ok((scores, prior))
+    Ok(scores)
 }
 
 use crate::models::AttentionImplementation;
@@ -286,24 +286,6 @@ impl Attention {
         ))
     }
 
-    fn forward(&self, query: &Tensor, memory: &Tensor) -> Result<Tensor> {
-        self.forward_with_capture(query, memory, None)
-    }
-
-    fn routing_capture(index: Option<usize>, stage: &str, tensor: &Tensor) -> Result<()> {
-        if index == Some(0) && crate::numerics::enabled() {
-            let captured = if tensor.rank() == 4
-                && matches!(stage, "q-projected" | "k-projected" | "v-projected")
-            {
-                tensor.flatten_from(2)?
-            } else {
-                tensor.clone()
-            };
-            crate::numerics::capture(&format!("head-evidence-0-{stage}"), &captured)?;
-        }
-        Ok(())
-    }
-
     #[cfg(feature = "metal")]
     fn forward_metal(&self, query: &Tensor, memory: &Tensor) -> Result<Tensor> {
         let (batch, q_len, _) = query.dims3()?;
@@ -374,12 +356,7 @@ impl Attention {
             .apply(&self.out_proj)
     }
 
-    fn forward_with_capture(
-        &self,
-        query: &Tensor,
-        memory: &Tensor,
-        capture_index: Option<usize>,
-    ) -> Result<Tensor> {
+    fn forward(&self, query: &Tensor, memory: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "metal")]
         if query.device().is_metal() {
             return self.forward_metal(query, memory);
@@ -388,14 +365,11 @@ impl Attention {
         let (batch, q_len, _) = query.dims3()?;
 
         let head_dim = self.width / self.heads;
-        Self::routing_capture(capture_index, "query-input", query)?;
-        Self::routing_capture(capture_index, "memory-input", memory)?;
+
         let (q, k, v, direct) = self.project_heads(query, memory)?;
         #[cfg(not(feature = "cuda"))]
         let _ = direct;
-        Self::routing_capture(capture_index, "q-projected", &q)?;
-        Self::routing_capture(capture_index, "k-projected", &k)?;
-        Self::routing_capture(capture_index, "v-projected", &v)?;
+
         let scale = (head_dim as f32).powf(-0.5);
         #[cfg(feature = "metal")]
         // BF16 Metal SDPA produced non-finite values for Clef's 256-wide heads.
@@ -437,13 +411,11 @@ impl Attention {
             false,
             self.implementation,
         )?;
-        if capture_index == Some(0) && crate::numerics::enabled() {
-            Self::routing_capture(capture_index, "attended", &attended.flatten_from(2)?)?;
-        }
+
         let output = attended
             .reshape((batch, q_len, self.width))?
             .apply(&self.out_proj)?;
-        Self::routing_capture(capture_index, "output-projected", &output)?;
+
         Ok(output)
     }
 }
@@ -478,21 +450,20 @@ impl EvidenceLayer {
         })
     }
 
-    fn forward(&self, queries: &Tensor, memory: &Tensor, index: usize) -> Result<Tensor> {
-        let routed = self.attention.forward_with_capture(
+    fn forward(&self, queries: &Tensor, memory: &Tensor) -> Result<Tensor> {
+        let routed = self.attention.forward(
             &queries.apply(&self.query_norm)?,
             &memory.apply(&self.memory_norm)?,
-            Some(index),
         )?;
         let queries = (queries + routed)?;
         let normalized = queries.apply(&self.feedforward_norm)?;
-        Attention::routing_capture(Some(index), "feedforward-input", &normalized)?;
+
         let projected = normalized.apply(&self.fc1)?;
-        Attention::routing_capture(Some(index), "feedforward-projected", &projected)?;
+
         let activated = projected.gelu_erf()?;
-        Attention::routing_capture(Some(index), "feedforward-activated", &activated)?;
+
         let output = activated.apply(&self.fc2)?;
-        Attention::routing_capture(Some(index), "feedforward-output", &output)?;
+
         &queries + output
     }
 }
@@ -594,9 +565,6 @@ impl Attention {
         queries: &PackedHeadSegments,
         keys: &PackedHeadSegments,
     ) -> Result<Tensor> {
-        if crate::numerics::enabled() {
-            candle_core::bail!("packed head is not a singleton tensor capture path");
-        }
         if query.dims() != [1, queries.total, self.width]
             || memory.dims() != [1, keys.total, self.width]
         {
@@ -701,9 +669,6 @@ struct HeadFinalBatch {
     normalized_lexical: Tensor,
     normalized_anchor: Tensor,
     field_cos: Tensor,
-    features: Tensor,
-    projected: Tensor,
-    activated: Tensor,
     output: Tensor,
 }
 
@@ -758,9 +723,6 @@ impl JointHead {
             normalized_lexical,
             normalized_anchor,
             field_cos,
-            features,
-            projected,
-            activated,
             output,
         })
     }
@@ -938,7 +900,7 @@ impl JointHead {
             return self.forward_scoring_single(hidden, ids, questions, output_embedding);
         }
         let hidden = hidden.apply(&self.hidden_norm)?;
-        crate::numerics::capture("head-normalized", &hidden)?;
+
         let hidden = if hidden.rank() == 3 {
             hidden.squeeze(0)?
         } else {
@@ -1062,9 +1024,8 @@ impl JointHead {
             routed.push(query);
         }
         let mut options = Tensor::cat(&routed.iter().collect::<Vec<_>>(), 0)?.unsqueeze(0)?;
-        for (index, layer) in self.evidence_layers.iter().enumerate() {
-            options = layer.forward(&options, &memory, index)?;
-            crate::numerics::capture(&format!("head-evidence-{index}"), &options)?;
+        for layer in &self.evidence_layers {
+            options = layer.forward(&options, &memory)?;
         }
         let options = options.squeeze(0)?;
         let mut split = Vec::with_capacity(questions.len());
@@ -1074,7 +1035,7 @@ impl JointHead {
             start += count;
         }
         let base_fields = question_vectors.apply(&self.question_projection)?;
-        crate::numerics::capture("head-initial-base-fields", &base_fields)?;
+
         let mut summaries = Vec::with_capacity(questions.len());
         for (index, values) in split.iter().enumerate() {
             let field = base_fields.narrow(0, index, 1)?.squeeze(0)?;
@@ -1083,16 +1044,7 @@ impl JointHead {
             let weights =
                 softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(values.dtype())?;
             let summary = Self::option_summary(values, &weights)?;
-            if crate::numerics::enabled() {
-                for (stage, tensor) in [
-                    ("values", values),
-                    ("scores", &scores),
-                    ("weights", &weights),
-                    ("output", &summary),
-                ] {
-                    crate::numerics::capture(&format!("head-summary-{index}-{stage}"), tensor)?;
-                }
-            }
+
             summaries.push(summary);
         }
         let fields = ((&base_fields
@@ -1101,10 +1053,9 @@ impl JointHead {
         .broadcast_add(&global.unsqueeze(0)?.apply(&self.global_projection)?)?
             + type_ids.apply(&self.type_embedding)?)?;
         let mut fields = fields.unsqueeze(0)?;
-        crate::numerics::capture("head-initial-fields", &fields)?;
-        for (index, layer) in self.layers.iter().enumerate() {
+
+        for layer in &self.layers {
             fields = layer.forward(&fields, &memory)?;
-            crate::numerics::capture(&format!("head-fields-{index}"), &fields)?;
         }
         let fields = fields.squeeze(0)?.apply(&self.field_norm)?;
         let prior_scale = self.prior_scale.clone();
@@ -1137,18 +1088,7 @@ impl JointHead {
             let residual_projected = features.apply(&self.scorer1)?;
             let residual_activated = residual_projected.gelu_erf()?;
             let residual_output = residual_activated.apply(&self.scorer2)?;
-            if crate::numerics::enabled() {
-                for (stage, value) in [
-                    ("features", &features),
-                    ("projected", &residual_projected),
-                    ("activated", &residual_activated),
-                    ("output", &residual_output),
-                    ("prior", &prior),
-                    ("field-cos", &field_cos),
-                ] {
-                    crate::numerics::capture(&format!("head-residual-{index}-{stage}"), value)?;
-                }
-            }
+
             let residual = residual_output.squeeze(1)?.to_dtype(DType::F32)?;
             let joint = (field_cos.broadcast_mul(&joint_scale)? + residual)?;
             pending_scores.push((prior + joint.broadcast_mul(&gate)?)?);
@@ -1185,7 +1125,7 @@ impl JointHead {
         output_embedding: &Tensor,
     ) -> Result<Vec<Vec<f32>>> {
         let hidden = hidden.apply(&self.hidden_norm)?;
-        crate::numerics::capture("head-normalized", &hidden)?;
+
         let hidden = if hidden.rank() == 3 {
             hidden.squeeze(0)?
         } else {
@@ -1309,9 +1249,8 @@ impl JointHead {
             routed.push(query);
         }
         let mut options = Tensor::cat(&routed.iter().collect::<Vec<_>>(), 0)?.unsqueeze(0)?;
-        for (index, layer) in self.evidence_layers.iter().enumerate() {
-            options = layer.forward(&options, &memory, index)?;
-            crate::numerics::capture(&format!("head-evidence-{index}"), &options)?;
+        for layer in &self.evidence_layers {
+            options = layer.forward(&options, &memory)?;
         }
         let options = options.squeeze(0)?;
         let mut split = Vec::with_capacity(questions.len());
@@ -1321,7 +1260,7 @@ impl JointHead {
             start += count;
         }
         let base_fields = question_vectors.apply(&self.question_projection)?;
-        crate::numerics::capture("head-initial-base-fields", &base_fields)?;
+
         let mut summaries = Vec::with_capacity(questions.len());
         for (index, values) in split.iter().enumerate() {
             let field = base_fields.narrow(0, index, 1)?.squeeze(0)?;
@@ -1330,16 +1269,7 @@ impl JointHead {
             let weights =
                 softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(values.dtype())?;
             let summary = Self::option_summary(values, &weights)?;
-            if crate::numerics::enabled() {
-                for (stage, tensor) in [
-                    ("values", values),
-                    ("scores", &scores),
-                    ("weights", &weights),
-                    ("output", &summary),
-                ] {
-                    crate::numerics::capture(&format!("head-summary-{index}-{stage}"), tensor)?;
-                }
-            }
+
             summaries.push(summary);
         }
         let fields = ((&base_fields
@@ -1348,10 +1278,9 @@ impl JointHead {
         .broadcast_add(&global.unsqueeze(0)?.apply(&self.global_projection)?)?
             + type_ids.apply(&self.type_embedding)?)?;
         let mut fields = fields.unsqueeze(0)?;
-        crate::numerics::capture("head-initial-fields", &fields)?;
-        for (index, layer) in self.layers.iter().enumerate() {
+
+        for layer in &self.layers {
             fields = layer.forward(&fields, &memory)?;
-            crate::numerics::capture(&format!("head-fields-{index}"), &fields)?;
         }
         let fields = fields.squeeze(0)?.apply(&self.field_norm)?;
         let prior_scale = self.prior_scale.clone();
@@ -1380,22 +1309,8 @@ impl JointHead {
                 .squeeze(1)?
                 .broadcast_mul(&prior_scale)?;
             let field_cos = final_batch.field_cos.narrow(0, start, count)?;
-            let features = final_batch.features.narrow(0, start, count)?;
-            let residual_projected = final_batch.projected.narrow(0, start, count)?;
-            let residual_activated = final_batch.activated.narrow(0, start, count)?;
             let residual_output = final_batch.output.narrow(0, start, count)?;
-            if crate::numerics::enabled() {
-                for (stage, value) in [
-                    ("features", &features),
-                    ("projected", &residual_projected),
-                    ("activated", &residual_activated),
-                    ("output", &residual_output),
-                    ("prior", &prior),
-                    ("field-cos", &field_cos),
-                ] {
-                    crate::numerics::capture(&format!("head-residual-{index}-{stage}"), value)?;
-                }
-            }
+
             let residual = residual_output.squeeze(1)?.to_dtype(DType::F32)?;
             let joint = (field_cos.broadcast_mul(&joint_scale)? + residual)?;
             pending_scores.push((prior + joint.broadcast_mul(&gate)?)?);
@@ -1435,7 +1350,7 @@ impl JointHead {
         request_question_counts: &[usize],
     ) -> Result<Vec<Vec<f32>>> {
         let hidden = hidden.apply(&self.hidden_norm)?;
-        crate::numerics::capture("head-normalized", &hidden)?;
+
         let hidden = if hidden.rank() == 3 {
             hidden.squeeze(0)?
         } else {
@@ -1601,9 +1516,8 @@ impl JointHead {
             routed.push(query);
         }
         let mut options = Tensor::cat(&routed.iter().collect::<Vec<_>>(), 0)?.unsqueeze(0)?;
-        for (index, layer) in self.evidence_layers.iter().enumerate() {
+        for layer in &self.evidence_layers {
             options = layer.forward_head_packed(&options, &memory, &options_plan, &tokens)?;
-            crate::numerics::capture(&format!("head-evidence-{index}"), &options)?;
         }
         let options = options.squeeze(0)?;
         let mut split = Vec::with_capacity(questions.len());
@@ -1613,7 +1527,7 @@ impl JointHead {
             start += count;
         }
         let base_fields = question_vectors.apply(&self.question_projection)?;
-        crate::numerics::capture("head-initial-base-fields", &base_fields)?;
+
         let mut summaries = Vec::with_capacity(questions.len());
         for (index, values) in split.iter().enumerate() {
             let field = base_fields.narrow(0, index, 1)?.squeeze(0)?;
@@ -1622,16 +1536,7 @@ impl JointHead {
             let weights =
                 softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(values.dtype())?;
             let summary = Self::option_summary(values, &weights)?;
-            if crate::numerics::enabled() {
-                for (stage, tensor) in [
-                    ("values", values),
-                    ("scores", &scores),
-                    ("weights", &weights),
-                    ("output", &summary),
-                ] {
-                    crate::numerics::capture(&format!("head-summary-{index}-{stage}"), tensor)?;
-                }
-            }
+
             summaries.push(summary);
         }
         let fields = ((&base_fields
@@ -1640,10 +1545,9 @@ impl JointHead {
         .broadcast_add(&global.apply(&self.global_projection)?)?
             + type_ids.apply(&self.type_embedding)?)?;
         let mut fields = fields.unsqueeze(0)?;
-        crate::numerics::capture("head-initial-fields", &fields)?;
-        for (index, layer) in self.layers.iter().enumerate() {
+
+        for layer in &self.layers {
             fields = layer.forward_head_packed(&fields, &memory, &fields_plan, &tokens)?;
-            crate::numerics::capture(&format!("head-fields-{index}"), &fields)?;
         }
         let fields = fields.squeeze(0)?.apply(&self.field_norm)?;
         let prior_scale = self.prior_scale.clone();
@@ -1675,7 +1579,7 @@ impl JointHead {
                 );
                 start += count;
             }
-            let (scores, prior) = grouped_final_scores(
+            let scores = grouped_final_scores(
                 &raw_priors,
                 &final_batch.field_cos,
                 &final_batch.output,
@@ -1683,28 +1587,7 @@ impl JointHead {
                 &joint_scale,
                 &gate,
             )?;
-            if crate::numerics::enabled() {
-                let mut start = 0;
-                for (index, &count) in counts.iter().enumerate() {
-                    let features = final_batch.features.narrow(0, start, count)?;
-                    let projected = final_batch.projected.narrow(0, start, count)?;
-                    let activated = final_batch.activated.narrow(0, start, count)?;
-                    let output = final_batch.output.narrow(0, start, count)?;
-                    let prior = prior.narrow(0, start, count)?;
-                    let field_cos = final_batch.field_cos.narrow(0, start, count)?;
-                    for (stage, value) in [
-                        ("features", &features),
-                        ("projected", &projected),
-                        ("activated", &activated),
-                        ("output", &output),
-                        ("prior", &prior),
-                        ("field-cos", &field_cos),
-                    ] {
-                        crate::numerics::capture(&format!("head-residual-{index}-{stage}"), value)?;
-                    }
-                    start += count;
-                }
-            }
+
             let scores = scores.to_vec1::<f32>()?;
             let mut start = 0;
             return Ok(counts
@@ -1727,22 +1610,8 @@ impl JointHead {
                 .squeeze(1)?
                 .broadcast_mul(&prior_scale)?;
             let field_cos = final_batch.field_cos.narrow(0, start, count)?;
-            let features = final_batch.features.narrow(0, start, count)?;
-            let residual_projected = final_batch.projected.narrow(0, start, count)?;
-            let residual_activated = final_batch.activated.narrow(0, start, count)?;
             let residual_output = final_batch.output.narrow(0, start, count)?;
-            if crate::numerics::enabled() {
-                for (stage, value) in [
-                    ("features", &features),
-                    ("projected", &residual_projected),
-                    ("activated", &residual_activated),
-                    ("output", &residual_output),
-                    ("prior", &prior),
-                    ("field-cos", &field_cos),
-                ] {
-                    crate::numerics::capture(&format!("head-residual-{index}-{stage}"), value)?;
-                }
-            }
+
             let residual = residual_output.squeeze(1)?.to_dtype(DType::F32)?;
             let joint = (field_cos.broadcast_mul(&joint_scale)? + residual)?;
             pending_scores.push((prior + joint.broadcast_mul(&gate)?)?);
