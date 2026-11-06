@@ -607,7 +607,7 @@ impl Layer {
         local_window: usize,
     ) -> Result<Tensor> {
         let normalized = match &self.attention_norm {
-            Some(norm) => xs.apply(norm)?,
+            Some(norm) => crate::kernels::normalization::layer_norm(xs, norm)?,
             None => xs.clone(),
         };
 
@@ -629,7 +629,7 @@ impl Layer {
             )?
             .to_dtype(xs.dtype())?;
         let xs = (attention + xs)?;
-        let normalized = xs.apply(&self.mlp_norm)?;
+        let normalized = crate::kernels::normalization::layer_norm(&xs, &self.mlp_norm)?;
 
         let mlp = self.mlp.forward(&normalized)?;
 
@@ -727,7 +727,8 @@ impl Encoder {
             .then(|| self.local_mask(length, ids.device()))
             .transpose()?;
         let local_window = self.local_attention_size / 2;
-        let mut xs = ids.apply(&self.embeddings)?.apply(&self.norm)?;
+        let mut xs =
+            crate::kernels::normalization::layer_norm(&ids.apply(&self.embeddings)?, &self.norm)?;
         for layer in &self.layers {
             xs = layer.forward(
                 &xs,
@@ -737,7 +738,7 @@ impl Encoder {
                 local_window,
             )?;
         }
-        xs.apply(&self.final_norm)
+        crate::kernels::normalization::layer_norm(&xs, &self.final_norm)
     }
 
     fn local_mask(&self, length: usize, device: &Device) -> Result<Tensor> {

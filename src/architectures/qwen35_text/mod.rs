@@ -1400,6 +1400,9 @@ fn chunked_delta_rule(
     if q.device().is_metal() && key_dim == 128 {
         return crate::kernels::metal::delta_rule(q, k, v, g, beta);
     }
+    if q.device().is_cpu() && q.dtype() == DType::F32 {
+        return crate::kernels::cpu::delta_rule(q, k, v, g, beta);
+    }
     chunked_delta_rule_fallback(q, k, v, g, beta)
 }
 
@@ -1789,6 +1792,79 @@ fn full_attention_gate_mul(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_recurrence_matches_chunked_reference() -> Result<()> {
+        let device = candle_core::Device::Cpu;
+        for (batch, heads, length, keys, values) in [
+            (1, 1, 1, 8, 5),
+            (2, 3, 31, 16, 9),
+            (2, 3, 32, 16, 9),
+            (2, 3, 33, 16, 9),
+            (1, 2, 257, 16, 9),
+            (1, 2, 1025, 16, 9),
+            (1, 2, 65, 128, 128),
+        ] {
+            let pattern = |count: usize, seed: usize| -> Vec<f32> {
+                (0..count)
+                    .map(|i| ((i * 17 + seed) % 127) as f32 / 127. - 0.5)
+                    .collect()
+            };
+            let q = Tensor::from_vec(
+                pattern(batch * heads * length * keys, 3),
+                (batch, length, heads, keys),
+                &device,
+            )?
+            .transpose(1, 2)?;
+            let k = Tensor::from_vec(
+                pattern(batch * heads * length * keys, 11),
+                (batch, length, heads, keys),
+                &device,
+            )?
+            .transpose(1, 2)?;
+            let normalize =
+                |x: &Tensor| x.broadcast_div(&(x.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?);
+            let q = (normalize(&q)? / (keys as f64).sqrt())?;
+            let k = normalize(&k)?;
+            let v = Tensor::from_vec(
+                pattern(batch * heads * length * values, 29),
+                (batch, length, heads, values),
+                &device,
+            )?
+            .transpose(1, 2)?;
+            let g = Tensor::from_vec(
+                (0..batch * heads * length)
+                    .map(|i| -0.001 - (i % 9) as f32 / 10.)
+                    .collect::<Vec<_>>(),
+                (batch, heads, length),
+                &device,
+            )?;
+            let beta = Tensor::from_vec(
+                (0..batch * heads * length)
+                    .map(|i| [0_f32, 0.5, 1., 1e-7][i % 4])
+                    .collect::<Vec<_>>(),
+                (batch, heads, length),
+                &device,
+            )?;
+            let expected = chunked_delta_rule_fallback(&q, &k, &v, &g, &beta)?;
+            let actual = chunked_delta_rule(&q, &k, &v, &g, &beta)?;
+            assert_eq!(actual.dims(), [batch, length, heads, values]);
+            for (index, (a, b)) in actual
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .zip(expected.flatten_all()?.to_vec1::<f32>()?)
+                .enumerate()
+            {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "shape {batch}/{heads}/{length}/{keys}/{values}, element {index}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn guarded_double_radius_coefficient_bounds_exact_rational_values() {
