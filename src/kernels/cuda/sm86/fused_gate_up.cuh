@@ -77,7 +77,6 @@ __device__ __forceinline__ void fused_gate_up_body(const E *gate_weight, const E
         const auto product = __float2bfloat16_rn(
             __fmul_rn(__bfloat162float(lookup[__bfloat16_as_ushort(gate)]), __bfloat162float(up)));
         products[i] = __bfloat162float(product);
-
     }
     using Destination = typename ProductEpi::OutputTileIterator;
     typename Destination::Params params{Row(n)};
@@ -91,6 +90,5 @@ static_assert(sizeof(Shared) == 73728, "Rust dynamic shared memory must match na
 extern "C" __global__ __launch_bounds__(Threads) void direct_ffn_bf16(const E *gate_weight,
     const E *up_weight, const E *input, const __nv_bfloat16 *table, __nv_bfloat16 *output, int rows,
     int n, int k) {
-    fused_gate_up_body(
-        gate_weight, up_weight, input, table, output, rows, n, k);
+    fused_gate_up_body(gate_weight, up_weight, input, table, output, rows, n, k);
 }

@@ -69,7 +69,6 @@ __device__ __forceinline__ void fused_gate_up_body(const E *packed, const E *x,
         const auto product = __float2bfloat16_rn(
             __fmul_rn(__bfloat162float(lookup[__bfloat16_as_ushort(gate)]), __bfloat162float(up)));
         products[i] = __bfloat162float(product);
-
     }
     using Destination = typename ProductEpi::OutputTileIterator;
     typename Destination::Params params{Row(n)};

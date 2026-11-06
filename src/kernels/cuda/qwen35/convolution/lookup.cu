@@ -90,8 +90,8 @@ __device__ __forceinline__ void qwen35_conv_lookup_impl(const __nv_bfloat16 *mix
     float q[4], k[4];
     qwen35_conv_lookup_element4(
         mixed, weights, q, token, head * 128 + lane * 4, begin, channels, kernel, table);
-    qwen35_conv_lookup_element4(mixed, weights, k, token, key_width + head * 128 + lane * 4,
-        begin, channels, kernel, table);
+    qwen35_conv_lookup_element4(mixed, weights, k, token, key_width + head * 128 + lane * 4, begin,
+        channels, kernel, table);
     float qs = __fmul_rn(q[0], q[0]), ks = __fmul_rn(k[0], k[0]);
 #pragma unroll
     for (int j = 1; j < 4; ++j) {
@@ -130,9 +130,9 @@ extern "C" __global__ void qwen35_conv_lookup_uniform(const __nv_bfloat16 *x,
     qwen35_conv_lookup_impl<false>(
         x, w, q, k, v, nullptr, rows, kh, vh, scale, length, kernel, table);
 }
-extern "C" __global__ void qwen35_conv_lookup_packed(const __nv_bfloat16 *x,
-    const __nv_bfloat16 *w, float *q, float *k, float *v, const unsigned *starts, unsigned rows,
-    int kh, int vh, float scale, int length, int kernel, const __nv_bfloat16 *table) {
+extern "C" __global__ void qwen35_conv_lookup_packed(const __nv_bfloat16 *x, const __nv_bfloat16 *w,
+    float *q, float *k, float *v, const unsigned *starts, unsigned rows, int kh, int vh,
+    float scale, int length, int kernel, const __nv_bfloat16 *table) {
     qwen35_conv_lookup_impl<true>(
         x, w, q, k, v, starts, rows, kh, vh, scale, length, kernel, table);
 }

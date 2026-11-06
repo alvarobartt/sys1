@@ -24,8 +24,8 @@ __device__ __forceinline__ void halfonly_convcast_qv_impl(const __nv_bfloat16 *m
     float q[4], k[4];
     qwen35_conv_lookup_element4(
         mixed, weights, q, token, head * 128 + lane * 4, begin, channels, kernel, table);
-    qwen35_conv_lookup_element4(mixed, weights, k, token, key_width + head * 128 + lane * 4,
-        begin, channels, kernel, table);
+    qwen35_conv_lookup_element4(mixed, weights, k, token, key_width + head * 128 + lane * 4, begin,
+        channels, kernel, table);
     float qs = __fmul_rn(q[0], q[0]), ks = __fmul_rn(k[0], k[0]);
 #pragma unroll
     for (int j = 1; j < 4; ++j) {
