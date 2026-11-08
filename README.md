@@ -112,7 +112,7 @@ print(response.choices["route"].choice)
 
 ### CUDA build assets and benchmarks
 
-CUDA builds fetch checksum-verified device images from the pinned [sys1-artifacts](https://huggingface.co/alvarobartt/sys1-artifacts/tree/fe16e9b22cd05ebb799f242df9ac68470d3e3d4c) revision and embed them in the executable. Inference needs no Python or asset download. External reference-fixture tests are ignored by default; serving and the end-to-end benchmarks do not need them. Third-party notices remain in `licenses/`.
+CUDA builds fetch checksum-verified device images from the pinned [sys1-artifacts](https://huggingface.co/alvarobartt/sys1-artifacts/tree/fe16e9b22cd05ebb799f242df9ac68470d3e3d4c) revision and embed them in the executable. Inference needs no Python or asset download. Third-party notices remain in `licenses/`.
 
 The [benchmark dataset](https://huggingface.co/datasets/alvarobartt/sys1-benchmarks/tree/a3c3616418ef2d20d2b39bfe8d0c2c905305df5d) provides canonical and stress workloads without storing data in Git:
 

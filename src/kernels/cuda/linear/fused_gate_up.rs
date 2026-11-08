@@ -101,7 +101,7 @@ pub(crate) fn forward(input: &Tensor, weight: &Tensor) -> Result<Tensor> {
     let ri = i32::try_from(rows).map_err(error)?;
     let ni = i32::try_from(n).map_err(error)?;
     let ki = i32::try_from(k).map_err(error)?;
-    super::activation::with_sigmoid_lookup(&device, |table| {
+    crate::kernels::cuda::activation::with_sigmoid_lookup(&device, |table| {
         let mut launch = function.builder();
         launch.arg(&w);
         launch.arg(&x);
