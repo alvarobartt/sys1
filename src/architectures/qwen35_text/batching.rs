@@ -154,10 +154,10 @@ pub(crate) fn packed_buckets(
     max_length: usize,
     budget: usize,
 ) -> Vec<Vec<usize>> {
-    if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("90") {
-        return packed_buckets_long_work(lengths, max_length, budget, 128);
-    }
-    if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("80") {
+    if matches!(
+        option_env!("SYS1_CUDA_COMPUTE_CAP"),
+        Some("80" | "86" | "89" | "90")
+    ) {
         return packed_buckets_long_work(lengths, max_length, budget, 128);
     }
     let mut sorted = lengths.to_vec();
@@ -189,8 +189,10 @@ pub(crate) fn c64_scratch_bytes_per_token(key_dim: usize, value_dim: usize, head
     let base = heads
         .saturating_mul(key_dim.saturating_add(value_dim).saturating_add(64 + 2))
         .saturating_mul(4);
-    let prepack = if matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90"))
-        && key_dim == 128
+    let prepack = if matches!(
+        option_env!("SYS1_CUDA_COMPUTE_CAP"),
+        Some("80" | "86" | "90")
+    ) && key_dim == 128
         && value_dim <= 128
     {
         heads.saturating_mul(28672 * 2 + 4).div_ceil(64)
@@ -199,7 +201,10 @@ pub(crate) fn c64_scratch_bytes_per_token(key_dim: usize, value_dim: usize, head
     };
 
     base.saturating_add(base.div_ceil(
-        if matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90")) {
+        if matches!(
+            option_env!("SYS1_CUDA_COMPUTE_CAP"),
+            Some("80" | "86" | "90")
+        ) {
             2
         } else {
             8
@@ -211,7 +216,10 @@ pub(crate) fn c64_scratch_bytes_per_token(key_dim: usize, value_dim: usize, head
 }
 
 pub(crate) fn aggregate_work_multiplier() -> usize {
-    if matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90")) {
+    if matches!(
+        option_env!("SYS1_CUDA_COMPUTE_CAP"),
+        Some("80" | "86" | "90")
+    ) {
         4
     } else {
         2

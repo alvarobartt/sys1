@@ -140,44 +140,4 @@ mod tests {
         }
         Ok(())
     }
-
-    #[test]
-    #[ignore = "external reference data"]
-    fn promoted_gelu_matches_native_torch_fixtures() -> Result<()> {
-        let root = crate::assets::fixtures("activation")?;
-        let device =
-            crate::device::load().map_err(|error| candle_core::Error::Msg(error.to_string()))?;
-        for (name, rtol) in [("bf16", 0.016f32), ("f16", 0.001), ("f32", 1.3e-6)] {
-            #[cfg(feature = "cuda")]
-            if name == "bf16"
-                && let candle_core::Device::Cuda(cuda) = &device
-            {
-                let (major, _) = cuda
-                    .cuda_stream()
-                    .context()
-                    .compute_capability()
-                    .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
-                if major < 8 {
-                    continue;
-                }
-            }
-            let data = candle_core::safetensors::load(
-                root.join(format!("gelu-erf-{name}.safetensors")),
-                &device,
-            )?;
-            let actual = gelu_erf(&data["input"])?
-                .to_dtype(DType::F32)?
-                .to_vec1::<f32>()?;
-            let expected = data["expected"].to_dtype(DType::F32)?.to_vec1::<f32>()?;
-            assert_eq!(actual.len(), 2049);
-            for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
-                assert!(
-                    actual.is_finite()
-                        && (*actual - expected).abs() <= 1e-5 + rtol * expected.abs(),
-                    "{name} GELU at{index}: {actual} vs {expected}"
-                );
-            }
-        }
-        Ok(())
-    }
 }

@@ -3,7 +3,7 @@ use candle_core::cuda_backend::{
     cudarc::{
         driver::{
             CudaFunction, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg,
-            sys::{CUdevice_attribute, CUfunction_attribute},
+            sys::CUfunction_attribute,
         },
         nvrtc::Ptx,
     },
@@ -55,18 +55,29 @@ fn native_binary(i: usize) -> Result<&'static [u8]> {
     }
 }
 fn native_threads(i: usize) -> u32 {
-    if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("80") {
+    if cfg!(sys1_cuda_gdn_sm80) {
         SM80_THREADS[i]
     } else {
         THREADS[i]
     }
 }
 fn native_shared(i: usize) -> u32 {
-    if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("80") {
+    if cfg!(sys1_cuda_gdn_sm80) {
         SM80_SHARED[i]
     } else {
         SHARED[i]
     }
+}
+
+fn supports_device(stream: &CudaStream) -> Result<bool> {
+    let expected = match option_env!("SYS1_CUDA_COMPUTE_CAP") {
+        Some("80") => (8, 0),
+        Some("86") => (8, 6),
+        Some("89") => (8, 9),
+        Some("90") => (9, 0),
+        _ => return Ok(false),
+    };
+    Ok(stream.context().compute_capability().w()? == expected)
 }
 
 struct Metadata {
@@ -271,8 +282,10 @@ pub(crate) fn prepare_qv(device: &Device, lengths: &[usize]) -> Result<Option<Pr
     let Device::Cuda(device) = device else {
         return Ok(None);
     };
-    if !matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90"))
-        || lengths.is_empty()
+    if !matches!(
+        option_env!("SYS1_CUDA_COMPUTE_CAP"),
+        Some("80" | "86" | "89" | "90")
+    ) || lengths.is_empty()
         || lengths.contains(&0)
     {
         return Ok(None);
@@ -287,28 +300,15 @@ pub(crate) fn prepare_qv(device: &Device, lengths: &[usize]) -> Result<Option<Pr
         return Ok(None);
     }
 
-    if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("80")
-        && (total > 65536 || lengths.iter().any(|&n| n < 128))
+    if matches!(
+        option_env!("SYS1_CUDA_COMPUTE_CAP"),
+        Some("80" | "86" | "89")
+    ) && (total > 65536 || lengths.iter().any(|&n| n < 128))
     {
         return Ok(None);
     }
-    let expected_major = if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("80") {
-        8
-    } else {
-        9
-    };
     let stream = device.cuda_stream();
-    if stream
-        .context()
-        .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-        .w()?
-        != expected_major
-        || stream
-            .context()
-            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-            .w()?
-            != 0
-    {
+    if !supports_device(&stream)? {
         return Ok(None);
     }
     let mut slot = workspace_slot(&stream)?
@@ -469,7 +469,10 @@ fn try_forward_inputs(
         }
     }
 
-    if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("80") {
+    if matches!(
+        option_env!("SYS1_CUDA_COMPUTE_CAP"),
+        Some("80" | "86" | "89")
+    ) {
         if total > 65536
             || lengths.iter().any(|&n| n < 128)
             || [g, beta]
@@ -496,21 +499,7 @@ fn try_forward_inputs(
         if !bound || !Arc::ptr_eq(&ticket.slot.as_ref().unwrap().stream, &stream) {
             candle_core::bail!("prepared Q/V tensor identity, stream or sequence mismatch");
         }
-    } else if stream
-        .context()
-        .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-        .w()?
-        != (if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("80") {
-            8
-        } else {
-            9
-        })
-        || stream
-            .context()
-            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-            .w()?
-            != 0
-    {
+    } else if !supports_device(&stream)? {
         return Ok(None);
     }
     let has_prepared = prepared.is_some();

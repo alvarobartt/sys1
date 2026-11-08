@@ -1,3 +1,10 @@
+#[cfg(sys1_cuda_direct_ffn)]
+pub(crate) mod direct_mlp;
+#[cfg(sys1_cuda_fused_ffn)]
+pub(crate) mod fused_gate_up;
+#[cfg(sys1_cuda_fused_ffn)]
+pub(crate) mod fused_qkvz;
+
 use candle_core::{DType, Result, Tensor};
 
 pub(crate) fn matmul_fp32(input: &Tensor, weight: &Tensor) -> Result<Tensor> {

@@ -11,8 +11,10 @@ impl LinearAttention {
         let (projected, early_z) = self.project_qkvz(x)?;
         let mut prepared_qv = None;
 
-        if matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90"))
-            && self.value_dim == 128
+        if matches!(
+            option_env!("SYS1_CUDA_COMPUTE_CAP"),
+            Some("80" | "86" | "89" | "90")
+        ) && self.value_dim == 128
             && let Some(ticket) = prepared_convolution::prepare(
                 &projected,
                 &self.conv,
@@ -357,7 +359,10 @@ impl LinearAttention {
 
         if x.device().is_cuda() && self.key_dim == 128 {
             let output = if x.dtype() == DType::BF16
-                && matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90"))
+                && matches!(
+                    option_env!("SYS1_CUDA_COMPUTE_CAP"),
+                    Some("80" | "86" | "89" | "90")
+                )
                 && self.value_dim == 128
             {
                 cuda_c64bfout_varlen_prepared(
@@ -407,7 +412,9 @@ impl LinearAttention {
         x: &Tensor,
         sequences: &PackedSequences,
     ) -> Result<(Tensor, Tensor)> {
-        if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120") && x.dtype() == DType::BF16 {
+        if matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("89" | "120"))
+            && x.dtype() == DType::BF16
+        {
             let ba = self
                 .ba
                 .as_ref()
@@ -432,6 +439,9 @@ impl LinearAttention {
     pub(crate) fn qkvz_available(&self) -> bool {
         self.qkv.bias().is_none()
             && self.z.bias().is_none()
-            && crate::kernels::cuda::fused_qkvz::available(self.qkv.weight(), self.z.weight())
+            && crate::kernels::cuda::linear::fused_qkvz::available(
+                self.qkv.weight(),
+                self.z.weight(),
+            )
     }
 }

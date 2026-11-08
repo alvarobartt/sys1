@@ -131,7 +131,7 @@ fn compile_assets(capability: u32) {
         println!("cargo:rustc-check-cfg=cfg(sys1_cuda_gdn_sm80)");
         println!("cargo:rustc-check-cfg=cfg(sys1_cuda_gdn_sm90)");
         let architecture = match capability {
-            80 => Some(("qwen35_aot_assets_sm80", "sys1_cuda_gdn_sm80")),
+            80 | 86 | 89 => Some(("qwen35_aot_assets_sm80", "sys1_cuda_gdn_sm80")),
             90 => Some(("qwen35_aot_assets_v91", "sys1_cuda_gdn_sm90")),
             _ => None,
         };
@@ -161,10 +161,10 @@ fn compile_assets(capability: u32) {
 
 #[cfg(feature = "cuda")]
 fn compile_direct_gate_up(capability: u32) {
-    if capability != 86 {
+    if !matches!(capability, 86 | 89) {
         return;
     }
-    let source = "src/kernels/cuda/sm86/fused_gate_up.cuh";
+    let source = "src/kernels/cuda/linear/direct_mlp.cuh";
     println!("cargo:rerun-if-changed={source}");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let includes = cudaforge::DependencyManager::new()
@@ -172,15 +172,8 @@ fn compile_direct_gate_up(capability: u32) {
         .fetch_all(&out)
         .expect("pinned CUTLASS headers");
     let status = Command::new("nvcc")
-        .args([
-            "-x",
-            "cu",
-            "-ptx",
-            "-std=c++17",
-            "-O3",
-            "-lineinfo",
-            "-arch=compute_86",
-        ])
+        .args(["-x", "cu", "-ptx", "-std=c++17", "-O3", "-lineinfo"])
+        .arg(format!("-arch=compute_{capability}"))
         .args(includes)
         .arg(source)
         .arg("-o")

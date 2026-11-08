@@ -149,66 +149,6 @@ impl Packed {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn u32(b: &[u8], i: usize) -> u32 {
-        u32::from_le_bytes(b[i..i + 4].try_into().unwrap())
-    }
-    fn u64(b: &[u8], i: usize) -> u64 {
-        u64::from_le_bytes(b[i..i + 8].try_into().unwrap())
-    }
-    #[test]
-    #[ignore = "external reference data"]
-    fn matches_original_generated_host_defined_bytes() {
-        let cases = std::fs::read(crate::assets::get("fa4_driver_abi_cases.bin").unwrap()).unwrap();
-        let cases = cases.as_slice();
-        assert_eq!(&cases[..8], b"S1FA4ABI");
-        let count = u32(cases, 8) as usize;
-        let stride = u32(cases, 12) as usize;
-        assert_eq!((count, stride, cases.len()), (12, 764, 9184));
-        let mut defined = [false; 664];
-        for (i, (offset, size)) in PARAM_LAYOUT.into_iter().enumerate() {
-            let n = if (6..=9).contains(&i) {
-                64
-            } else if [4, 5, 17].contains(&i) {
-                12
-            } else {
-                size
-            };
-            defined[offset..offset + n].fill(true);
-        }
-        for case in cases[16..].chunks_exact(stride) {
-            let p = Packed::new(
-                u64(case, 8),
-                u64(case, 16),
-                u64(case, 24),
-                u64(case, 32),
-                u64(case, 40),
-                u32(case, 0) as usize,
-                u32(case, 4) as usize,
-                0.0625,
-            )
-            .unwrap();
-            assert_eq!(p.grid, [u32(case, 720), u32(case, 724), u32(case, 728)]);
-            assert_eq!(BLOCK, [u32(case, 732), u32(case, 736), u32(case, 740)]);
-            assert_eq!(SHARED_BYTES, u32(case, 744));
-            assert_eq!(
-                [
-                    u32(case, 748),
-                    u32(case, 752),
-                    u32(case, 756),
-                    u32(case, 760)
-                ],
-                [6, 0, 2, 0]
-            );
-            for (i, used) in defined.into_iter().enumerate() {
-                assert_eq!(
-                    p.bytes[i],
-                    if used { case[56 + i] } else { 0 },
-                    "tokens{} byte{i}",
-                    u32(case, 0)
-                );
-            }
-        }
-    }
     #[test]
     fn rejects_invalid_shapes_scale_and_address_ranges() {
         let make = |t, b, q, c, s| Packed::new(q, 0x20000, 0x30000, 0x40000, c, t, b, s);

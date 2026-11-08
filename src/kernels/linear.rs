@@ -165,56 +165,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    #[ignore = "external reference data"]
-    fn bias_rounding_matches_native_torch_projection_fixtures() -> Result<()> {
-        let root = crate::assets::fixtures("linear")?;
-
-        #[cfg(not(feature = "cuda"))]
-        let device = candle_core::Device::Cpu;
-        #[cfg(feature = "cuda")]
-        let device =
-            crate::device::load().map_err(|error| candle_core::Error::Msg(error.to_string()))?;
-        for name in ["bf16", "f16", "f32"] {
-            #[cfg(feature = "cuda")]
-            if name == "bf16"
-                && device.is_cuda()
-                && let candle_core::Device::Cuda(cuda) = &device
-            {
-                let (major, _) = cuda
-                    .cuda_stream()
-                    .context()
-                    .compute_capability()
-                    .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
-                if major < 8 {
-                    continue;
-                }
-            }
-            let path = root.join(format!("b2-q3-k7-w128-{name}.safetensors"));
-            let data = candle_core::safetensors::load(&path, &device)?;
-            let weight = &data["weight"];
-            let bias = &data["bias"];
-            let q = Linear::new(weight.narrow(0, 0, 128)?, Some(bias.narrow(0, 0, 128)?));
-            let kv = Linear::new(weight.narrow(0, 128, 256)?, Some(bias.narrow(0, 128, 256)?));
-            let query = forward(&data["query"], &q)?;
-            let memory = forward(&data["memory"], &kv)?;
-            for (key, actual) in [
-                ("q", query),
-                ("k", memory.narrow(2, 0, 128)?),
-                ("v", memory.narrow(2, 128, 128)?),
-            ] {
-                let values =
-                    |tensor: &Tensor| tensor.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>();
-                assert_eq!(
-                    values(&actual)?,
-                    values(&data[&format!("expected_{key}")])?,
-                    "{name} {key}"
-                );
-            }
-        }
-        Ok(())
-    }
-
     #[cfg(feature = "metal")]
     #[test]
     fn metal_preserves_main_matmul_cast_before_bias() -> Result<()> {

@@ -173,7 +173,7 @@ pub(crate) fn cuda_bf16_activation(
 ) -> Result<Tensor> {
     if matches!(
         option_env!("SYS1_CUDA_COMPUTE_CAP"),
-        Some("80" | "90" | "120")
+        Some("80" | "89" | "90" | "120")
     ) {
         cuda_bf16_activation_lookup(input, up, mode)
     } else {

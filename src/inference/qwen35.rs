@@ -201,7 +201,7 @@ impl<A: Adapter> Qwen35<A> {
                 .collect();
         }
         #[cfg(feature = "cuda")]
-        if encoded.len() > 1 && self.backbone.packed_text_supported() {
+        if !encoded.is_empty() && self.backbone.packed_text_supported() {
             return self.predict_packed_text_bucket(encoded);
         }
 

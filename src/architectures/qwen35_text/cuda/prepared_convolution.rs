@@ -11,8 +11,10 @@ pub(crate) fn prepare(
     value_heads: usize,
     sequences: &PackedSequences,
 ) -> Result<Option<gated_delta::PreparedQv>> {
-    if !matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90"))
-        || !input.device().is_cuda()
+    if !matches!(
+        option_env!("SYS1_CUDA_COMPUTE_CAP"),
+        Some("80" | "86" | "89" | "90")
+    ) || !input.device().is_cuda()
         || input.dtype() != DType::BF16
         || weights.dtype() != DType::BF16
         || !input.device().same_device(weights.device())

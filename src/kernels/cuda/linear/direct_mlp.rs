@@ -61,7 +61,7 @@ pub(crate) fn forward(input: &Tensor, weight: &Prepared) -> Result<Tensor> {
     if k != 4096
         || twon != 24576
         || wk != k
-        || !(512..=32768).contains(&rows)
+        || !(512..=65536).contains(&rows)
         || input.dtype() != DType::BF16
         || weight.gate.dtype() != DType::BF16
         || !input.device().same_device(weight.gate.device())

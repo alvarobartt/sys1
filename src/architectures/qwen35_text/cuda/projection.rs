@@ -996,7 +996,10 @@ impl Mlp {
     pub(crate) fn fused_geometry_available(&self) -> bool {
         self.gate.bias().is_none()
             && self.up.bias().is_none()
-            && crate::kernels::cuda::fused_gate_up::available(self.gate.weight(), self.up.weight())
+            && crate::kernels::cuda::linear::fused_gate_up::available(
+                self.gate.weight(),
+                self.up.weight(),
+            )
     }
     pub(crate) fn cached_fused(&self) -> Result<Option<Tensor>> {
         Ok(self
@@ -1011,7 +1014,7 @@ impl Mlp {
             .lock()
             .map_err(|_| candle_core::Error::Msg("poisoned model-owned fused MLP weight".into()))?;
         if slot.is_none() {
-            *slot = Some(crate::kernels::cuda::fused_gate_up::prepare(
+            *slot = Some(crate::kernels::cuda::linear::fused_gate_up::prepare(
                 self.gate.weight(),
                 self.up.weight(),
             )?);
@@ -1024,13 +1027,21 @@ impl Mlp {
     #[cfg(all(feature = "cuda", sys1_cuda_direct_ffn))]
     pub(crate) fn direct_product(&self, x: &Tensor) -> Result<Option<Tensor>> {
         let rows = x.elem_count() / x.dim(D::Minus1)?.max(1);
-        if !x.device().is_cuda() || x.dtype() != DType::BF16 || !(2048..=32768).contains(&rows) {
+        let minimum_rows = if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("89") {
+            512
+        } else {
+            2048
+        };
+        if !x.device().is_cuda()
+            || x.dtype() != DType::BF16
+            || !(minimum_rows..=65536).contains(&rows)
+        {
             return Ok(None);
         }
         let Some(weight) = self.direct_weight.as_ref() else {
             return Ok(None);
         };
-        let result = crate::kernels::cuda::sm86::fused_gate_up::forward(x, weight)?;
+        let result = crate::kernels::cuda::linear::direct_mlp::forward(x, weight)?;
         #[cfg(test)]
         DIRECT_MLP_CALLS.with(|slot| slot.set(slot.get() + 1));
 

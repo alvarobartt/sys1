@@ -32,7 +32,7 @@ pub(in crate::architectures::qwen35_text) fn initialize_admission(
     let c64_scratch_bytes_per_token = if packed_admission
         && matches!(
             option_env!("SYS1_CUDA_COMPUTE_CAP"),
-            Some("80" | "90" | "120")
+            Some("80" | "86" | "89" | "90" | "120")
         )
         && config.linear_value_head_dim <= 128
     {
@@ -61,11 +61,7 @@ pub(in crate::architectures::qwen35_text) fn initialize_admission(
     let index_token_capacity = (i32::MAX as usize) / maximum_projection_width.max(1);
     let token_budget = |free_bytes| {
         if packed_admission {
-            let multiplier = match option_env!("SYS1_CUDA_COMPUTE_CAP") {
-                Some("80" | "90") => 4,
-                Some("86" | "120") => 2,
-                _ => 1,
-            };
+            let multiplier = batching::aggregate_work_multiplier();
             batching::estimated_memory_tokens(free_bytes, bytes_per_token)
                 .max(1)
                 .min(max_length.saturating_mul(multiplier))
@@ -87,8 +83,11 @@ pub(in crate::architectures::qwen35_text) fn initialize_admission(
     let free_bytes = free_bytes.saturating_sub(head_cache_growth_reserve_bytes);
     let budget = token_budget(free_bytes);
     let active_rows = |row_length| {
-        let work_budget = if packed_admission && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("90")
-        {
+        let work_budget = if packed_admission
+            && matches!(
+                option_env!("SYS1_CUDA_COMPUTE_CAP"),
+                Some("80" | "86" | "89" | "90")
+            ) {
             batching::long_work_budget(max_length, budget, row_length, 128)
         } else {
             budget
@@ -117,8 +116,10 @@ pub(in crate::architectures::qwen35_text) fn initialize_admission(
         estimated_memory_tokens = batching::estimated_memory_tokens(free_bytes, bytes_per_token),
         batch_token_budget = budget,
         short_work_token_budget = if packed_admission
-            && matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90"))
-        {
+            && matches!(
+                option_env!("SYS1_CUDA_COMPUTE_CAP"),
+                Some("80" | "86" | "89" | "90")
+            ) {
             budget.min(max_length)
         } else {
             budget
@@ -126,7 +127,7 @@ pub(in crate::architectures::qwen35_text) fn initialize_admission(
         long_work_token_budget = budget,
         long_work_threshold_tokens = if packed_admission {
             match option_env!("SYS1_CUDA_COMPUTE_CAP") {
-                Some("80") => 128usize,
+                Some("80" | "86" | "89") => 128usize,
                 Some("90") => 128usize,
                 _ => 0,
             }

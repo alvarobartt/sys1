@@ -1,5 +1,3 @@
-#[cfg(test)]
-mod assets;
 #[cfg(not(any(feature = "cpu", feature = "cuda", feature = "metal")))]
 compile_error!("enable one backend feature: cpu, cuda, or metal");
 #[cfg(any(

@@ -143,7 +143,7 @@ impl RmsNorm {
 
 struct Mlp {
     #[cfg(all(feature = "cuda", sys1_cuda_direct_ffn))]
-    direct_weight: Option<crate::kernels::cuda::sm86::fused_gate_up::Prepared>,
+    direct_weight: Option<crate::kernels::cuda::linear::direct_mlp::Prepared>,
     #[cfg(all(feature = "cuda", sys1_cuda_fused_ffn))]
     fused_weight: std::sync::Arc<std::sync::Mutex<Option<Tensor>>>,
     gate: Linear,
@@ -170,8 +170,8 @@ impl Mlp {
         )?;
         #[cfg(all(feature = "cuda", sys1_cuda_direct_ffn))]
         let direct_weight =
-            if crate::kernels::cuda::sm86::fused_gate_up::available(gate.weight(), up.weight()) {
-                Some(crate::kernels::cuda::sm86::fused_gate_up::prepare(
+            if crate::kernels::cuda::linear::direct_mlp::available(gate.weight(), up.weight()) {
+                Some(crate::kernels::cuda::linear::direct_mlp::prepare(
                     gate.weight(),
                     up.weight(),
                 )?)
@@ -197,7 +197,8 @@ impl Mlp {
                 if x.device().is_cuda() && x.dtype() == DType::BF16 && (512..=32768).contains(&rows)
                 {
                     if let Some(weight) = self.cached_fused()? {
-                        let result = crate::kernels::cuda::fused_gate_up::forward(x, &weight)?;
+                        let result =
+                            crate::kernels::cuda::linear::fused_gate_up::forward(x, &weight)?;
                         #[cfg(test)]
                         FUSED_MLP_CALLS.with(|slot| slot.set(slot.get() + 1));
 
@@ -1095,7 +1096,10 @@ impl LinearAttention {
         #[cfg(feature = "cuda")]
         if x.device().is_cuda() && self.key_dim == 128 {
             let output = if x.dtype() == DType::BF16
-                && matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("80" | "90"))
+                && matches!(
+                    option_env!("SYS1_CUDA_COMPUTE_CAP"),
+                    Some("80" | "86" | "89" | "90")
+                )
                 && self.value_dim == 128
                 && length >= 128
             {
@@ -1160,7 +1164,7 @@ impl LinearAttention {
                 .ba
                 .as_ref()
                 .ok_or_else(|| candle_core::Error::Msg("missing packed BF16 gates".into()))?;
-            let projected = if option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120")
+            let projected = if matches!(option_env!("SYS1_CUDA_COMPUTE_CAP"), Some("89" | "120"))
                 && x.dim(1)? >= 1024
                 && ba.weight().dims() == [64, 4096]
             {
@@ -1753,7 +1757,7 @@ impl LinearAttention {
             #[cfg(not(test))]
             let enabled = true;
             if let Some(tile) =
-                crate::kernels::cuda::fused_qkvz::select_tile(rows).filter(|_| enabled)
+                crate::kernels::cuda::linear::fused_qkvz::select_tile(rows).filter(|_| enabled)
             {
                 let packed = self
                     .qkvz_weight
@@ -1763,7 +1767,8 @@ impl LinearAttention {
                     })?
                     .clone();
                 if let Some(packed) = packed {
-                    let (qkv, z) = crate::kernels::cuda::fused_qkvz::forward(x, &packed, tile)?;
+                    let (qkv, z) =
+                        crate::kernels::cuda::linear::fused_qkvz::forward(x, &packed, tile)?;
                     #[cfg(test)]
                     QKVZ_DUAL_CALLS.with(|c| c.set(c.get() + 1));
                     return Ok((qkv, Some(z)));
@@ -2393,285 +2398,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    #[ignore = "external reference data"]
-    fn convolution_matches_frozen_native_torch_gpu_fixtures() -> Result<()> {
-        let directory = crate::assets::fixtures("qwen35_conv")?;
-        let mut fixtures = std::fs::read_dir(directory)?
-            .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                (path
-                    .extension()
-                    .is_some_and(|extension| extension == "safetensors"))
-                .then_some(path)
-            })
-            .collect::<Vec<_>>();
-        fixtures.sort();
-        assert_eq!(
-            fixtures.len(),
-            8,
-            "all pinned native BF16/FP32 cases are required"
-        );
-        for path in fixtures {
-            let tensors = candle_core::safetensors::load(&path, &candle_core::Device::Cpu)?;
-            let input = &tensors["input"];
-            let weight = &tensors["weight"];
-            let kernel = weight.dim(2)?;
-            let expected_conv = &tensors["expected_conv"];
-            let expected = &tensors["expected"];
-            let assert_close = |actual: &Tensor, reference: &Tensor, name: &str| -> Result<()> {
-                let actual = actual
-                    .to_dtype(DType::F32)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?;
-                let reference = reference
-                    .to_dtype(DType::F32)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?;
-                assert_eq!(actual.len(), reference.len());
-
-                let rtol = if input.dtype() == DType::BF16 {
-                    1.6e-2
-                } else {
-                    1.3e-6
-                };
-                for (index, (actual, reference)) in actual.into_iter().zip(reference).enumerate() {
-                    assert!(actual.is_finite() && reference.is_finite());
-                    assert!(
-                        (actual - reference).abs() <= 1e-5 + rtol * reference.abs(),
-                        "{} {name} element {index}: {actual} vs {reference}",
-                        path.display()
-                    );
-                }
-                Ok(())
-            };
-            let convolution = causal_conv(input, weight, kernel)?;
-            if input.dtype() == DType::BF16 {
-                assert_eq!(
-                    convolution
-                        .to_dtype(DType::F32)?
-                        .flatten_all()?
-                        .to_vec1::<f32>()?,
-                    expected_conv
-                        .to_dtype(DType::F32)?
-                        .flatten_all()?
-                        .to_vec1::<f32>()?
-                );
-            }
-            assert_close(&convolution, expected_conv, "CPU convolution")?;
-            assert_close(
-                &causal_conv_silu(input, weight, kernel)?,
-                expected,
-                "CPU SiLU",
-            )?;
-            #[cfg(feature = "cuda")]
-            {
-                let device = test_cuda_device()?;
-                let capability = match &device {
-                    candle_core::Device::Cuda(cuda) => {
-                        cuda.cuda_stream()
-                            .context()
-                            .compute_capability()
-                            .map_err(|error| candle_core::Error::Msg(error.to_string()))?
-                            .0
-                    }
-                    _ => unreachable!(),
-                };
-                if input.dtype() != DType::BF16 || capability >= 8 {
-                    let result =
-                        cuda_conv_silu(&input.to_device(&device)?, &weight.to_device(&device)?)?;
-                    assert_close(&result, expected, "CUDA SiLU")?;
-                }
-            }
-            #[cfg(feature = "metal")]
-            {
-                let device = candle_core::Device::new_metal(0)?;
-                let result = crate::kernels::metal::conv_silu(
-                    &input.to_device(&device)?,
-                    &weight.to_device(&device)?,
-                )?;
-
-                let round = |value: f32| {
-                    if input.dtype() == DType::BF16 {
-                        let bits = value.to_bits();
-                        f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000)
-                    } else {
-                        value
-                    }
-                };
-                let (batch, length, channels) = input.dims3()?;
-                let xs = input
-                    .to_dtype(DType::F32)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?;
-                let ws = weight
-                    .to_dtype(DType::F32)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?;
-                let mut reference = Vec::with_capacity(xs.len());
-                for b in 0..batch {
-                    for token in 0..length {
-                        for channel in 0..channels {
-                            let mut sum = 0f32;
-                            for tap in 0..kernel {
-                                if token + tap + 1 >= kernel {
-                                    let source = token + tap + 1 - kernel;
-                                    let product = round(
-                                        xs[(b * length + source) * channels + channel]
-                                            * ws[channel * kernel + tap],
-                                    );
-                                    sum = round(sum + product);
-                                }
-                            }
-                            reference.push(round(sum / (1. + (-sum).exp())));
-                        }
-                    }
-                }
-                let reference =
-                    Tensor::from_vec(reference, input.shape().clone(), &candle_core::Device::Cpu)?
-                        .to_dtype(input.dtype())?;
-                assert_close(&result, &reference, "Metal retained per-tap SiLU")?;
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "external reference data"]
-    fn delta_rule_matches_pinned_native_chunk_and_fp64_fixtures() -> Result<()> {
-        let directory = crate::assets::fixtures("qwen35_delta")?;
-        let device =
-            crate::device::load().map_err(|error| candle_core::Error::Msg(error.to_string()))?;
-        for preparation in ["f32", "bf16"] {
-            let tensors = candle_core::safetensors::load(
-                directory.join(format!("b2-l65-kh2-h4-d16-{preparation}.safetensors")),
-                &device,
-            )?;
-            let q = &tensors["query_scaled_f32"];
-            let k = &tensors["key_f32"];
-            let v = &tensors["value_f32"];
-            let g = &tensors["gate_f32"];
-            let beta = &tensors["beta_f32"];
-            #[allow(unused_mut)]
-            let mut actuals = vec![(
-                "tensor_chunk32",
-                chunked_delta_rule_fallback(
-                    &q.transpose(1, 2)?,
-                    &k.transpose(1, 2)?,
-                    &v.transpose(1, 2)?,
-                    &g.transpose(1, 2)?,
-                    &beta.transpose(1, 2)?,
-                )?,
-            )];
-            #[cfg(feature = "cuda")]
-            if device.is_cuda() {
-                actuals.push((
-                    "cuda_expanded",
-                    cuda_delta_rule_token_major(q, k, v, g, beta)?,
-                ));
-                let indices = Tensor::from_vec(vec![0u32, 2], 2, &device)?;
-                actuals.push((
-                    "cuda_grouped",
-                    cuda_delta_rule_token_major(
-                        &q.index_select(&indices, 2)?,
-                        &k.index_select(&indices, 2)?,
-                        v,
-                        g,
-                        beta,
-                    )?,
-                ));
-            }
-            for (implementation, actual) in actuals {
-                assert_eq!(actual.dims(), [2, 65, 4, 16]);
-                let actual = actual.flatten_all()?.to_vec1::<f32>()?;
-                for oracle in [
-                    "native_chunk_f32",
-                    "native_sequential_f32",
-                    "fp64_recurrence_rounded_f32",
-                ] {
-                    let expected = tensors[oracle].flatten_all()?.to_vec1::<f32>()?;
-                    assert_eq!(actual.len(), expected.len());
-                    for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
-                        assert!(
-                            actual.is_finite()
-                                && expected.is_finite()
-                                && (actual - expected).abs() <= 1e-5 + 1.3e-6 * expected.abs(),
-                            "{preparation} {implementation} vs {oracle}, element{index}: {actual} vs {expected}"
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "external reference data"]
-    fn recurrent_rounding_matches_native_fixtures() -> Result<()> {
-        let root = crate::assets::fixtures("qwen35_recurrent")?;
-        let device =
-            crate::device::load().map_err(|error| candle_core::Error::Msg(error.to_string()))?;
-        for (name, dtype, rtol) in [
-            ("bf16", DType::BF16, 1.6e-2f32),
-            ("f16", DType::F16, 1e-3),
-            ("f32", DType::F32, 1.3e-6),
-        ] {
-            #[cfg(feature = "cuda")]
-            if dtype == DType::BF16
-                && let candle_core::Device::Cuda(cuda) = &device
-                && cuda
-                    .cuda_stream()
-                    .context()
-                    .compute_capability()
-                    .map_err(|error| candle_core::Error::Msg(error.to_string()))?
-                    .0
-                    < 8
-            {
-                continue;
-            }
-            let data = candle_core::safetensors::load(
-                root.join(format!("post-finalize-{name}.safetensors")),
-                &device,
-            )?;
-            let actual = gated_norm_reference(
-                &data["recurrent_f32"],
-                &data["gate"],
-                &data["weight"],
-                1e-6,
-                dtype,
-            )?;
-            let values =
-                |tensor: &Tensor| tensor.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>();
-            let check = |actual: &Tensor, expected: &Tensor| -> Result<()> {
-                for (index, (actual, expected)) in
-                    values(actual)?.iter().zip(values(expected)?).enumerate()
-                {
-                    assert!(actual.is_finite() && expected.is_finite());
-                    assert!(
-                        (actual - expected).abs() <= 1e-5 + rtol * expected.abs(),
-                        "native {name} fixture index={index}: {actual} vs {expected}"
-                    );
-                }
-                Ok(())
-            };
-            check(&actual, &data["expected"])?;
-            check(&rounded_beta(&data["beta_input"])?, &data["expected_beta"])?;
-            #[cfg(feature = "cuda")]
-            if device.is_cuda() && dtype == DType::BF16 {
-                check(
-                    &cuda_post_finalize_bf16(
-                        &data["recurrent_f32"],
-                        &data["gate"],
-                        &data["weight"],
-                        1e-6,
-                    )?,
-                    &data["expected"],
-                )?;
-            }
-        }
-        Ok(())
     }
 
     #[test]

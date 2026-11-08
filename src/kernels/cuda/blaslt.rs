@@ -202,91 +202,46 @@ impl Context {
                     true
                 }
             };
-            if mid_enabled
+            let blackwell_down = mid_enabled
                 && option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("120")
                 && (3201..=3712).contains(&rows)
                 && inner == 12288
                 && columns == 4096
                 && !transposed_weight
-                && reference_rows.is_none()
-            {
-                let mut choices: [std::mem::MaybeUninit<sys::cublasLtMatmulHeuristicResult_t>; 16] =
-                    [const { std::mem::MaybeUninit::uninit() }; 16];
-                let mut returned = 0i32;
-                let status = sys::cublasLtMatmulAlgoGetHeuristic(
+                && reference_rows.is_none();
+            let ada_down = option_env!("SYS1_CUDA_COMPUTE_CAP") == Some("89")
+                && inner == 12288
+                && columns == 4096
+                && !transposed_weight
+                && reference_rows == Some(512);
+            if blackwell_down || ada_down {
+                let search_rows = if ada_down { 16384 } else { rows };
+                let search_b = Layout(
+                    result::create_matrix_layout(bf16, inner as u64, search_rows as u64, ld_k)
+                        .map_err(error)?,
+                );
+                let search_out = Layout(
+                    result::create_matrix_layout(bf16, columns as u64, search_rows as u64, ld_n)
+                        .map_err(error)?,
+                );
+                let geometry = if ada_down {
+                    (6, 20, 15, 1)
+                } else {
+                    (21, 20, 10, 0)
+                };
+                if let Some(plan) = checked_tile_plan(
                     self.handle,
                     desc.0,
-                    a.0,
-                    b.0,
-                    out.0,
-                    out.0,
+                    [a.0, b.0, out.0],
+                    [search_b.0, search_out.0],
                     pref.0,
-                    16,
-                    choices.as_mut_ptr().cast(),
-                    &mut returned,
-                )
-                .result();
-                if status.is_ok() && (1..=16).contains(&returned) {
-                    for slot in &choices[..returned as usize] {
-                        let candidate = slot.assume_init_ref();
-                        if candidate.state.result().is_err()
-                            || candidate.workspaceSize > self.planning_workspace_bytes
-                        {
-                            continue;
-                        }
-                        let attribute = |name| -> Option<i32> {
-                            let mut value = 0i32;
-                            let mut written = 0usize;
-                            let status = sys::cublasLtMatmulAlgoConfigGetAttribute(
-                                &candidate.algo,
-                                name,
-                                (&mut value as *mut i32).cast(),
-                                std::mem::size_of::<i32>(),
-                                &mut written,
-                            )
-                            .result();
-                            (status.is_ok() && written == std::mem::size_of::<i32>())
-                                .then_some(value)
-                        };
-                        use sys::cublasLtMatmulAlgoConfigAttributes_t::*;
-                        if attribute(CUBLASLT_ALGO_CONFIG_ID) != Some(21)
-                            || attribute(CUBLASLT_ALGO_CONFIG_TILE_ID) != Some(20)
-                            || attribute(CUBLASLT_ALGO_CONFIG_STAGES_ID) != Some(10)
-                            || attribute(CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING) != Some(0)
-                            || attribute(CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION) != Some(0)
-                            || !matches!(attribute(CUBLASLT_ALGO_CONFIG_SPLITK_NUM), Some(0 | 1))
-                            || attribute(CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME) != Some(0)
-                        {
-                            continue;
-                        }
-                        let mut checked =
-                            std::mem::MaybeUninit::<sys::cublasLtMatmulHeuristicResult_t>::uninit();
-                        if sys::cublasLtMatmulAlgoCheck(
-                            self.handle,
-                            desc.0,
-                            a.0,
-                            b.0,
-                            out.0,
-                            out.0,
-                            &candidate.algo,
-                            checked.as_mut_ptr(),
-                        )
-                        .result()
-                        .is_err()
-                        {
-                            continue;
-                        }
-                        let checked = checked.assume_init();
-                        if checked.state.result().is_err()
-                            || checked.workspaceSize > self.planning_workspace_bytes
-                        {
-                            continue;
-                        }
-                        heuristic.algo = candidate.algo;
-                        heuristic.workspaceSize = checked.workspaceSize;
-                        #[cfg(test)]
+                    self.planning_workspace_bytes,
+                    geometry,
+                ) {
+                    heuristic = plan;
+                    #[cfg(test)]
+                    if blackwell_down {
                         MID_DOWN_PLAN_CALLS.with(|count| count.set(count.get() + 1));
-                        break;
                     }
                 }
             }
@@ -352,6 +307,95 @@ impl Context {
         }
     }
 }
+fn checked_tile_plan(
+    handle: sys::cublasLtHandle_t,
+    desc: sys::cublasLtMatmulDesc_t,
+    actual: [sys::cublasLtMatrixLayout_t; 3],
+    search: [sys::cublasLtMatrixLayout_t; 2],
+    preference: sys::cublasLtMatmulPreference_t,
+    workspace_bytes: usize,
+    geometry: (i32, i32, i32, i32),
+) -> Option<sys::cublasLtMatmulHeuristicResult_t> {
+    let [a, b, out] = actual;
+    let [search_b, search_out] = search;
+    let mut choices: [std::mem::MaybeUninit<sys::cublasLtMatmulHeuristicResult_t>; 16] =
+        [const { std::mem::MaybeUninit::uninit() }; 16];
+    let mut returned = 0i32;
+    unsafe {
+        sys::cublasLtMatmulAlgoGetHeuristic(
+            handle,
+            desc,
+            a,
+            search_b,
+            search_out,
+            search_out,
+            preference,
+            16,
+            choices.as_mut_ptr().cast(),
+            &mut returned,
+        )
+        .result()
+        .ok()?;
+        if !(1..=16).contains(&returned) {
+            return None;
+        }
+        for slot in &choices[..returned as usize] {
+            let candidate = slot.assume_init_ref();
+            if candidate.state.result().is_err() || candidate.workspaceSize > workspace_bytes {
+                continue;
+            }
+            let attribute = |name| -> Option<i32> {
+                let mut value = 0i32;
+                let mut written = 0usize;
+                let status = sys::cublasLtMatmulAlgoConfigGetAttribute(
+                    &candidate.algo,
+                    name,
+                    (&mut value as *mut i32).cast(),
+                    std::mem::size_of::<i32>(),
+                    &mut written,
+                )
+                .result();
+                (status.is_ok() && written == std::mem::size_of::<i32>()).then_some(value)
+            };
+            use sys::cublasLtMatmulAlgoConfigAttributes_t::*;
+            if attribute(CUBLASLT_ALGO_CONFIG_ID) != Some(geometry.0)
+                || attribute(CUBLASLT_ALGO_CONFIG_TILE_ID) != Some(geometry.1)
+                || attribute(CUBLASLT_ALGO_CONFIG_STAGES_ID) != Some(geometry.2)
+                || attribute(CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING) != Some(geometry.3)
+                || attribute(CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION) != Some(0)
+                || !matches!(attribute(CUBLASLT_ALGO_CONFIG_SPLITK_NUM), Some(0 | 1))
+                || attribute(CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME) != Some(0)
+            {
+                continue;
+            }
+            let mut checked =
+                std::mem::MaybeUninit::<sys::cublasLtMatmulHeuristicResult_t>::uninit();
+            if sys::cublasLtMatmulAlgoCheck(
+                handle,
+                desc,
+                a,
+                b,
+                out,
+                out,
+                &candidate.algo,
+                checked.as_mut_ptr(),
+            )
+            .result()
+            .is_err()
+            {
+                continue;
+            }
+            let mut checked = checked.assume_init();
+            if checked.state.result().is_err() || checked.workspaceSize > workspace_bytes {
+                continue;
+            }
+            checked.algo = candidate.algo;
+            return Some(checked);
+        }
+    }
+    None
+}
+
 impl Drop for Context {
     fn drop(&mut self) {
         if self.stream.context().bind_to_thread().is_ok() {

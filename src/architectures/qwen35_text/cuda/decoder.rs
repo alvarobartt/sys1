@@ -254,7 +254,7 @@ impl Decoder {
                 return Ok(base);
             }
             for mixer in candidates {
-                let packed = crate::kernels::cuda::fused_qkvz::prepare(
+                let packed = crate::kernels::cuda::linear::fused_qkvz::prepare(
                     mixer.qkv.weight(),
                     mixer.z.weight(),
                 )?;
