@@ -17,7 +17,7 @@
 - `candle` with [`tokenizers` release candidate](https://huggingface.co/blog/tokenizers-v1)!
 - Dynamic, token-based batching
 - SDPA on CPU, Metal, and CUDA
-- Flash Attention on Ampere, Ada Lovelace, and Hopper
+- Automatic Flash Attention on supported CUDA devices; `--enforce-eager` selects eager attention
 - Blazing fast inference for ModernBERT and Qwen3.5
 - Multimodal decisions from text, images, and video when supported by the model
 
@@ -31,7 +31,6 @@ If you run on CUDA you also need `nvcc`. And if you run on Metal, you also need 
 cargo install sys1 --features cpu
 # cargo install sys1 --no-default-features --features metal
 # cargo install sys1 --no-default-features --features cuda
-# cargo install sys1 --no-default-features --features cuda,flash-attn-2 # Ampere, Ada Lovelace, or Hopper
 ```
 
 Then run it with any of the supported models (more coming soon!).
@@ -110,3 +109,18 @@ print(response.choices["route"].choice)
 - [TypeSafe AI Python SDK](https://github.com/typesafe-ai/typesafe-sdk-python)
 - [Laya: Multilingual, non-autoregressive System 1 decision engine](https://github.com/NandhaKishorM/laya)
 - [Introducing Clef: our open-source decision models, and new RL fine-tuning platform](https://blog.cloudflare.com/clef-decision-models/)
+
+### CUDA build assets and benchmarks
+
+CUDA builds fetch checksum-verified device images from the pinned [sys1-artifacts](https://huggingface.co/alvarobartt/sys1-artifacts/tree/fe16e9b22cd05ebb799f242df9ac68470d3e3d4c) revision and embed them in the executable. Inference needs no Python or asset download. Third-party notices remain in `licenses/`.
+
+The [benchmark dataset](https://huggingface.co/datasets/alvarobartt/sys1-benchmarks/tree/a3c3616418ef2d20d2b39bfe8d0c2c905305df5d) provides canonical and stress workloads without storing data in Git:
+
+```sh
+uv run benchmark.py throughput --dataset-profile clef-flash --concurrency 1 32 128 512 --api-url http://127.0.0.1:3000 --output results.json
+uv run --with huggingface-hub==1.33.0 leaderboard.py --base-url http://127.0.0.1:3000 --out results/c1
+uv run --with huggingface-hub==1.33.0 leaderboard.py --base-url http://127.0.0.1:3000 --concurrency 512 --stress-continuous --stress-case canonical full-context-64-questions full-context-mixed-types --stress-windows 1 --stress-seconds 300 --stress-warmup-requests 1024 --out results/c512
+uv run --with httpx==0.28.1 demo.py --host 127.0.0.1 --port 3000
+```
+
+Use the same checkpoint revision, precision, workload, client and hardware for each engine. C512 records queueing latency separately from throughput and drains outstanding requests. The dataset retains the historical client's source and exact input hashes. These cohorts reconstruct supported public requests; they are not the unpublished Decision Index sample.

@@ -51,6 +51,7 @@ FROM chef AS builder
 
 COPY --from=planner /app/recipe.json recipe.json
 COPY src/kernels ./src/kernels
+COPY src/assets.rs ./src/assets.rs
 
 ARG CUDA_COMPUTE_CAPS
 ARG SCCACHE_GHA_ENABLED=off
@@ -76,10 +77,7 @@ RUN --mount=type=cache,id=sys1-sccache,target=/root/.cache/sccache,sharing=locke
     fi; \
     compute_caps="$(printf '%s' "${CUDA_COMPUTE_CAPS}" | tr ';' ' ')"; \
     for compute_cap in ${compute_caps}; do \
-        case "${compute_cap}" in \
-            80|86|89|90) features=cuda,flash-attn-2 ;; \
-            *) features=cuda ;; \
-        esac; \
+        features=cuda; \
         CUDA_COMPUTE_CAP="${compute_cap}" \
         CARGO_TARGET_DIR="target/${compute_cap}" \
         cargo chef cook \
@@ -113,10 +111,7 @@ RUN --mount=type=cache,id=sys1-sccache,target=/root/.cache/sccache,sharing=locke
     set -- ${compute_caps}; \
     install -d /app/bin; \
     for compute_cap do \
-        case "${compute_cap}" in \
-            80|86|89|90) features=cuda,flash-attn-2 ;; \
-            *) features=cuda ;; \
-        esac; \
+        features=cuda; \
         CUDA_COMPUTE_CAP="${compute_cap}" \
         CARGO_TARGET_DIR="target/${compute_cap}" \
         cargo build \
@@ -153,6 +148,8 @@ ENV HOME=/home/sys1 \
 
 COPY --chmod=755 cuda-entrypoint.sh /usr/local/bin/cuda-entrypoint.sh
 COPY --from=builder /app/bin/ /usr/local/bin/
+COPY LICENSE /usr/share/licenses/sys1/LICENSE
+COPY licenses /usr/share/licenses/sys1/third-party
 
 USER sys1
 

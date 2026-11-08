@@ -118,25 +118,56 @@ impl Batcher {
                     .map(|job| (job.request, (job.response, job.kind)))
                     .unzip();
                 let model = model.clone();
-                let responses = tokio::task::spawn_blocking(move || model.predict_batch(requests))
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::error!(%error, "Inference worker failed");
-                        (0..batch_size)
-                            .map(|_| Err(ApiError::internal(error.to_string())))
-                            .collect()
+
+                let mut deliveries: Vec<_> = deliveries.into_iter().map(Some).collect();
+                let (completion_sender, mut completions) = mpsc::unbounded_channel();
+                let task = tokio::task::spawn_blocking(move || {
+                    model.predict_batch_incremental(requests, &mut |slot, response| {
+                        let _ = completion_sender.send((slot, response));
                     });
-                let failures = responses
+                });
+                let mut failures = 0usize;
+                let mut response_count = 0usize;
+                let mut final_response = None;
+                while let Some((slot, response)) = completions.recv().await {
+                    let Some(delivery) = deliveries.get_mut(slot) else {
+                        tracing::error!(
+                            slot,
+                            batch_size,
+                            "Inference completion slot out of bounds"
+                        );
+                        continue;
+                    };
+                    let Some((channel, kind)) = delivery.take() else {
+                        tracing::error!(slot, "Duplicate inference completion ignored");
+                        continue;
+                    };
+                    response_count += 1;
+                    if kind.records_metrics() && response.is_err() {
+                        failures += 1;
+                        worker_metrics.model_requests_failed(1);
+                    }
+
+                    if response_count == batch_size {
+                        final_response = Some((channel, response));
+                    } else {
+                        let _ = channel.send(response);
+                    }
+                }
+                let missing_error = match task.await {
+                    Ok(()) => "inference worker returned fewer responses than requests".to_owned(),
+                    Err(error) => {
+                        tracing::error!(%error, "Inference worker failed");
+                        format!("inference worker failed: {error}")
+                    }
+                };
+                let missing_failures = deliveries
                     .iter()
-                    .zip(&deliveries)
-                    .filter(|(response, (_, kind))| kind.records_metrics() && response.is_err())
-                    .count()
-                    + deliveries
-                        .iter()
-                        .skip(responses.len())
-                        .filter(|(_, kind)| kind.records_metrics())
-                        .count();
-                worker_metrics.model_requests_failed(failures);
+                    .filter_map(Option::as_ref)
+                    .filter(|(_, kind)| kind.records_metrics())
+                    .count();
+                failures += missing_failures;
+                worker_metrics.model_requests_failed(missing_failures);
                 drop(batch_guard);
                 tracing::debug!(
                     batch_size,
@@ -144,14 +175,10 @@ impl Batcher {
                     elapsed_ms = started.elapsed().as_millis(),
                     "Inference batch completed"
                 );
-                let response_count = responses.len();
-                let mut responses = responses.into_iter();
-                for (channel, _) in deliveries {
-                    let response = responses.next().unwrap_or_else(|| {
-                        Err(ApiError::internal(
-                            "inference worker returned fewer responses than requests",
-                        ))
-                    });
+                for (channel, _) in deliveries.into_iter().flatten() {
+                    let _ = channel.send(Err(ApiError::internal(missing_error.clone())));
+                }
+                if let Some((channel, response)) = final_response {
                     let _ = channel.send(response);
                 }
                 if response_count != batch_size {
@@ -366,6 +393,7 @@ mod tests {
         block: AtomicBool,
         started: Arc<Barrier>,
         release: Arc<Barrier>,
+        batch_sizes: Mutex<Vec<usize>>,
     }
 
     impl DecisionModel for BlockOnceModel {
@@ -373,6 +401,7 @@ mod tests {
             &self,
             requests: Vec<DecisionRequest>,
         ) -> Vec<Result<DecisionResponse, ApiError>> {
+            self.batch_sizes.lock().unwrap().push(requests.len());
             if self.block.swap(false, Ordering::SeqCst) {
                 self.started.wait();
                 self.release.wait();
@@ -565,6 +594,7 @@ mod tests {
             block: AtomicBool::new(true),
             started: started.clone(),
             release: release.clone(),
+            batch_sizes: Mutex::new(Vec::new()),
         });
         let batcher = Batcher::new(
             model,
@@ -614,6 +644,61 @@ mod tests {
             metric_value(&batcher, "sys1_requests_successful_total"),
             2.0
         );
+    }
+
+    #[tokio::test]
+    async fn zero_wait_drains_already_queued_requests_into_a_batch() {
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let model = Arc::new(BlockOnceModel {
+            block: AtomicBool::new(true),
+            started: started.clone(),
+            release: release.clone(),
+            batch_sizes: Mutex::new(Vec::new()),
+        });
+        let batcher = Batcher::new(
+            model.clone(),
+            "test-model".to_owned(),
+            BatcherConfig {
+                max_batch_size: 8,
+                max_batch_questions: 8,
+                max_questions_per_request: 1,
+                wait: Duration::ZERO,
+                queue_capacity: 8,
+                response_timeout: None,
+            },
+        );
+        let first_batcher = batcher.clone();
+        let first =
+            tokio::spawn(async move { first_batcher.predict(one_question_request()).await });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || started.wait()),
+        )
+        .await
+        .expect("model started in time")
+        .unwrap();
+
+        let mut queued = Vec::new();
+        for _ in 0..4 {
+            let batcher = batcher.clone();
+            queued.push(tokio::spawn(async move {
+                batcher.predict(one_question_request()).await
+            }));
+        }
+        wait_for_metric(&batcher, "sys1_requests_queued", 4.0).await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || release.wait()),
+        )
+        .await
+        .expect("model released in time")
+        .unwrap();
+        assert!(first.await.unwrap().is_ok());
+        for result in queued {
+            assert!(result.await.unwrap().is_ok());
+        }
+        assert_eq!(*model.batch_sizes.lock().unwrap(), vec![1, 4]);
     }
 
     #[tokio::test]

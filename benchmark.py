@@ -2,9 +2,9 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "httpx[http2]>=0.27,<1",
-#   "huggingface-hub>=1.0,<2",
-#   "tokenizers>=0.22,<2",
+#   "httpx[http2]==0.28.1",
+#   "huggingface-hub==1.33.0",
+#   "tokenizers==0.23.2",
 # ]
 # ///
 
@@ -35,7 +35,6 @@ from tokenizers import Tokenizer
 VERSION = "0.1.0"
 DATASET_API = "https://datasets-server.huggingface.co/rows"
 
-
 @dataclass(frozen=True)
 class DatasetSpec:
     profile: str
@@ -45,8 +44,15 @@ class DatasetSpec:
     split: str
     schema: str
 
-
 PROFILES = {
+    "clef-flash": DatasetSpec(
+        profile="clef-flash",
+        dataset="alvarobartt/sys1-benchmarks",
+        revision="a3c3616418ef2d20d2b39bfe8d0c2c905305df5d",
+        config="clef_flash",
+        split="canonical",
+        schema="typed-decisions",
+    ),
     "typed-decisions": DatasetSpec(
         profile="typed-decisions",
         dataset="LocalLLaMA/typed-decisions",
@@ -57,7 +63,7 @@ PROFILES = {
     ),
     "evalsafe-questions": DatasetSpec(
         profile="evalsafe-questions",
-        dataset="typesafe/evalsafe-agent-trace-observability",
+        dataset="typesafeAI/evalsafe-agent-trace-observability",
         revision="8635540973910a92465fe2bc53e195375aa6e1a8",
         config="questions",
         split="test",
@@ -142,7 +148,6 @@ Q_CHOICE = {
     },
 }
 
-
 def percentile(values: list[float], quantile: float) -> float:
     ordered = sorted(values)
     position = (len(ordered) - 1) * quantile
@@ -151,7 +156,6 @@ def percentile(values: list[float], quantile: float) -> float:
     if lower == upper:
         return ordered[lower]
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
-
 
 def summary(samples: list[float], digits: int = 3) -> dict[str, Any]:
     if not samples:
@@ -166,12 +170,10 @@ def summary(samples: list[float], digits: int = 3) -> dict[str, Any]:
         "samples": [round(value, digits) for value in samples],
     }
 
-
 def compact_summary(samples: list[float]) -> dict[str, Any]:
     result = summary(samples)
     result.pop("samples", None)
     return result
-
 
 def resolve_spec(args: argparse.Namespace) -> DatasetSpec:
     profile = PROFILES[args.dataset_profile]
@@ -189,8 +191,33 @@ def resolve_spec(args: argparse.Namespace) -> DatasetSpec:
         schema=args.dataset_schema or profile.schema,
     )
 
+async def download_dataset_page(client: httpx.AsyncClient, params: dict[str, Any]) -> httpx.Response:
+
+    for attempt in range(7):
+        response = None
+        try:
+            response = await client.get(DATASET_API, params=params)
+        except httpx.TransportError:
+            if attempt == 6:
+                raise
+        else:
+            if response.status_code not in {429, 500, 502, 503, 504} or attempt == 6:
+                response.raise_for_status()
+                return response
+        delay = min(2**attempt, 30)
+        if response is not None:
+            try:
+                delay = max(0, min(float(response.headers.get("retry-after", delay)), 30))
+            except ValueError:
+                pass
+        await asyncio.sleep(delay)
+    raise AssertionError("dataset acquisition retry loop did not terminate")
 
 async def download_rows(spec: DatasetSpec) -> list[dict[str, Any]]:
+    if spec.dataset == "alvarobartt/sys1-benchmarks":
+        path = hf_hub_download(repo_id=spec.dataset, repo_type="dataset",
+                               revision=spec.revision, filename=f"data/{spec.split}.jsonl")
+        return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
     rows: list[dict[str, Any]] = []
     offset = 0
     total: int | None = None
@@ -204,15 +231,7 @@ async def download_rows(spec: DatasetSpec) -> list[dict[str, Any]]:
                 "offset": offset,
                 "length": 100,
             }
-            for attempt in range(7):
-                response = await client.get(DATASET_API, params=params)
-                if response.status_code != 429:
-                    break
-                retry_after = response.headers.get("retry-after")
-                await asyncio.sleep(
-                    float(retry_after) if retry_after else min(2**attempt, 30)
-                )
-            response.raise_for_status()
+            response = await download_dataset_page(client, params)
             page = response.json()
             total = page["num_rows_total"]
             wrapped = page["rows"]
@@ -221,7 +240,6 @@ async def download_rows(spec: DatasetSpec) -> list[dict[str, Any]]:
             rows.extend(item["row"] for item in wrapped)
             offset += len(wrapped)
     return rows
-
 
 def normalize_rows(rows: list[dict[str, Any]], schema: str) -> list[dict[str, Any]]:
     if schema == "typed-decisions":
@@ -257,7 +275,6 @@ def normalize_rows(rows: list[dict[str, Any]], schema: str) -> list[dict[str, An
         example["questions"][question_id] = json.loads(row["question_json"])
     return list(grouped.values())
 
-
 async def load_examples(spec: DatasetSpec, cache_root: Path) -> list[dict[str, Any]]:
     slug = spec.dataset.replace("/", "--")
     path = cache_root / f"{slug}-{spec.revision}-{spec.config}-{spec.split}.json"
@@ -274,7 +291,6 @@ async def load_examples(spec: DatasetSpec, cache_root: Path) -> list[dict[str, A
     if not examples:
         raise RuntimeError(f"dataset produced no examples: {spec}")
     return examples
-
 
 def build_requests(
     examples: list[dict[str, Any]],
@@ -300,7 +316,6 @@ def build_requests(
         remaining -= take
     return requests, ids, cursor
 
-
 def load_tokenizer(model: str, revision: str) -> tuple[Tokenizer, str]:
     path = hf_hub_download(
         repo_id=model,
@@ -308,7 +323,6 @@ def load_tokenizer(model: str, revision: str) -> tuple[Tokenizer, str]:
         revision=revision,
     )
     return Tokenizer.from_file(path), path
-
 
 def render_value(value: Any) -> str:
     if isinstance(value, str):
@@ -326,16 +340,13 @@ def render_value(value: Any) -> str:
         )
     return render_json(value)
 
-
 def render_json(value: Any) -> str:
     if isinstance(value, (list, dict)):
         return render_value(value)
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
-
 def token_count(tokenizer: Tokenizer, text: str) -> int:
     return len(tokenizer.encode(text, add_special_tokens=False).ids)
-
 
 def git_sha() -> str | None:
     try:
@@ -345,14 +356,12 @@ def git_sha() -> str | None:
     except (OSError, subprocess.CalledProcessError):
         return None
 
-
 def target_url(api_url: str) -> str:
     parsed = urlsplit(api_url.rstrip("/"))
     if parsed.hostname not in {"0.0.0.0", "::"}:
         return parsed.geturl()
     netloc = f"127.0.0.1:{parsed.port}" if parsed.port else "127.0.0.1"
     return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, ""))
-
 
 def parse_labels(items: list[str]) -> dict[str, str]:
     result: dict[str, str] = {}
@@ -362,7 +371,6 @@ def parse_labels(items: list[str]) -> dict[str, str]:
             raise ValueError("--label must be KEY=VALUE")
         result[key] = value
     return result
-
 
 def metadata(
     args: argparse.Namespace,
@@ -391,7 +399,6 @@ def metadata(
         result["dataset"] = asdict(dataset)
     return result
 
-
 def client_settings(args: argparse.Namespace, connections: int) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
     return {
@@ -403,7 +410,6 @@ def client_settings(args: argparse.Namespace, connections: int) -> dict[str, Any
         "timeout": args.timeout,
         "follow_redirects": True,
     }
-
 
 async def wait_until_ready(client: httpx.AsyncClient, args: argparse.Namespace) -> None:
     base = target_url(args.api_url)
@@ -419,14 +425,19 @@ async def wait_until_ready(client: httpx.AsyncClient, args: argparse.Namespace) 
         await asyncio.sleep(0.25)
     raise TimeoutError(f"API was not ready after {args.startup_timeout:g}s: {error}")
 
-
 async def send_request(
     client: httpx.AsyncClient, endpoint: str, payload: dict[str, Any]
 ) -> dict[str, Any]:
     started = time.perf_counter()
     response = await client.post(endpoint, json=payload)
     latency_ms = (time.perf_counter() - started) * 1_000
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        raise httpx.HTTPStatusError(
+            f"{error}; response body: {response.text[:4096]}",
+            request=error.request, response=error.response,
+        ) from error
     body = response.json()
     expected = len(payload["questions"])
     actual = len(body.get("answers", {}))
@@ -438,20 +449,25 @@ async def send_request(
         "input_tokens": int(body.get("usage", {}).get("input_tokens", 0)),
     }
 
-
 async def send_scenario(
     client: httpx.AsyncClient, endpoint: str, payloads: list[dict[str, Any]]
 ) -> dict[str, Any]:
     started = time.perf_counter()
     responses = await asyncio.gather(
-        *(send_request(client, endpoint, payload) for payload in payloads)
+        *(send_request(client, endpoint, payload) for payload in payloads),
+        return_exceptions=True,
     )
+    successes = [item for item in responses if not isinstance(item, BaseException)]
+    failures = [{"request_index": index, "error": str(item),
+                 "error_type": type(item).__name__}
+                for index, item in enumerate(responses) if isinstance(item, BaseException)]
     return {
         "elapsed_ms": (time.perf_counter() - started) * 1_000,
-        "input_tokens": sum(item["input_tokens"] for item in responses),
-        "http_versions": {item["http_version"] for item in responses},
+        "input_tokens": sum(item["input_tokens"] for item in successes),
+        "http_versions": {item["http_version"] for item in successes},
+        "failures": failures,
+        "successful_requests": len(successes),
     }
-
 
 async def dataset_latency(args: argparse.Namespace) -> dict[str, Any]:
     spec = resolve_spec(args)
@@ -470,12 +486,19 @@ async def dataset_latency(args: argparse.Namespace) -> dict[str, Any]:
             tokens: list[float] = []
             ids: list[str] = []
             request_counts: list[int] = []
+            failures: list[dict[str, Any]] = []
+            warmup_failures: list[dict[str, Any]] = []
             for iteration in range(args.warmup + args.repetitions):
                 payloads, current_ids, cursor = build_requests(
                     examples, count, cursor, args.max_questions_per_request
                 )
                 measurement = await send_scenario(client, endpoint, payloads)
                 versions.update(measurement["http_versions"])
+                if measurement["failures"]:
+                    target = warmup_failures if iteration < args.warmup else failures
+                    target.extend({**failure, "iteration": iteration, "example_ids": current_ids}
+                                  for failure in measurement["failures"])
+                    continue
                 if iteration >= args.warmup:
                     elapsed.append(measurement["elapsed_ms"])
                     tokens.append(float(measurement["input_tokens"]))
@@ -491,10 +514,18 @@ async def dataset_latency(args: argparse.Namespace) -> dict[str, Any]:
                     [token / (ms / 1_000) for token, ms in zip(tokens, elapsed)]
                 ),
                 "unique_examples": len(set(ids)),
+                "errors": len(failures),
+                "failures": failures,
+                "warmup_errors": len(warmup_failures),
+                "warmup_failures": warmup_failures,
+                "zero_error_run": not failures and not warmup_failures,
+                "latency_population": "fully successful timed scenarios only",
+                "attempted_scenario_samples": args.repetitions,
             }
             print(
-                f"{count:>3} questions  p50 {summary(elapsed)['p50']:>8.3f} ms  "
-                f"tokens p50 {summary(tokens)['p50']:>7.0f}",
+                f"{count:>3} questions  successful_samples={len(elapsed)} "
+                f"p50_ms={summary(elapsed).get('p50')} errors={len(failures)} "
+                f"warmup_errors={len(warmup_failures)}",
                 flush=True,
             )
     return {
@@ -504,10 +535,11 @@ async def dataset_latency(args: argparse.Namespace) -> dict[str, Any]:
             "warmup": args.warmup,
             "repetitions": args.repetitions,
             "dataset_examples": len(examples),
+            "failed_requests": sum(row["errors"] for row in scenarios.values()),
+            "failed_warmup_requests": sum(row["warmup_errors"] for row in scenarios.values()),
         },
         "scenarios": scenarios,
     }
-
 
 async def dataset_throughput(args: argparse.Namespace) -> dict[str, Any]:
     spec = resolve_spec(args)
@@ -549,21 +581,40 @@ async def dataset_throughput(args: argparse.Namespace) -> dict[str, Any]:
 
             if args.warmup:
                 warm = await asyncio.gather(
-                    *(limited(payload) for payload in payloads[: args.warmup])
+                    *(limited(payload) for payload in payloads[: args.warmup]),
+                    return_exceptions=True,
                 )
-                versions.update(item["http_version"] for item in warm)
+            else:
+                warm = []
+            warm_errors = [
+                {"request_index": index, "type": type(item).__name__, "message": str(item)[:8192]}
+                for index, item in enumerate(warm) if isinstance(item, Exception)
+            ]
+            versions.update(item["http_version"] for item in warm if not isinstance(item, Exception))
             measured = payloads[args.warmup :]
             started = time.perf_counter()
-            responses = await asyncio.gather(
-                *(limited(payload) for payload in measured)
+            outcomes = await asyncio.gather(
+                *(limited(payload) for payload in measured), return_exceptions=True,
             )
             elapsed_s = time.perf_counter() - started
+            failures = [
+                {"request_index": index, "type": type(item).__name__, "message": str(item)[:8192]}
+                for index, item in enumerate(outcomes) if isinstance(item, Exception)
+            ]
+            responses = [item for item in outcomes if not isinstance(item, Exception)]
             versions.update(item["http_version"] for item in responses)
             total_tokens = sum(item["input_tokens"] for item in responses)
-            request_rate = len(measured) / elapsed_s
+            request_rate = len(responses) / elapsed_s
             scenarios[f"concurrency_{concurrency}"] = {
                 "concurrency": concurrency,
                 "requests": len(measured),
+                "successful_requests": len(responses),
+                "errors": len(failures),
+                "failures": failures,
+                "warmup_errors": len(warm_errors),
+                "warmup_failures": warm_errors,
+                "questions": len(responses) * args.questions_per_request,
+                "zero_error_run": not failures and not warm_errors,
                 "questions_per_request": args.questions_per_request,
                 "elapsed_ms": round(elapsed_s * 1_000, 3),
                 "requests_per_second": round(request_rate, 3),
@@ -582,7 +633,8 @@ async def dataset_throughput(args: argparse.Namespace) -> dict[str, Any]:
             }
             print(
                 f"concurrency {concurrency:>3}  {request_rate:>8.2f} req/s  "
-                f"{total_tokens / elapsed_s:>10.0f} input tok/s",
+                f"{total_tokens / elapsed_s:>10.0f} input tok/s  "
+                f"errors={len(failures)} warmup_errors={len(warm_errors)}",
                 flush=True,
             )
     return {
@@ -593,10 +645,11 @@ async def dataset_throughput(args: argparse.Namespace) -> dict[str, Any]:
             "requests_per_scenario": args.requests,
             "dataset_examples": len(examples),
             "eligible_examples": len(eligible),
+            "failed_requests": sum(row["errors"] for row in scenarios.values()),
+            "failed_warmup_requests": sum(row["warmup_errors"] for row in scenarios.values()),
         },
         "scenarios": scenarios,
     }
-
 
 async def dataset_stats(args: argparse.Namespace) -> dict[str, Any]:
     spec = resolve_spec(args)
@@ -667,7 +720,6 @@ async def dataset_stats(args: argparse.Namespace) -> dict[str, Any]:
         },
     }
 
-
 async def synthetic_latency(args: argparse.Namespace) -> dict[str, Any]:
     endpoint = f"{target_url(args.api_url)}{args.endpoint}"
     versions: set[str] = set()
@@ -709,7 +761,6 @@ async def synthetic_latency(args: argparse.Namespace) -> dict[str, Any]:
         },
         "scenarios": scenarios,
     }
-
 
 async def long_context(args: argparse.Namespace) -> dict[str, Any]:
     tokenizer, _ = load_tokenizer(args.tokenizer_model, args.tokenizer_revision)
@@ -778,12 +829,10 @@ async def long_context(args: argparse.Namespace) -> dict[str, Any]:
         "cases": cases,
     }
 
-
 def add_output(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--sys1-sha")
     parser.add_argument("--label", action="append", default=[], metavar="KEY=VALUE")
-
 
 def add_http(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--api-url", default="http://127.0.0.1:3000")
@@ -792,7 +841,6 @@ def add_http(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--health-endpoint", default="/health")
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--startup-timeout", type=float, default=300)
-
 
 def add_dataset(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
@@ -806,7 +854,6 @@ def add_dataset(parser: argparse.ArgumentParser) -> None:
         "--dataset-schema", choices=["typed-decisions", "evalsafe-questions"]
     )
     parser.add_argument("--cache-root", type=Path, default=Path(".benchmark-cache"))
-
 
 def build_parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
@@ -874,7 +921,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     return root
 
-
 def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if hasattr(args, "questions") and any(value <= 0 for value in args.questions):
         parser.error("--questions values must be positive")
@@ -885,7 +931,6 @@ def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if hasattr(args, "warmup") and args.warmup < 0:
         parser.error("--warmup cannot be negative")
-
 
 def main() -> None:
     parser = build_parser()
@@ -902,7 +947,8 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     print(f"wrote {args.output}")
-
+    if result.get("meta", {}).get("failed_requests", 0) or result.get("meta", {}).get("failed_warmup_requests", 0):
+        raise SystemExit(1)
 
 if __name__ == "__main__":
     main()

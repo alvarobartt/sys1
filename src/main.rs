@@ -112,35 +112,11 @@ struct Args {
     /// Floating-point precision; omitted or auto uses the model's inference policy.
     #[arg(short = 'd', long, env, value_enum, help_heading = "Model options")]
     dtype: Option<Precision>,
-    /// Attention implementation used for inference.
-    #[arg(
-        short = 'a',
-        long,
-        env,
-        value_enum,
-        default_value_t = models::AttentionImplementation::Auto,
-        help_heading = "Model options"
-    )]
-    attention: models::AttentionImplementation,
+    #[arg(long, env, help_heading = "Model options")]
+    enforce_eager: bool,
 }
 
 impl Args {
-    fn attention(
-        requested: models::AttentionImplementation,
-        architecture: models::Architecture,
-        dtype: DType,
-    ) -> models::AttentionImplementation {
-        if architecture != models::Architecture::Laya
-            || requested != models::AttentionImplementation::Auto
-        {
-            return requested;
-        }
-        if matches!(dtype, DType::F16 | DType::BF16) && cfg!(feature = "flash-attn-2") {
-            return models::AttentionImplementation::FlashAttention2;
-        }
-        models::AttentionImplementation::Eager
-    }
-
     fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.max_batch_size > 0, "--max-batch-size must be positive");
         anyhow::ensure!(
@@ -164,9 +140,6 @@ impl Args {
             self.max_model_len != Some(0),
             "--max-model-len must be positive"
         );
-        if let Some(dtype) = self.dtype.filter(|dtype| *dtype != Precision::Auto) {
-            self.attention.validate(dtype.resolve_explicit())?;
-        }
         Ok(())
     }
 }
@@ -190,6 +163,42 @@ impl Precision {
     }
 }
 
+#[cfg(unix)]
+fn configure_open_file_limit() {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } != 0 {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "Unable to query open-file limit");
+        return;
+    }
+    let recommended: libc::rlim_t = 65_536;
+    let target = if limits.rlim_max == libc::RLIM_INFINITY {
+        recommended
+    } else {
+        limits.rlim_max.min(recommended)
+    };
+    if limits.rlim_cur == libc::RLIM_INFINITY || limits.rlim_cur >= target {
+        return;
+    }
+    let previous = limits.rlim_cur;
+    limits.rlim_cur = target;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } != 0 {
+        tracing::warn!(error = %std::io::Error::last_os_error(), previous, target, "Unable to raise open-file limit");
+        return;
+    }
+    tracing::info!(
+        previous,
+        open_file_limit = target,
+        hard_limit = limits.rlim_max,
+        "Open-file limit configured"
+    );
+}
+
+#[cfg(not(unix))]
+fn configure_open_file_limit() {}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -201,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     args.validate()?;
+    configure_open_file_limit();
     sys1::validate_backend()?;
     let backend = if cfg!(feature = "cuda") {
         "cuda"
@@ -260,13 +270,15 @@ async fn main() -> anyhow::Result<()> {
         Some(dtype) => dtype,
         None => models::model_default_dtype(&model_path, architecture)?,
     };
-    let attention = Args::attention(args.attention, architecture, dtype);
+    let attention = if args.enforce_eager {
+        models::AttentionImplementation::Eager
+    } else {
+        models::AttentionImplementation::Auto
+    };
     attention.validate(dtype)?;
     let served_model_name = args.served_model_name.unwrap_or(source_name);
     let started = Instant::now();
     tracing::info!(model = %served_model_name, source, ?architecture, ?dtype, ?attention, path = %model_path.display(), "Loading model");
-    #[cfg(feature = "metal")]
-    sys1::report_dtype_support(dtype);
     let model = models::load(
         &model_path,
         architecture,
@@ -357,35 +369,12 @@ mod tests {
     }
 
     #[test]
-    fn selects_attention_for_laya() {
-        assert_eq!(
-            Args::attention(
-                models::AttentionImplementation::Auto,
-                models::Architecture::Laya,
-                DType::F32,
-            ),
-            models::AttentionImplementation::Eager
-        );
-        let low_precision = if cfg!(feature = "flash-attn-2") {
-            models::AttentionImplementation::FlashAttention2
-        } else {
-            models::AttentionImplementation::Eager
-        };
-        assert_eq!(
-            Args::attention(
-                models::AttentionImplementation::Auto,
-                models::Architecture::Laya,
-                DType::F16,
-            ),
-            low_precision
-        );
-        assert_eq!(
-            Args::attention(
-                models::AttentionImplementation::Auto,
-                models::Architecture::Qwen35,
-                DType::BF16,
-            ),
-            models::AttentionImplementation::Auto
+    fn attention_is_automatic_with_an_explicit_eager_override() {
+        assert!(!args(&[]).enforce_eager);
+        assert!(args(&["--enforce-eager"]).enforce_eager);
+        assert!(
+            Args::try_parse_from(["sys1", "--model-id", "owner/model", "--attention", "eager"])
+                .is_err()
         );
     }
 
@@ -400,8 +389,5 @@ mod tests {
         assert!(invalid_batch.validate().is_err());
         assert!(args(&["--max-model-len", "0"]).validate().is_err());
         assert!(args(&["--max-queue-size", "0"]).validate().is_err());
-
-        let invalid_attention = args(&["--attention", "flash-attn-2", "--dtype", "f32"]);
-        assert!(invalid_attention.validate().is_err());
     }
 }

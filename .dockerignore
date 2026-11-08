@@ -4,3 +4,12 @@ models
 target
 __pycache__
 *.pyc
+
+.aws
+.codex
+.agents
+.cache
+.env
+.env.*
+benchmarks
+vendor

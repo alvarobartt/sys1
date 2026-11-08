@@ -91,6 +91,7 @@ RUN useradd --system --uid 10001 --create-home sys1
 ENV HF_HOME=/home/sys1/.cache/huggingface
 
 COPY --from=builder /app/target/release/sys1 /usr/local/bin/sys1
+COPY LICENSE /usr/share/licenses/sys1/LICENSE
 
 USER sys1
 
